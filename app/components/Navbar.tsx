@@ -28,17 +28,17 @@ export default function Navbar() {
   return (
     <nav className="bg-white text-black px-8 sm:px-20 py-6 shadow-md">
       <div className="w-full flex items-center justify-between">
-        {/* Left side with spinning logo */}
+        {/* Left side with static logo */}
         <div
           className="flex items-center gap-4 cursor-pointer"
           onClick={() => router.push("/")}
         >
           <Image
-            src="/logo4.png" // make sure the logo is placed in public/logo.png
+            src="/logo4.png" // make sure the logo is in public/logo4.png
             alt="Logo"
             width={90}
             height={90}
-            className="object-contain animate-spin-slow"
+            className="object-contain"
           />
           <div className="text-3xl sm:text-4xl font-bold tracking-wide">
             SmartBull.ai
