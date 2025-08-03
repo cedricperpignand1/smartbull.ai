@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { signIn, useSession } from "next-auth/react";
+import Image from "next/image";
 
 export default function LandingPage() {
   const { status } = useSession();
@@ -11,7 +12,6 @@ export default function LandingPage() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // Handle signup
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -37,7 +37,6 @@ export default function LandingPage() {
     }
   };
 
-  // Handle login
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -56,9 +55,19 @@ export default function LandingPage() {
   return (
     <main className="h-screen w-full flex bg-gray-100">
       {/* Left side - Marketing */}
-      <div className="hidden md:flex flex-col justify-center items-center w-1/2 bg-gradient-to-b from-blue-100 to-blue-200 p-10">
+      <div className="hidden md:flex flex-col justify-center items-center w-1/2 bg-gradient-to-b from-yellow-100 to-yellow-80 p-10">
+        
+        {/* Logo */}
+        <Image
+          src="/logo4.png" // ensure logo.png is in public/
+          alt="Logo"
+          width={350}
+          height={350}
+          className="mb-8 animate-spin-slow"
+        />
+
         <h1 className="text-4xl font-bold mb-6 text-center">
-          Welcome to TheTradersRoom.ai
+          Welcome to SmartBull.ai
         </h1>
         <p className="text-lg text-gray-700 text-center max-w-md">
           Track top gainers, get AI stock picks, and manage your daily trades
@@ -98,7 +107,7 @@ export default function LandingPage() {
               disabled={loading}
               className={`${
                 isLogin
-                  ? "bg-blue-600 hover:bg-blue-700"
+                  ? "bg-black hover:bg-gray-600"
                   : "bg-green-600 hover:bg-green-700"
               } text-white py-2 rounded transition`}
             >

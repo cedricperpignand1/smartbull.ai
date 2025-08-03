@@ -2,11 +2,11 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { useSession, signOut } from "next-auth/react";
+import Image from "next/image";
+import { signOut } from "next-auth/react";
 
 export default function Navbar() {
   const router = useRouter();
-  const { data: session, status } = useSession();
   const [time, setTime] = useState<string>("");
 
   useEffect(() => {
@@ -26,14 +26,23 @@ export default function Navbar() {
   }, []);
 
   return (
-    <nav className="bg-black text-white px-8 sm:px-20 py-6 shadow-md">
+    <nav className="bg-white text-black px-8 sm:px-20 py-6 shadow-md">
       <div className="w-full flex items-center justify-between">
-        {/* Left side */}
+        {/* Left side with spinning logo */}
         <div
+          className="flex items-center gap-4 cursor-pointer"
           onClick={() => router.push("/")}
-          className="cursor-pointer text-3xl sm:text-4xl font-bold tracking-wide"
         >
-          SmartBull.ai
+          <Image
+            src="/logo4.png" // make sure the logo is placed in public/logo.png
+            alt="Logo"
+            width={90}
+            height={90}
+            className="object-contain animate-spin-slow"
+          />
+          <div className="text-3xl sm:text-4xl font-bold tracking-wide">
+            SmartBull.ai
+          </div>
         </div>
 
         {/* Right side */}
@@ -51,30 +60,12 @@ export default function Navbar() {
             >
               My P&amp;L
             </button>
-
-            {status === "authenticated" ? (
-              <button
-                onClick={() => signOut({ callbackUrl: "/" })}
-                className="bg-red-600 hover:bg-red-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
-              >
-                Sign Out
-              </button>
-            ) : (
-              <>
-                <button
-                  onClick={() => router.push("/signup")}
-                  className="bg-green-600 hover:bg-green-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
-                >
-                  Sign Up
-                </button>
-                <button
-                  onClick={() => router.push("/login")}
-                  className="bg-purple-600 hover:bg-purple-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
-                >
-                  Login
-                </button>
-              </>
-            )}
+            <button
+              onClick={() => signOut({ callbackUrl: "/" })}
+              className="bg-red-600 hover:bg-red-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
+            >
+              Sign Out
+            </button>
           </div>
 
           <div className="text-lg font-mono">{time}</div>

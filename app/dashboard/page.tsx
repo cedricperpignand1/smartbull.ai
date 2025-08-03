@@ -237,23 +237,25 @@ export default function Home() {
           enableResizing={resizingConfig}
           className="bg-white rounded shadow-lg flex flex-col"
         >
-          <div className="flex flex-col p-4 flex-1 overflow-auto">
-            <h2 className="font-bold text-lg mb-2">AI Recommendation</h2>
-            <button
-              onClick={askAIRecommendation}
-              disabled={analyzing}
-              className={`px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition ${
-                analyzing && "opacity-60 cursor-not-allowed"
-              }`}
-            >
-              {analyzing ? "Analyzing..." : "Ask AI"}
-            </button>
-            {recommendation && (
-              <div className="mt-4 text-sm whitespace-pre-wrap flex-1">
-                {recommendation}
-              </div>
-            )}
-          </div>
+         <div className="flex flex-col p-4 flex-1">
+  <h2 className="font-bold text-lg mb-2">AI Recommendation</h2>
+  <button
+    onClick={askAIRecommendation}
+    disabled={analyzing}
+    className={`px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition ${
+      analyzing && "opacity-60 cursor-not-allowed"
+    }`}
+  >
+    {analyzing ? "Analyzing..." : "Ask AI"}
+  </button>
+
+  {recommendation && (
+    <div className="mt-4 text-sm whitespace-pre-wrap">
+      {recommendation}
+    </div>
+  )}
+</div>
+
         </Rnd>
 
         {/* Top Gainers Box */}
@@ -317,7 +319,7 @@ export default function Home() {
               <div className="flex-1 overflow-auto">
                 <table className="min-w-full text-xs sm:text-sm">
                   <thead>
-                    <tr className="bg-green-600 text-white">
+                    <tr className="bg-black text-white">
                       <th className="p-2">Symbol</th>
                       <th className="p-2">Price</th>
                       <th className="p-2">Change %</th>

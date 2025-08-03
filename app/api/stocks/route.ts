@@ -5,16 +5,28 @@ const FMP_API_KEY = "M0MLRDp8dLak6yJOfdv7joKaKGSje8pp";
 const ALPACA_API_KEY = process.env.ALPACA_API_KEY!;
 const ALPACA_SECRET_KEY = process.env.ALPACA_SECRET_KEY!;
 
-// Detect if market is open (Eastern Time 9:30–16:00)
+// Detect if market is open (Eastern Time 9:30–16:00, Monday to Friday)
 function isMarketOpenNow(): boolean {
   const now = new Date();
+
+  // Convert to EST (UTC-5 fixed offset)
   const estOffset = -5;
   const est = new Date(
     now.getTime() + (estOffset * 60 + now.getTimezoneOffset()) * 60000
   );
+
+  const day = est.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
   const h = est.getHours();
   const m = est.getMinutes();
-  return (h > 9 || (h === 9 && m >= 30)) && h < 16;
+
+  // Only Monday to Friday
+  const isWeekday = day >= 1 && day <= 5;
+
+  // Market hours: 9:30 to 16:00
+  const isMarketHours =
+    (h > 9 || (h === 9 && m >= 30)) && h < 16;
+
+  return isWeekday && isMarketHours;
 }
 
 async function fetchQuoteAlpaca(ticker: string) {
@@ -102,9 +114,11 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url);
     const override = searchParams.get("source"); // fmp or alpaca
     const marketOpen = isMarketOpenNow();
+
+    // Automatically pick FMP during market hours (9:30-16:00 Mon-Fri)
     const useFmp = override === "fmp" || (marketOpen && override !== "alpaca");
 
-    // Fetch top gainers (always from FMP for the initial list)
+    // Always fetch top gainers from FMP for the base list
     const fmpRes = await fetch(
       `https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey=${FMP_API_KEY}`,
       { cache: "no-store" }
