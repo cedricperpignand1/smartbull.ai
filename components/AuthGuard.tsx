@@ -9,7 +9,8 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
 
-  const publicPages = ["/login", "/signup"];
+  const publicPages = ["/", "/login", "/signup"];
+
 
   useEffect(() => {
     if (

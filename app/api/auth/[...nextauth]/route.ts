@@ -1,17 +1,18 @@
-import NextAuth from "next-auth";
+import NextAuth, { AuthOptions } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import CredentialsProvider from "next-auth/providers/credentials";
 import { PrismaAdapter } from "@next-auth/prisma-adapter";
 import prisma from "@/lib/prisma";
 import bcrypt from "bcryptjs";
 
-const handler = NextAuth({
+export const authOptions: AuthOptions = {
   adapter: PrismaAdapter(prisma),
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID!,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
     }),
+
     CredentialsProvider({
       name: "Credentials",
       credentials: {
@@ -25,14 +26,14 @@ const handler = NextAuth({
           where: { email: credentials.email },
         });
 
-        if (!user?.hashedPassword) return null;
+        if (!user || !user.hashedPassword) return null;
 
-        const valid = await bcrypt.compare(
+        const isValid = await bcrypt.compare(
           credentials.password,
           user.hashedPassword
         );
-        if (!valid) return null;
 
+        if (!isValid) return null;
         return user;
       },
     }),
@@ -40,9 +41,13 @@ const handler = NextAuth({
   session: {
     strategy: "jwt",
   },
-  pages: {
-    signIn: "/login",
-  },
-});
+  // Remove or change this:
+  // pages: {
+  //   signIn: "/",  // uncomment this if you want NextAuth redirects to point to "/"
+  // },
+  secret: process.env.NEXTAUTH_SECRET,
+};
+
+const handler = NextAuth(authOptions);
 
 export { handler as GET, handler as POST };

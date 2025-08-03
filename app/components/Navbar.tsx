@@ -2,9 +2,11 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
+import { useSession, signOut } from "next-auth/react";
 
 export default function Navbar() {
   const router = useRouter();
+  const { data: session, status } = useSession();
   const [time, setTime] = useState<string>("");
 
   useEffect(() => {
@@ -49,18 +51,30 @@ export default function Navbar() {
             >
               My P&amp;L
             </button>
-            <button
-              onClick={() => router.push("/signup")}
-              className="bg-green-600 hover:bg-green-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
-            >
-              Sign Up
-            </button>
-            <button
-              onClick={() => router.push("/login")}
-              className="bg-purple-600 hover:bg-purple-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
-            >
-              Login
-            </button>
+
+            {status === "authenticated" ? (
+              <button
+                onClick={() => signOut({ callbackUrl: "/" })}
+                className="bg-red-600 hover:bg-red-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
+              >
+                Sign Out
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={() => router.push("/signup")}
+                  className="bg-green-600 hover:bg-green-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
+                >
+                  Sign Up
+                </button>
+                <button
+                  onClick={() => router.push("/login")}
+                  className="bg-purple-600 hover:bg-purple-700 text-white px-5 py-2 rounded-lg text-base font-semibold transition"
+                >
+                  Login
+                </button>
+              </>
+            )}
           </div>
 
           <div className="text-lg font-mono">{time}</div>

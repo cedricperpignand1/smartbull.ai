@@ -3,8 +3,8 @@
 import { useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
 import { Rnd } from "react-rnd";
-import Navbar from "./components/Navbar";
-import { Button } from "./components/ui/button";
+import Navbar from "../components/Navbar";
+import { Button } from "../components/ui/button";
 
 interface Stock {
   ticker: string;
