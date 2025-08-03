@@ -1,12 +1,15 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Ensure that Next.js uses SSR for dynamic routes (important for NextAuth)
+  // This ensures Vercel uses SSR and avoids pre-rendering API routes
+  output: "standalone",
+
   experimental: {
     serverActions: {
       bodySizeLimit: "2mb",
     },
   },
+
   reactStrictMode: true,
 };
 
