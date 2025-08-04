@@ -1,32 +1,23 @@
+// /app/api/stocks/route.ts
 import { NextResponse } from "next/server";
 
-const FMP_API_KEY = "M0MLRDp8dLak6yJOfdv7joKaKGSje8pp";
-
+const FMP_API_KEY = process.env.FMP_API_KEY || "M0MLRDp8dLak6yJOfdv7joKaKGSje8pp";
 const ALPACA_API_KEY = process.env.ALPACA_API_KEY!;
 const ALPACA_SECRET_KEY = process.env.ALPACA_SECRET_KEY!;
 
-// Detect if market is open (Eastern Time 9:30–16:00, Monday to Friday)
+// Simple in-memory cache for employees to reduce FMP calls (5 min TTL)
+const employeesCache = new Map<string, { v: number | null; t: number }>();
+const EMP_TTL_MS = 5 * 60 * 1000;
+
 function isMarketOpenNow(): boolean {
   const now = new Date();
-
-  // Convert to EST (UTC-5 fixed offset)
-  const estOffset = -5;
-  const est = new Date(
-    now.getTime() + (estOffset * 60 + now.getTimezoneOffset()) * 60000
-  );
-
-  const day = est.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
-  const h = est.getHours();
-  const m = est.getMinutes();
-
-  // Only Monday to Friday
-  const isWeekday = day >= 1 && day <= 5;
-
-  // Market hours: 9:30 to 16:00
-  const isMarketHours =
-    (h > 9 || (h === 9 && m >= 30)) && h < 16;
-
-  return isWeekday && isMarketHours;
+  const ny = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const d = ny.getDay();
+  const h = ny.getHours();
+  const m = ny.getMinutes();
+  const isWeekday = d >= 1 && d <= 5;
+  const isHours = (h > 9 || (h === 9 && m >= 30)) && h < 16;
+  return isWeekday && isHours;
 }
 
 async function fetchQuoteAlpaca(ticker: string) {
@@ -39,21 +30,14 @@ async function fetchQuoteAlpaca(ticker: string) {
       },
       cache: "no-store",
     });
-
     if (!res.ok) return null;
     const data = await res.json();
-    const quote = data.quote;
-
+    const q = data?.quote;
     return {
-      price: quote
-        ? (quote.bp && quote.ap
-            ? (quote.bp + quote.ap) / 2
-            : quote.bp || quote.ap)
-        : null,
-      volume: quote?.s || null,
+      price: q ? (q.bp && q.ap ? (q.bp + q.ap) / 2 : q.bp || q.ap) : null,
+      volume: q?.s ?? null,
     };
-  } catch (err) {
-    console.error(`Alpaca error for ${ticker}`, err);
+  } catch {
     return null;
   }
 }
@@ -63,14 +47,41 @@ async function fetchQuoteFMP(ticker: string) {
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) return null;
   const data = await res.json();
-  return data.length > 0 ? data[0] : null;
+  return Array.isArray(data) && data.length ? data[0] : null;
 }
 
 async function fetchNews(ticker: string) {
   const url = `https://financialmodelingprep.com/api/v3/stock_news?tickers=${ticker}&limit=5&apikey=${FMP_API_KEY}`;
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) return [];
-  return await res.json();
+  return res.json();
+}
+
+// NEW: fetch employees from FMP profile, with simple cache
+async function fetchEmployeesFMP(ticker: string): Promise<number | null> {
+  const now = Date.now();
+  const hit = employeesCache.get(ticker);
+  if (hit && now - hit.t < EMP_TTL_MS) return hit.v;
+
+  try {
+    const url = `https://financialmodelingprep.com/api/v3/profile/${ticker}?apikey=${FMP_API_KEY}`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) {
+      employeesCache.set(ticker, { v: null, t: now });
+      return null;
+    }
+    const data = await res.json();
+    const employees =
+      Array.isArray(data) && data[0]?.fullTimeEmployees != null
+        ? Number(data[0].fullTimeEmployees)
+        : null;
+
+    employeesCache.set(ticker, { v: employees, t: now });
+    return employees;
+  } catch {
+    employeesCache.set(ticker, { v: null, t: now });
+    return null;
+  }
 }
 
 function scoreStock(stock: any, fundamentals: any, alpaca: any, news: any[]) {
@@ -95,55 +106,57 @@ function scoreStock(stock: any, fundamentals: any, alpaca: any, news: any[]) {
   if (float > 0 && float < 50_000_000) score += 3;
   else if (float > 0 && float < 200_000_000) score += 1;
 
-  const positiveHeadlines = news.filter((n) =>
-    n.title.toLowerCase().includes("up") ||
-    n.title.toLowerCase().includes("growth") ||
-    n.title.toLowerCase().includes("beats") ||
-    n.title.toLowerCase().includes("strong") ||
-    n.title.toLowerCase().includes("buy") ||
-    n.title.toLowerCase().includes("surge")
-  ).length;
+  const positiveHeadlines = news.filter((n: any) => {
+    const t = n?.title?.toLowerCase?.() || "";
+    return (
+      t.includes("up") ||
+      t.includes("growth") ||
+      t.includes("beats") ||
+      t.includes("strong") ||
+      t.includes("buy") ||
+      t.includes("surge")
+    );
+  }).length;
 
   score += positiveHeadlines > 0 ? 2 : 0;
-
   return score;
 }
 
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
-    const override = searchParams.get("source"); // fmp or alpaca
+    const mode = (searchParams.get("source") || "auto").toLowerCase();
     const marketOpen = isMarketOpenNow();
+    const useFmp = mode === "fmp" || (mode !== "alpaca" && marketOpen);
 
-    // Automatically pick FMP during market hours (9:30-16:00 Mon-Fri)
-    const useFmp = override === "fmp" || (marketOpen && override !== "alpaca");
-
-    // Always fetch top gainers from FMP for the base list
+    // Base list from FMP
     const fmpRes = await fetch(
       `https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey=${FMP_API_KEY}`,
       { cache: "no-store" }
     );
     if (!fmpRes.ok) throw new Error("Failed to fetch FMP gainers");
-    const rawData = await fmpRes.json();
-    const top20 = rawData.slice(0, 20);
+    const raw = await fmpRes.json();
+    const top20 = (Array.isArray(raw) ? raw : []).slice(0, 20);
 
     const analyzed = await Promise.all(
       top20.map(async (item: any) => {
-        const fundamentals = await fetchQuoteFMP(item.symbol);
-        const alpaca = await fetchQuoteAlpaca(item.symbol);
-        const news = await fetchNews(item.symbol);
+        const [fundamentals, alpaca, news, employees] = await Promise.all([
+          fetchQuoteFMP(item.symbol),
+          fetchQuoteAlpaca(item.symbol),
+          fetchNews(item.symbol),
+          fetchEmployeesFMP(item.symbol), // NEW
+        ]);
 
-        const finalPrice = useFmp
-          ? item.price
-          : alpaca?.price || item.price;
+        const finalPrice = useFmp ? item.price : alpaca?.price ?? item.price;
 
         return {
           ticker: item.symbol,
           price: finalPrice,
           changesPercentage: item.changesPercentage,
-          marketCap: fundamentals?.marketCap || null,
-          sharesOutstanding: fundamentals?.sharesOutstanding || null,
-          volume: alpaca?.volume || fundamentals?.volume || null,
+          marketCap: fundamentals?.marketCap ?? null,
+          sharesOutstanding: fundamentals?.sharesOutstanding ?? null,
+          volume: alpaca?.volume ?? fundamentals?.volume ?? null,
+          employees: employees ?? null, // NEW
           score: scoreStock(item, fundamentals, alpaca, news),
         };
       })
@@ -152,8 +165,11 @@ export async function GET(req: Request) {
     const sorted = analyzed.sort((a, b) => b.score - a.score).slice(0, 7);
 
     return NextResponse.json({
-      source: useFmp ? "FMP" : "Alpaca",
+      mode,
+      marketOpen,
+      sourceUsed: useFmp ? "FMP" : "Alpaca",
       stocks: sorted,
+      updatedAt: new Date().toISOString(),
     });
   } catch (error) {
     console.error("Error fetching top gainers:", error);

@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+
+type Mode = "auto" | "fmp" | "alpaca";
 
 interface Stock {
   ticker: string;
@@ -9,62 +11,86 @@ interface Stock {
   marketCap: number | null;
   sharesOutstanding: number | null;
   volume: number | null;
-}
-
-function isMarketOpenNow(): boolean {
-  const now = new Date();
-  const utc = now.getTime() + now.getTimezoneOffset() * 60000;
-  const estOffset = -5; // EST offset
-  const est = new Date(utc + 3600000 * estOffset);
-
-  const day = est.getUTCDay();
-  const hour = est.getUTCHours();
-  const minute = est.getUTCMinutes();
-
-  const isWeekday = day >= 1 && day <= 5;
-  const after930 = hour > 9 || (hour === 9 && minute >= 30);
-  const before4 = hour < 16;
-  return isWeekday && after930 && before4;
+  // Optional fields if your API includes them (sent through to /api/recommendation as-is)
+  employees?: number | null;
+  netProfitMarginTTM?: number | null;
+  profitMargin?: number | null;
+  netProfitMargin?: number | null;
 }
 
 export default function TopGainers() {
+  const [mode, setMode] = useState<Mode>("auto");
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [dataSource, setDataSource] = useState<string>("");
+  const [sourceUsed, setSourceUsed] = useState<string>("");
+  const [updatedAt, setUpdatedAt] = useState<string>("");
+  const [marketOpen, setMarketOpen] = useState<boolean | null>(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const fetchData = async (overrideSource?: string) => {
+  // --- AI Recommendation UI state ---
+  const [aiPick, setAiPick] = useState<string>("");
+  const [aiLoading, setAiLoading] = useState(false);
+
+  const fetchData = async () => {
     try {
-      let source = overrideSource;
-      if (!source) {
-        source = isMarketOpenNow() ? "fmp" : "alpaca";
-      }
-
-      const res = await fetch(`/api/stocks?source=${source}`, {
-        cache: "no-store",
-      });
+      setLoading(true);
+      const res = await fetch(`/api/stocks?source=${mode}`, { cache: "no-store" });
       const data = await res.json();
+
       if (data.errorMessage) {
         setErrorMessage(data.errorMessage);
+        setStocks([]);
+        setSourceUsed("");
       } else {
-        setStocks(data.stocks || data);
-        setDataSource(data.source || "");
+        setStocks(data.stocks || []);
+        setSourceUsed(data.sourceUsed || data.source || "");
+        setUpdatedAt(data.updatedAt || "");
+        setMarketOpen(typeof data.marketOpen === "boolean" ? data.marketOpen : null);
+        setErrorMessage(null);
       }
-      setLoading(false);
     } catch (err) {
       console.error("Error fetching stocks:", err);
       setErrorMessage("Unable to fetch data.");
+    } finally {
       setLoading(false);
     }
   };
 
+  // Initial fetch + 5s auto-refresh
   useEffect(() => {
     fetchData();
-  }, []);
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(fetchData, 5000);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [mode]);
 
+  // One-button toggle: if Auto -> FMP; then FMP <-> Alpaca
   const handleSwitch = () => {
-    const newSource = dataSource === "FMP" ? "alpaca" : "fmp";
-    fetchData(newSource);
+    setMode((prev) => (prev === "auto" ? "fmp" : prev === "fmp" ? "alpaca" : "fmp"));
+  };
+
+  // ---- #2: Send current stocks to /api/recommendation and show reply ----
+  const getRecommendation = async () => {
+    try {
+      setAiLoading(true);
+      setAiPick("");
+      const res = await fetch("/api/recommendation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Send exactly what the API expects
+        body: JSON.stringify({ stocks }),
+      });
+      const data = await res.json();
+      setAiPick(data.recommendation || "No recommendation.");
+    } catch (e) {
+      console.error(e);
+      setAiPick("Error getting recommendation.");
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   return (
@@ -72,26 +98,51 @@ export default function TopGainers() {
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-3">
           <h2 className="font-bold text-lg">Top Gainers</h2>
-          {dataSource && (
+
+          {sourceUsed && (
             <span
               className={`px-2 py-1 rounded text-xs font-semibold ${
-                dataSource === "FMP"
+                sourceUsed === "FMP"
                   ? "bg-green-100 text-green-700"
                   : "bg-purple-100 text-purple-700"
               }`}
             >
-              {dataSource === "FMP"
-                ? "Market Open (FMP)"
-                : "Premarket/After Hours (Alpaca)"}
+              {sourceUsed === "FMP" ? "Market Hours (FMP)" : "Premarket/After Hours (Alpaca)"}
+            </span>
+          )}
+
+          {marketOpen !== null && (
+            <span className="px-2 py-1 rounded text-xs bg-gray-100 text-gray-700">
+              Market Open: {marketOpen ? "Yes" : "No"}
+            </span>
+          )}
+
+          {updatedAt && (
+            <span className="text-xs text-gray-500">
+              Updated: {new Date(updatedAt).toLocaleTimeString()}
             </span>
           )}
         </div>
-        <button
-          onClick={handleSwitch}
-          className="px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded text-sm text-white"
-        >
-          Switch
-        </button>
+
+        <div className="flex items-center gap-2">
+          <select
+            value={mode}
+            onChange={(e) => setMode(e.target.value as Mode)}
+            className="px-2 py-1 border rounded text-sm"
+            title="Auto uses FMP during market hours, Alpaca otherwise"
+          >
+            <option value="auto">Auto</option>
+            <option value="fmp">FMP</option>
+            <option value="alpaca">Alpaca</option>
+          </select>
+
+          <button
+            onClick={handleSwitch}
+            className="px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded text-sm text-white"
+          >
+            Switch
+          </button>
+        </div>
       </div>
 
       {loading ? (
@@ -112,31 +163,45 @@ export default function TopGainers() {
               </tr>
             </thead>
             <tbody>
-              {stocks.map((stock, i) => (
-                <tr key={i} className="hover:bg-gray-100 cursor-pointer">
-                  <td className="border p-2">{stock.ticker}</td>
-                  <td className="border p-2">${stock.price}</td>
+              {stocks.map((s, i) => (
+                <tr key={i} className="hover:bg-gray-100">
+                  <td className="border p-2">{s.ticker}</td>
+                  <td className="border p-2">
+                    {s.price !== null && s.price !== undefined ? `$${s.price}` : "-"}
+                  </td>
                   <td
                     className="border p-2"
-                    style={{
-                      color: stock.changesPercentage >= 0 ? "green" : "red",
-                    }}
+                    style={{ color: s.changesPercentage >= 0 ? "green" : "red" }}
                   >
-                    {stock.changesPercentage.toFixed(2)}%
+                    {s.changesPercentage?.toFixed?.(2) ?? "-"}%
                   </td>
+                  <td className="border p-2">{s.marketCap?.toLocaleString() ?? "-"}</td>
                   <td className="border p-2">
-                    {stock.marketCap?.toLocaleString() || "-"}
+                    {s.sharesOutstanding?.toLocaleString() ?? "-"}
                   </td>
-                  <td className="border p-2">
-                    {stock.sharesOutstanding?.toLocaleString() || "-"}
-                  </td>
-                  <td className="border p-2">
-                    {stock.volume?.toLocaleString() || "-"}
-                  </td>
+                  <td className="border p-2">{s.volume?.toLocaleString() ?? "-"}</td>
                 </tr>
               ))}
             </tbody>
           </table>
+
+          {/* ---- AI Recommendation UI ---- */}
+          <div className="mt-3 flex items-start gap-2">
+            <button
+              onClick={getRecommendation}
+              className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm"
+            >
+              {aiLoading ? "Analyzing..." : "Get AI Pick"}
+            </button>
+
+            {aiPick && (
+              <div className="text-sm bg-gray-50 border rounded p-2 whitespace-pre-wrap flex-1">
+                <strong>AI Recommendation:</strong>
+                <div className="mt-1">{aiPick}</div>
+              </div>
+            )}
+          </div>
+          {/* ---- /AI Recommendation UI ---- */}
         </div>
       )}
     </div>

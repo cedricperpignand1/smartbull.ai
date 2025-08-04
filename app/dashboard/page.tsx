@@ -13,62 +13,64 @@ interface Stock {
   marketCap: number | null;
   sharesOutstanding: number | null;
   volume: number | null;
+  employees?: number | null; // included on server and passed to AI
 }
 
 export default function Home() {
   const { data: session, status } = useSession();
 
-  // Show loading spinner while session is loading
   if (status === "loading") {
-    return (
-      <div className="flex items-center justify-center h-screen">
-        Loading...
-      </div>
-    );
+    return <div className="flex items-center justify-center h-screen">Loading...</div>;
   }
-
-  // Redirect if user not logged in
   if (!session) {
     return (
       <div className="flex items-center justify-center h-screen">
-        <p className="text-lg font-bold">
-          You need to log in to access this page.
-        </p>
+        <p className="text-lg font-bold">You need to log in to access this page.</p>
       </div>
     );
   }
 
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [loading, setLoading] = useState(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const [dataSource, setDataSource] = useState<string>(""); // "FMP" | "Alpaca"
   const [recommendation, setRecommendation] = useState<string | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const [chartVisible, setChartVisible] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
 
   const [agentResult, setAgentResult] = useState<string | null>(null);
   const [agentBuyPrice, setAgentBuyPrice] = useState<string | null>(null);
   const [agentSellPrice, setAgentSellPrice] = useState<string | null>(null);
 
-  const [dataSource, setDataSource] = useState<string>("");
+  // Table headers rendered from array to avoid whitespace text nodes in <tr>
+  const HEADERS = [
+    "Symbol",
+    "Price",
+    "Change %",
+    "Market Cap",
+    "Float",
+    "Volume",
+    "Employees",
+  ];
 
   useEffect(() => {
-    fetch("/api/stocks")
+    fetch("/api/stocks", { cache: "no-store" })
       .then((res) => res.json())
       .then((data) => {
         if (data.errorMessage) {
           setErrorMessage(data.errorMessage);
         } else {
           setStocks(data.stocks || data);
-          setDataSource(data.source || "");
+          setDataSource(data.sourceUsed || data.source || "");
         }
         setLoading(false);
       })
       .catch((err) => {
         console.error("Error fetching stocks:", err);
-        setErrorMessage(
-          "Unable to fetch data. You may have run out of API calls on FMP."
-        );
+        setErrorMessage("Unable to fetch data. You may have run out of API calls on FMP.");
         setLoading(false);
       });
   }, []);
@@ -78,16 +80,18 @@ export default function Home() {
       setAnalyzing(true);
       setRecommendation(null);
 
-      const res = await fetch("/api/analyze", {
+      const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks }),
+        body: JSON.stringify({ stocks: stocks.slice(0, 7) }),
       });
 
-      if (!res.ok) throw new Error("Failed to analyze stocks");
-
       const data = await res.json();
-      setRecommendation(data.recommendation);
+      if (data.errorMessage) {
+        setRecommendation(`Error: ${data.errorMessage}`);
+      } else {
+        setRecommendation(data.recommendation || "No recommendation.");
+      }
     } catch (error) {
       console.error("Error fetching AI recommendation:", error);
       setRecommendation("Failed to analyze stocks. Check server logs.");
@@ -111,9 +115,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ticker: selectedStock }),
       });
-
       if (!res.ok) throw new Error("Failed to analyze chart");
-
       const data = await res.json();
       setAgentBuyPrice(data.bestBuyPrice);
       setAgentSellPrice(data.sellPrice);
@@ -133,51 +135,11 @@ export default function Home() {
     const rows = saved
       ? JSON.parse(saved)
       : [
-          {
-            day: "Day 1",
-            date: "",
-            pick: "",
-            price: "",
-            priceToSell: "",
-            invested: "",
-            diff: "",
-          },
-          {
-            day: "Day 2",
-            date: "",
-            pick: "",
-            price: "",
-            priceToSell: "",
-            invested: "",
-            diff: "",
-          },
-          {
-            day: "Day 3",
-            date: "",
-            pick: "",
-            price: "",
-            priceToSell: "",
-            invested: "",
-            diff: "",
-          },
-          {
-            day: "Day 4",
-            date: "",
-            pick: "",
-            price: "",
-            priceToSell: "",
-            invested: "",
-            diff: "",
-          },
-          {
-            day: "Day 5",
-            date: "",
-            pick: "",
-            price: "",
-            priceToSell: "",
-            invested: "",
-            diff: "",
-          },
+          { day: "Day 1", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
+          { day: "Day 2", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
+          { day: "Day 3", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
+          { day: "Day 4", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
+          { day: "Day 5", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
         ];
 
     const today = new Date().toISOString().split("T")[0];
@@ -193,7 +155,6 @@ export default function Home() {
         break;
       }
     }
-
     if (!found) {
       const newDay = `Day ${updated.length + 1}`;
       updated.push({
@@ -206,11 +167,8 @@ export default function Home() {
         diff: "",
       });
     }
-
     localStorage.setItem("pnlRows", JSON.stringify(updated));
-    alert(
-      `Added ${selectedStock} to your P&L with Buy: ${agentBuyPrice}, Sell: ${agentSellPrice}`
-    );
+    alert(`Added ${selectedStock} to your P&L with Buy: ${agentBuyPrice}, Sell: ${agentSellPrice}`);
   };
 
   const resizingConfig = {
@@ -235,37 +193,35 @@ export default function Home() {
           minWidth={300}
           minHeight={200}
           enableResizing={resizingConfig}
-          className="bg-white rounded shadow-lg flex flex-col"
+          className="bg-white rounded shadow-lg flex flex-col z-50"
         >
-         <div className="flex flex-col p-4 flex-1">
-  <h2 className="font-bold text-lg mb-2">AI Recommendation</h2>
-  <button
-    onClick={askAIRecommendation}
-    disabled={analyzing}
-    className={`px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition ${
-      analyzing && "opacity-60 cursor-not-allowed"
-    }`}
-  >
-    {analyzing ? "Analyzing..." : "Ask AI"}
-  </button>
+          <div className="flex flex-col p-4 flex-1">
+            <h2 className="font-bold text-lg mb-2">AI Recommendation</h2>
+            <button
+              onClick={askAIRecommendation}
+              disabled={analyzing || stocks.length === 0}
+              className={`px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition ${
+                (analyzing || stocks.length === 0) && "opacity-60 cursor-not-allowed"
+              }`}
+              title={stocks.length === 0 ? "No stocks loaded yet" : "Send current 7 to AI"}
+            >
+              {analyzing ? "Analyzing..." : "Ask AI"}
+            </button>
 
-  {recommendation && (
-    <div className="mt-4 text-sm whitespace-pre-wrap">
-      {recommendation}
-    </div>
-  )}
-</div>
-
+            {recommendation && (
+              <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>
+            )}
+          </div>
         </Rnd>
 
         {/* Top Gainers Box */}
         <Rnd
           bounds="#content-area"
-          default={{ x: 450, y: 20, width: 700, height: 400 }}
-          minWidth={400}
-          minHeight={200}
+          default={{ x: 450, y: 20, width: 800, height: 420 }}
+          minWidth={500}
+          minHeight={220}
           enableResizing={resizingConfig}
-          className="bg-white rounded shadow-lg flex flex-col"
+          className="bg-white rounded shadow-lg flex flex-col z-50"
         >
           <div className="flex flex-col p-4 flex-1 overflow-auto">
             <div className="flex items-center justify-between mb-2">
@@ -286,29 +242,37 @@ export default function Home() {
                 )}
               </div>
 
-              {/* Switch Button */}
-              <Button
-                onClick={async () => {
-                  const target = dataSource === "FMP" ? "alpaca" : "fmp";
+              <div className="flex items-center gap-2">
+                <Button
+                  onClick={askAIRecommendation}
+                  disabled={analyzing || stocks.length === 0}
+                  className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {analyzing ? "Analyzing..." : "Ask AI"}
+                </Button>
 
-                  try {
-                    const res = await fetch(`/api/stocks?source=${target}`);
-                    const data = await res.json();
-                    if (data.errorMessage) {
-                      setErrorMessage(data.errorMessage);
-                    } else {
-                      setStocks(data.stocks || data);
-                      setDataSource(data.source || "");
+                <Button
+                  onClick={async () => {
+                    const target = dataSource === "FMP" ? "alpaca" : "fmp";
+                    try {
+                      const res = await fetch(`/api/stocks?source=${target}`, { cache: "no-store" });
+                      const data = await res.json();
+                      if (data.errorMessage) {
+                        setErrorMessage(data.errorMessage);
+                      } else {
+                        setStocks(data.stocks || data);
+                        setDataSource(data.sourceUsed || data.source || "");
+                      }
+                    } catch (err) {
+                      console.error("Error switching data source:", err);
+                      setErrorMessage("Failed to switch data source.");
                     }
-                  } catch (err) {
-                    console.error("Error switching data source:", err);
-                    setErrorMessage("Failed to switch data source.");
-                  }
-                }}
-                className="px-3 py-1 bg-gray-800 hover:bg-gray-300 rounded text-sm"
-              >
-                Switch
-              </Button>
+                  }}
+                  className="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-white rounded text-sm"
+                >
+                  Switch
+                </Button>
+              </div>
             </div>
 
             {loading ? (
@@ -320,24 +284,26 @@ export default function Home() {
                 <table className="min-w-full text-xs sm:text-sm">
                   <thead>
                     <tr className="bg-black text-white">
-                      <th className="p-2">Symbol</th>
-                      <th className="p-2">Price</th>
-                      <th className="p-2">Change %</th>
-                      <th className="p-2">Market Cap</th>
-                      <th className="p-2">Float</th>
-                      <th className="p-2">Volume</th>
+                      {HEADERS.map((h) => (
+                        <th key={h} className="p-2">
+                          {h}
+                        </th>
+                      ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {stocks.map((stock, i) => (
+                    {stocks.map((stock) => (
                       <tr
-                        key={i}
+                        key={stock.ticker}
                         className="hover:bg-gray-100 cursor-pointer"
                         onClick={() => handleStockClick(stock.ticker)}
                       >
                         <td className="border p-2">{stock.ticker}</td>
                         <td className="border p-2">${stock.price}</td>
-                        <td className="border p-2 text-green-600">
+                        <td
+                          className="border p-2"
+                          style={{ color: stock.changesPercentage >= 0 ? "green" : "red" }}
+                        >
                           {stock.changesPercentage.toFixed(2)}%
                         </td>
                         <td className="border p-2">
@@ -348,6 +314,9 @@ export default function Home() {
                         </td>
                         <td className="border p-2">
                           {stock.volume?.toLocaleString() || "-"}
+                        </td>
+                        <td className="border p-2">
+                          {stock.employees != null ? stock.employees.toLocaleString() : "-"}
                         </td>
                       </tr>
                     ))}
@@ -362,11 +331,11 @@ export default function Home() {
         {chartVisible && selectedStock && (
           <Rnd
             bounds="#content-area"
-            default={{ x: 1200, y: 20, width: 700, height: 700 }}
+            default={{ x: 1270, y: 20, width: 700, height: 700 }}
             minWidth={300}
             minHeight={200}
             enableResizing={resizingConfig}
-            className="bg-white rounded shadow-lg flex flex-col"
+            className="bg-white rounded shadow-lg flex flex-col z-50"
           >
             <div className="flex flex-col p-4 flex-1 overflow-auto">
               <h2 className="font-bold mb-2">{selectedStock} Chart</h2>
@@ -379,6 +348,7 @@ export default function Home() {
                 />
               </div>
               <div className="flex gap-3 mt-4">
+                {/* Removed the Ask AI button here */}
                 <button
                   onClick={handleAgent}
                   className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition"
