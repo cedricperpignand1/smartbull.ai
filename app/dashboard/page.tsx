@@ -83,7 +83,7 @@ export default function Home() {
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks: stocks.slice(0, 7) }),
+        body: JSON.stringify({ stocks: stocks.slice(0, 15) }),
       });
 
       const data = await res.json();
@@ -217,9 +217,9 @@ export default function Home() {
         {/* Top Gainers Box */}
         <Rnd
           bounds="#content-area"
-          default={{ x: 450, y: 20, width: 800, height: 420 }}
+          default={{ x: 450, y: 20, width: 900, height: 700 }}
           minWidth={500}
-          minHeight={220}
+          minHeight={500}
           enableResizing={resizingConfig}
           className="bg-white rounded shadow-lg flex flex-col z-50"
         >

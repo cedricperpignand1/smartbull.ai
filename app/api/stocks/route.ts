@@ -89,7 +89,7 @@ export async function GET(req: Request) {
     if (!fmpRes.ok) throw new Error("Failed to fetch FMP gainers");
 
     const raw = await fmpRes.json();
-    const top20 = (Array.isArray(raw) ? raw : []).slice(0, 7);
+    const top20 = (Array.isArray(raw) ? raw : []).slice(0, 15);
 
     const enriched = await Promise.all(
       top20.map(async (item: any) => {
