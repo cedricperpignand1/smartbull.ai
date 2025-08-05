@@ -109,24 +109,25 @@ export default function Home() {
   };
 
   const handleAgent = async () => {
-    try {
-      const res = await fetch("/api/chart-analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ticker: selectedStock }),
-      });
-      if (!res.ok) throw new Error("Failed to analyze chart");
-      const data = await res.json();
-      setAgentBuyPrice(data.bestBuyPrice);
-      setAgentSellPrice(data.sellPrice);
-      setAgentResult(
-        `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice}\n\n${data.reason}`
-      );
-    } catch (error) {
-      console.error(error);
-      alert("Error analyzing the chart.");
-    }
-  };
+  try {
+    const res = await fetch("/api/chart-analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker: selectedStock }),
+    });
+    if (!res.ok) throw new Error("Failed to analyze chart");
+    const data = await res.json();
+    setAgentBuyPrice(data.bestBuyPrice);
+    setAgentSellPrice(data.sellPrice);
+    setAgentResult(
+      `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice || "Not provided"}\n\n${data.reason}\n\nPrediction: ${data.prediction || "N/A"}`
+    );
+  } catch (error) {
+    console.error(error);
+    alert("Error analyzing the chart.");
+  }
+};
+
 
   const handlePickFromChart = () => {
     if (!selectedStock) return;
@@ -331,7 +332,7 @@ export default function Home() {
         {chartVisible && selectedStock && (
           <Rnd
             bounds="#content-area"
-            default={{ x: 1380, y: 20, width: 700, height: 700 }}
+            default={{ x: 1380, y: 20, width: 700, height: 845 }}
             minWidth={300}
             minHeight={200}
             enableResizing={resizingConfig}

@@ -2,27 +2,26 @@ import { NextResponse } from "next/server";
 
 const API_KEY = "M0MLRDp8dLak6yJOfdv7joKaKGSje8pp";
 
-// Fetch 30-min candles from FMP
+// Fetch 15-min candles from FMP
 async function fetchCandles(ticker: string) {
-  // FMP uses intervals like 1min, 5min, 15min, 30min, 1hour etc.
-  // We'll use 30min and get the last 50 candles.
-  const url = `https://financialmodelingprep.com/api/v3/historical-chart/30min/${ticker}?apikey=${API_KEY}`;
+  const url = `https://financialmodelingprep.com/api/v3/historical-chart/15min/${ticker}?apikey=${API_KEY}`;
   const res = await fetch(url, { cache: "no-store" });
+
   if (!res.ok) throw new Error(`FMP API error: ${res.status}`);
   const data = await res.json();
   return data.slice(0, 50); // most recent 50 candles
 }
 
-// Deep analysis function
+// Analyze intraday chart data
 function analyzeCandles(candles: any[]) {
   if (!candles || candles.length === 0) {
     return {
       bestBuyPrice: "N/A",
-      reason: "No 30-minute candles available for analysis.",
+      reason: "No 15-minute candles available for analysis.",
+      prediction: "unknown",
     };
   }
 
-  // Convert candles to numeric values (API returns strings)
   const processed = candles.map((c) => ({
     open: parseFloat(c.open),
     close: parseFloat(c.close),
@@ -31,52 +30,81 @@ function analyzeCandles(candles: any[]) {
     volume: parseFloat(c.volume),
   }));
 
-  // Compute average closing price
-  const avgPrice =
-    processed.reduce((sum, c) => sum + c.close, 0) / processed.length;
+  const totalVWAP = processed.reduce(
+    (acc, c) => {
+      const typicalPrice = (c.high + c.low + c.close) / 3;
+      acc.priceVolumeSum += typicalPrice * c.volume;
+      acc.totalVolume += c.volume;
+      return acc;
+    },
+    { priceVolumeSum: 0, totalVolume: 0 }
+  );
+  const vwap = totalVWAP.priceVolumeSum / totalVWAP.totalVolume;
 
-  // Find support level (lowest low)
-  const support = Math.min(...processed.map((c) => c.low));
+  const highOfDay = Math.max(...processed.map((c) => c.high));
+  const lowOfDay = Math.min(...processed.map((c) => c.low));
 
-  // Momentum check: last close - avg price
-  const last = processed[0]; // FMP returns latest first
-  const momentum = last.close - avgPrice;
+  const recent = processed.slice(0, 5); // last 5 x 15-min = 75 mins
+  const momentumScore = recent[0].close - recent[4].close;
 
-  let recommendationPrice = support.toFixed(2);
-  let reason = `Analyzed last ${processed.length} candles: Support near ${support.toFixed(
-    2
-  )}, Moving average ${avgPrice.toFixed(2)}, Last close ${
-    last.close
-  }. `;
+  const last = processed[0];
 
-  if (momentum > 0) {
-    reason +=
-      "Momentum is positive; price above average. Consider entering near the support zone.";
-  } else {
-    reason +=
-      "Momentum is weak; price below average. Best to wait for confirmation but watch support closely.";
+  let prediction = "neutral";
+  if (last.close > vwap && momentumScore > 0) {
+    prediction = "likely to go up";
+  } else if (last.close < vwap && momentumScore < 0) {
+    prediction = "likely to go down";
   }
 
-  return { bestBuyPrice: recommendationPrice, reason };
+  let bestBuyPrice = "N/A";
+  let reason = `Analyzed ${processed.length} x 15-min candles:\n` +
+               `- VWAP: $${vwap.toFixed(2)}\n` +
+               `- High of Day: $${highOfDay.toFixed(2)}\n` +
+               `- Low of Day: $${lowOfDay.toFixed(2)}\n` +
+               `- Last Price: $${last.close.toFixed(2)}\n` +
+               `- Momentum (last 5 candles): ${momentumScore.toFixed(2)}.\n`;
+
+  if (momentumScore > 0 && last.close >= vwap) {
+    bestBuyPrice = last.close.toFixed(2);
+    reason += `Price is trending up and holding above VWAP. Consider buying on pullbacks above VWAP.`;
+  } else {
+    reason += `Momentum is weak or price is below VWAP. Avoid entry until momentum strengthens or VWAP is reclaimed.`;
+  }
+
+  return {
+    bestBuyPrice,
+    reason,
+    prediction,
+  };
 }
 
+// POST handler
 export async function POST(req: Request) {
-  const { ticker } = await req.json();
-
   try {
+    const { ticker } = await req.json();
+
+    if (!ticker || typeof ticker !== "string") {
+      return NextResponse.json(
+        { error: "Invalid or missing ticker." },
+        { status: 400 }
+      );
+    }
+
     const candles = await fetchCandles(ticker);
-    const { bestBuyPrice, reason } = analyzeCandles(candles);
+    const result = analyzeCandles(candles);
 
     return NextResponse.json({
-      bestBuyPrice,
-      reason: `30-min chart analysis for ${ticker}: ${reason}`,
+      bestBuyPrice: result.bestBuyPrice,
+      reason: `Intraday 15-min analysis for ${ticker.toUpperCase()}:\n\n${result.reason}`,
+      prediction: `Next 15 minutes: ${result.prediction}`,
     });
   } catch (error: any) {
-    console.error("Chart analysis error:", error);
+    console.error("Chart analysis error:", error.message);
     return NextResponse.json(
       {
         bestBuyPrice: "N/A",
-        reason: `Failed to analyze ${ticker}. ${error.message}`,
+        reason: "Something went wrong during analysis.",
+        prediction: "unknown",
       },
       { status: 500 }
     );
