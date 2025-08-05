@@ -189,7 +189,7 @@ export default function Home() {
         {/* AI Recommendation Box */}
         <Rnd
           bounds="#content-area"
-          default={{ x: 20, y: 20, width: 400, height: 300 }}
+          default={{ x: 20, y: 20, width: 400, height: 600 }}
           minWidth={300}
           minHeight={200}
           enableResizing={resizingConfig}
