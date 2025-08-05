@@ -331,7 +331,7 @@ export default function Home() {
         {chartVisible && selectedStock && (
           <Rnd
             bounds="#content-area"
-            default={{ x: 1270, y: 20, width: 700, height: 700 }}
+            default={{ x: 1380, y: 20, width: 700, height: 700 }}
             minWidth={300}
             minHeight={200}
             enableResizing={resizingConfig}
