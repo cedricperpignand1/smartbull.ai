@@ -13,7 +13,7 @@ interface Stock {
   marketCap: number | null;
   sharesOutstanding: number | null;
   volume: number | null;
-  employees?: number | null; // included on server and passed to AI
+  employees?: number | null;
 }
 
 export default function Home() {
@@ -30,6 +30,7 @@ export default function Home() {
     );
   }
 
+  // ---- Stocks & AI analysis (your existing state) ----
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -45,17 +46,13 @@ export default function Home() {
   const [agentBuyPrice, setAgentBuyPrice] = useState<string | null>(null);
   const [agentSellPrice, setAgentSellPrice] = useState<string | null>(null);
 
-  // Table headers rendered from array to avoid whitespace text nodes in <tr>
-  const HEADERS = [
-    "Symbol",
-    "Price",
-    "Change %",
-    "Market Cap",
-    "Float",
-    "Volume",
-    "Employees",
-  ];
+  // ---- NEW: Bot polling state ----
+  const [botData, setBotData] = useState<any>(null);
 
+  // Table headers rendered from array to avoid whitespace text nodes in <tr>
+  const HEADERS = ["Symbol", "Price", "Change %", "Market Cap", "Float", "Volume", "Employees"];
+
+  // Load top gainers list
   useEffect(() => {
     fetch("/api/stocks", { cache: "no-store" })
       .then((res) => res.json())
@@ -73,6 +70,23 @@ export default function Home() {
         setErrorMessage("Unable to fetch data. You may have run out of API calls on FMP.");
         setLoading(false);
       });
+  }, []);
+
+  // ---- NEW: Poll the bot tick endpoint every 5s ----
+  useEffect(() => {
+    let id: any;
+    const run = async () => {
+      try {
+        const r = await fetch("/api/bot/tick", { cache: "no-store" });
+        const j = await r.json();
+        setBotData(j);
+      } catch (e) {
+        console.error("bot tick error", e);
+      }
+    };
+    run();
+    id = setInterval(run, 5000);
+    return () => clearInterval(id);
   }, []);
 
   const askAIRecommendation = async () => {
@@ -109,25 +123,26 @@ export default function Home() {
   };
 
   const handleAgent = async () => {
-  try {
-    const res = await fetch("/api/chart-analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ticker: selectedStock }),
-    });
-    if (!res.ok) throw new Error("Failed to analyze chart");
-    const data = await res.json();
-    setAgentBuyPrice(data.bestBuyPrice);
-    setAgentSellPrice(data.sellPrice);
-    setAgentResult(
-      `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice || "Not provided"}\n\n${data.reason}\n\nPrediction: ${data.prediction || "N/A"}`
-    );
-  } catch (error) {
-    console.error(error);
-    alert("Error analyzing the chart.");
-  }
-};
-
+    try {
+      const res = await fetch("/api/chart-analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticker: selectedStock }),
+      });
+      if (!res.ok) throw new Error("Failed to analyze chart");
+      const data = await res.json();
+      setAgentBuyPrice(data.bestBuyPrice);
+      setAgentSellPrice(data.sellPrice);
+      setAgentResult(
+        `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice || "Not provided"}\n\n${data.reason}\n\nPrediction: ${
+          data.prediction || "N/A"
+        }`
+      );
+    } catch (error) {
+      console.error(error);
+      alert("Error analyzing the chart.");
+    }
+  };
 
   const handlePickFromChart = () => {
     if (!selectedStock) return;
@@ -187,7 +202,7 @@ export default function Home() {
     <main className="h-screen w-screen bg-gray-100 flex flex-col">
       <Navbar />
       <div id="content-area" className="flex-1 relative">
-        {/* AI Recommendation Box */}
+        {/* AI Recommendation / Bot Box */}
         <Rnd
           bounds="#content-area"
           default={{ x: 20, y: 20, width: 400, height: 600 }}
@@ -198,6 +213,58 @@ export default function Home() {
         >
           <div className="flex flex-col p-4 flex-1">
             <h2 className="font-bold text-lg mb-2">AI Recommendation</h2>
+
+            {/* NEW: Bot daily pick + price box */}
+            {botData?.lastRec ? (
+              <div className="mb-3 text-sm border rounded p-2 bg-gray-50">
+                <div>
+                  <b>AI Pick:</b> {botData.lastRec.ticker}
+                </div>
+                <div>
+                  <b>Price:</b> ${Number(botData.lastRec.price).toFixed(2)}
+                </div>
+                <div>
+                  <b>Time:</b>{" "}
+                  {new Date(botData.lastRec.at).toLocaleTimeString("en-US", {
+                    timeZone: "America/New_York",
+                  })}{" "}
+                  ET
+                </div>
+              </div>
+            ) : (
+              <div className="text-gray-500 text-sm mb-3">
+                {botData?.skipped === "market_closed"
+                  ? "Market closed. Waiting for next session."
+                  : "No recommendation yet today."}
+              </div>
+            )}
+
+            {/* NEW: Account snapshot */}
+            {botData?.state && (
+              <div className="mb-3 text-sm border rounded p-2">
+                <div>
+                  Money I Have: <b>${Number(botData.state.cash).toFixed(2)}</b>
+                </div>
+                <div>
+                  Equity: <b>${Number(botData.state.equity).toFixed(2)}</b>
+                </div>
+                <div>
+                  PNL:{" "}
+                  <b className={Number(botData.state.pnl) >= 0 ? "text-green-600" : "text-red-600"}>
+                    {Number(botData.state.pnl) >= 0 ? "+" : ""}
+                    ${Number(botData.state.pnl).toFixed(2)}
+                  </b>
+                </div>
+                {botData?.live?.ticker && (
+                  <div className="mt-1 text-xs text-gray-600">
+                    Live: {botData.live.ticker}{" "}
+                    {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Manual “Ask AI” (your existing feature) */}
             <button
               onClick={askAIRecommendation}
               disabled={analyzing || stocks.length === 0}
@@ -212,6 +279,16 @@ export default function Home() {
             {recommendation && (
               <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>
             )}
+
+            {/* Server time (handy for debugging) */}
+            <div className="mt-auto text-xs text-gray-500">
+              Server ET:{" "}
+              {botData?.serverTimeET
+                ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", {
+                    timeZone: "America/New_York",
+                  })
+                : "…"}
+            </div>
           </div>
         </Rnd>
 
@@ -313,9 +390,7 @@ export default function Home() {
                         <td className="border p-2">
                           {stock.sharesOutstanding?.toLocaleString() || "-"}
                         </td>
-                        <td className="border p-2">
-                          {stock.volume?.toLocaleString() || "-"}
-                        </td>
+                        <td className="border p-2">{stock.volume?.toLocaleString() || "-"}</td>
                         <td className="border p-2">
                           {stock.employees != null ? stock.employees.toLocaleString() : "-"}
                         </td>
@@ -349,7 +424,6 @@ export default function Home() {
                 />
               </div>
               <div className="flex gap-3 mt-4">
-                {/* Removed the Ask AI button here */}
                 <button
                   onClick={handleAgent}
                   className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition"
