@@ -1,5 +1,13 @@
 {
+  "functions": {
+    "api/bot/tick.ts": {
+      "runtime": "nodejs18.x"
+    }
+  },
   "crons": [
-    { "path": "/api/bot/tick", "schedule": "*/1 13-21 * * 1-5" }
+    {
+      "path": "/api/bot/tick",
+      "schedule": "40 13 * * 1-5"
+    }
   ]
 }
