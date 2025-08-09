@@ -1,9 +1,5 @@
 {
-  "functions": {
-    "api/bot/tick.ts": {
-      "runtime": "nodejs18.x"
-    }
-  },
+  "version": 2,
   "crons": [
     {
       "path": "/api/bot/tick",
