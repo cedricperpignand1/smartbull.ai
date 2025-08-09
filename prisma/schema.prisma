@@ -69,6 +69,7 @@ model BotState {
   pnl         Decimal
   equity      Decimal
   lastRunDay  String?  // YYYY-MM-DD in ET
+  paused      Boolean  @default(false)   // Run/Pause toggle
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
@@ -78,10 +79,12 @@ model Recommendation {
   ticker    String
   price     Decimal   // Price at recommendation time
   at        DateTime  @default(now())
+
+  @@index([at])
 }
 
 model Position {
-  id         Int      @id @default(autoincrement())
+  id         Int       @id @default(autoincrement())
   ticker     String
   entryPrice Decimal
   shares     Int
@@ -89,6 +92,11 @@ model Position {
   open       Boolean   @default(true)
   exitPrice  Decimal?
   exitAt     DateTime?
+
+  pnlEntries PnlEntry[]
+
+  @@index([open])
+  @@index([entryAt])
 }
 
 model Trade {
@@ -98,4 +106,28 @@ model Trade {
   price  Decimal
   shares Int
   at     DateTime @default(now())
+
+  @@index([at])
+}
+
+// ----------
+// P&L HISTORY (one row per closed trade)
+// ----------
+model PnlEntry {
+  id         Int      @id @default(autoincrement())
+  positionId Int
+  position   Position @relation(fields: [positionId], references: [id])
+
+  ticker     String
+  entryPrice Decimal
+  exitPrice  Decimal
+  shares     Int
+
+  invested   Decimal   // entryPrice * shares at entry
+  realized   Decimal   // (exitPrice - entryPrice) * shares at exit
+
+  openedAt   DateTime  // from Position.entryAt
+  closedAt   DateTime  // when the SELL executed
+
+  @@index([closedAt])
 }

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { Prisma } from "@prisma/client"; // for Decimal math
 import { getQuote } from "@/lib/quote";
 import {
   isWeekdayET,
@@ -9,19 +10,25 @@ import {
   nowET,
 } from "@/lib/market";
 
-// Make sure Next/Vercel never caches this
+// Never cache this route
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 const START_CASH = 4000;
-const TP_PCT = 0.10; // +10% take-profit
+const TP_PCT = 0.10;  // +10% take-profit
 const SL_PCT = -0.05; // -5% stop-loss
 
 async function ensureState() {
   let s = await prisma.botState.findUnique({ where: { id: 1 } });
   if (!s) {
     s = await prisma.botState.create({
-      data: { id: 1, cash: START_CASH, pnl: 0, equity: START_CASH },
+      data: {
+        id: 1,
+        cash: START_CASH,
+        pnl: 0,
+        equity: START_CASH,
+        paused: false, // default running
+      },
     });
   }
   return s;
@@ -47,21 +54,30 @@ async function askAIForTicker(): Promise<string | null> {
   }
 }
 
-export async function GET() {
-  return handle();
-}
-export async function POST() {
-  return handle();
-}
+export async function GET() { return handle(); }
+export async function POST() { return handle(); }
 
 async function handle() {
   // Ensure bot state exists
   let state = await ensureState();
+
+  // ⛔ Respect Pause
+  if (state.paused) {
+    return NextResponse.json({
+      state,
+      lastRec: await getLastRecommendation(),
+      position: await getOpenPosition(),
+      live: null,
+      serverTimeET: nowET().toISOString(),
+      skipped: "paused",
+    });
+  }
+
   let openPos = await getOpenPosition();
   let lastRec = await getLastRecommendation();
   let livePrice: number | null = null;
 
-  // If market closed, just return current snapshot so UI can render
+  // If market closed, just return snapshot so UI can render
   if (!isWeekdayET() || !isMarketHoursET()) {
     return NextResponse.json({
       state,
@@ -147,9 +163,7 @@ async function handle() {
 
       // Exit on stop-loss or take-profit
       if (hitSL || hitTP) {
-        const exitVal = openPos.shares * p;
-        const entryVal = openPos.shares * entry;
-        const realized = exitVal - entryVal;
+        const closedAt = nowET();
 
         await prisma.trade.create({
           data: { side: "SELL", ticker: openPos.ticker, price: p, shares: openPos.shares },
@@ -157,14 +171,34 @@ async function handle() {
 
         await prisma.position.update({
           where: { id: openPos.id },
-          data: { open: false, exitPrice: p, exitAt: nowET() },
+          data: { open: false, exitPrice: p, exitAt: closedAt },
         });
 
+        // --- NEW: Write a P&L row ---
+        const invested = new Prisma.Decimal(openPos.entryPrice).mul(openPos.shares);
+        const realized = new Prisma.Decimal(p).minus(openPos.entryPrice).mul(openPos.shares);
+
+        await prisma.pnlEntry.create({
+          data: {
+            positionId: openPos.id,
+            ticker: openPos.ticker,
+            entryPrice: openPos.entryPrice,
+            exitPrice: p,
+            shares: openPos.shares,
+            invested,
+            realized,
+            openedAt: openPos.entryAt,
+            closedAt,
+          },
+        });
+
+        // Update cash / pnl / equity totals
+        const exitVal = openPos.shares * p;
         state = await prisma.botState.update({
           where: { id: 1 },
           data: {
             cash: Number(state.cash) + exitVal,
-            pnl: Number(state.pnl) + realized,
+            pnl: new Prisma.Decimal(state.pnl).plus(realized),
             equity: Number(state.cash) + exitVal,
           },
         });
