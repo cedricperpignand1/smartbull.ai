@@ -1,0 +1,111 @@
+// ----------
+// Datasource & Generator
+// ----------
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------
+// AUTH MODELS (NextAuth.js compatible)
+// ----------
+model User {
+  id             String    @id @default(cuid())
+  name           String?
+  email          String?   @unique
+  emailVerified  DateTime?
+  image          String?
+  hashedPassword String?
+  createdAt      DateTime  @default(now())
+  accounts       Account[]
+  sessions       Session[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id])
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ----------
+// BOT TRADING MODELS
+// ----------
+model BotState {
+  id         Int      @id @default(1)
+  cash       Decimal
+  pnl        Decimal
+  equity     Decimal
+  lastRunDay String? // YYYY-MM-DD in ET
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Recommendation {
+  id     Int      @id @default(autoincrement())
+  ticker String
+  price  Decimal // Price at recommendation time
+  at     DateTime @default(now())
+}
+
+model Position {
+  id         Int       @id @default(autoincrement())
+  ticker     String
+  entryPrice Decimal
+  shares     Int
+  entryAt    DateTime  @default(now())
+  open       Boolean   @default(true)
+  exitPrice  Decimal?
+  exitAt     DateTime?
+
+  // Alpaca parent BUY order id
+  brokerOrderId String? @unique
+}
+
+model Trade {
+  id     Int      @id @default(autoincrement())
+  side   String // "BUY" | "SELL"
+  ticker String
+  price  Decimal
+  shares Int
+  at     DateTime @default(now())
+
+  // Alpaca order id for this trade (parent for BUY, leg for SELL, or market close)
+  brokerOrderId String? @unique
+
+  // Actual fill info (from Alpaca)
+  filledAt    DateTime?
+  filledPrice Decimal?
+}
