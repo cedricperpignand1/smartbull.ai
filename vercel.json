@@ -1,7 +1,11 @@
 {
   "version": 2,
   "crons": [
-    { "path": "/api/bot/tick",     "schedule": "*/1 13-21 * * 1-5" },
-    { "path": "/api/alpaca/sync",  "schedule": "*/1 13-21 * * 1-5" }
+    { "path": "/api/bot/tick",        "schedule": "*/1 13-21 * * 1-5" },
+    { "path": "/api/alpaca/sync",     "schedule": "*/1 13-21 * * 1-5" },
+
+    { "path": "/api/stocks/snapshot", "schedule": "*/1 13-23 * * 1-5" },
+    
+    { "path": "/api/stocks/snapshot", "schedule": "*/1 0-1 * * 2-6" }
   ]
 }
