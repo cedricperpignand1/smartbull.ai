@@ -7,11 +7,21 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { nowET } from "@/lib/market";
 
-/** Step A: authorize Vercel Cron or token ?token=ALPACA_WEBHOOK_SECRET */
+/** Authorize: Vercel Cron OR token (?token=ALPACA_WEBHOOK_SECRET) */
 function authorized(req: Request) {
-  // Allow Vercel Cron (Vercel sets this header)
-  if (req.headers.get("x-vercel-cron") === "1") return true;
+  const h = req.headers;
 
+  // 1) Official Vercel Cron header
+  if (h.get("x-vercel-cron") === "1") return true;
+
+  // 2) Some Vercel invocations include this signature header
+  if (h.get("x-vercel-signature")) return true;
+
+  // 3) “Run” button sometimes only sets a UA with these hints
+  const ua = (h.get("user-agent") || "").toLowerCase();
+  if (ua.includes("vercel") && ua.includes("cron")) return true;
+
+  // 4) Explicit token in query string (manual calls / local tests)
   const SECRET = process.env.ALPACA_WEBHOOK_SECRET?.trim();
   if (!SECRET) return true; // dev convenience
   const u = new URL(req.url);
@@ -251,7 +261,9 @@ async function syncRecentOrders() {
 }
 
 export async function GET(req: Request) {
-  if (!authorized(req)) return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  if (!authorized(req)) {
+    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+  }
   try {
     const res = await syncRecentOrders();
     return NextResponse.json({ ok: true, ...res });
