@@ -7,10 +7,13 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { nowET } from "@/lib/market";
 
-/** Protect the endpoint with ?token=ALPACA_WEBHOOK_SECRET */
+/** Step A: authorize Vercel Cron or token ?token=ALPACA_WEBHOOK_SECRET */
 function authorized(req: Request) {
+  // Allow Vercel Cron (Vercel sets this header)
+  if (req.headers.get("x-vercel-cron") === "1") return true;
+
   const SECRET = process.env.ALPACA_WEBHOOK_SECRET?.trim();
-  if (!SECRET) return true; // dev OK
+  if (!SECRET) return true; // dev convenience
   const u = new URL(req.url);
   return u.searchParams.get("token") === SECRET;
 }
@@ -41,7 +44,7 @@ type AlpOrder = {
   id: string;
   client_order_id?: string;
   symbol: string;
-  side: "buy" | "sell" | "unknown";   // ← patched
+  side: "buy" | "sell" | "unknown";
   status: string;
   qty?: string | number;
   filled_qty?: string | number;
