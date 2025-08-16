@@ -774,7 +774,7 @@ export default function Home() {
             </div>
 
             <div className="mt-3 text-xs text-slate-500">
-              Hint: password is <span className="font-semibold">9340</span>
+              Hint: password is <span className="font-semibold">Fuck OFF</span>
             </div>
           </div>
         </div>
