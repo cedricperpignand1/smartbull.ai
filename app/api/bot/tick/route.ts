@@ -9,32 +9,49 @@ import { getQuote } from "@/lib/quote";
 import { isWeekdayET, isMarketHoursET, yyyyMmDdET, nowET } from "@/lib/market";
 import { submitBracketBuy, closePositionMarket } from "@/lib/alpaca";
 
-/** Throttle */
+/** ───────────────── Throttle / Coalesce ───────────────── */
 let lastTickAt = 0;
 let lastTickResponse: any = null;
 let pendingTick: Promise<any> | null = null;
 const MIN_TICK_MS = 500;
 
-/** Config */
+/** ───────────────── Config ───────────────── */
 const START_CASH = 4000;
-const INVEST_BUDGET = 4000;
-const TARGET_PCT = 0.10;
-const STOP_PCT   = -0.05;
-const MAX_SLIPPAGE_PCT = 0.003;
+const INVEST_BUDGET = 4000;     // cap per trade; if cash < 4k use all cash
+const TARGET_PCT = 0.10;        // +10% TP
+const STOP_PCT   = -0.05;       // -5% SL
+const MAX_SLIPPAGE_PCT = 0.003; // +0.3% above ref price
 const SNAPSHOT_STALE_MS = 5_000;
 const TOP_CANDIDATES    = 8;
 
-/** Windows */
-function entryWindowOpenET() { const d = nowET(); const m = d.getHours()*60 + d.getMinutes(); return m >= (9*60 + 34) && m <= (10*60 + 15); }
-function isForceBuyMinuteET(){ const d = nowET(); return d.getHours()===10 && d.getMinutes()===15; }
-function isMandatoryExitET() { const d = nowET(); const m = d.getHours()*60 + d.getMinutes(); return m >= (15*60 + 55); }
+/** ───────────────── Time Windows (ET) ───────────────── */
+function entryWindowOpenET() {
+  const d = nowET();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  return mins >= (9 * 60 + 34) && mins <= (10 * 60 + 15);
+}
+function isForceBuyMinuteET() {
+  const d = nowET();
+  return d.getHours() === 10 && d.getMinutes() === 15;
+}
+function isMandatoryExitET() {
+  const d = nowET();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  return mins >= (15 * 60 + 55);
+}
 
-/** Helpers & types */
+/** ───────────────── Types & helpers ───────────────── */
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
-type SnapStock = { ticker: string; price?: number|null; changesPercentage?: number|null; volume?: number|null; avgVolume?: number|null; marketCap?: number|null; };
+type SnapStock = { ticker: string; price?: number | null; changesPercentage?: number | null; volume?: number | null; avgVolume?: number | null; marketCap?: number | null; };
 
-function toET(dateIso: string){ return new Date(new Date(dateIso).toLocaleString("en-US",{ timeZone:"America/New_York"})); }
-function isSameETDay(d: Date, ymd: string){ const mo=String(d.getMonth()+1).padStart(2,"0"); const da=String(d.getDate()).padStart(2,"0"); return `${d.getFullYear()}-${mo}-${da}`===ymd; }
+function toET(dateIso: string) {
+  return new Date(new Date(dateIso).toLocaleString("en-US", { timeZone: "America/New_York" }));
+}
+function isSameETDay(d: Date, ymd: string) {
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mo}-${da}` === ymd;
+}
 
 async function fetchCandles1m(symbol: string, limit = 240): Promise<Candle[]> {
   const rel = `/api/fmp/candles?symbol=${encodeURIComponent(symbol)}&interval=1min&limit=${limit}`;
@@ -42,10 +59,17 @@ async function fetchCandles1m(symbol: string, limit = 240): Promise<Candle[]> {
   if (!res.ok) return [];
   const j = await res.json();
   const arr = Array.isArray(j?.candles) ? j.candles : [];
-  return arr.map((c: any) => ({ date:c.date, open:+c.open, high:+c.high, low:+c.low, close:+c.close, volume:+c.volume }));
+  return arr.map((c: any) => ({
+    date: c.date,
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close),
+    volume: Number(c.volume),
+  }));
 }
 
-// ---------- typed callbacks below (fixes “implicit any”) ----------
+/** ───────────────── Intraday signals (typed) ───────────────── */
 function computeOpeningRange(candles: Candle[], todayYMD: string) {
   const window = candles.filter((c: Candle) => {
     const d = toET(c.date);
@@ -64,13 +88,13 @@ function computeSessionVWAP(candles: Candle[], todayYMD: string) {
     return isSameETDay(d, todayYMD) && mins >= 9 * 60 + 30;
   });
   if (!session.length) return null;
-  let pv = 0, vol = 0;
+  let pvSum = 0, volSum = 0;
   for (const c of session) {
     const typical = (c.high + c.low + c.close) / 3;
-    pv += typical * c.volume;
-    vol += c.volume;
+    pvSum += typical * c.volume;
+    volSum += c.volume;
   }
-  return vol > 0 ? pv / vol : null;
+  return volSum > 0 ? pvSum / volSum : null;
 }
 
 function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
@@ -78,7 +102,7 @@ function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
   if (dayC.length < lookback + 1) return null;
   const latest = dayC[dayC.length - 1];
   const prior  = dayC.slice(-1 - lookback, -1);
-  const avgPrior = prior.reduce((sum: number, c: Candle) => sum + c.volume, 0) / lookback;
+  const avgPrior = prior.reduce((s: number, c: Candle) => s + c.volume, 0) / lookback;
   if (!avgPrior) return { mult: null as number | null, latestVol: latest.volume, avgPrior };
   return { mult: latest.volume / avgPrior, latestVol: latest.volume, avgPrior };
 }
@@ -98,70 +122,112 @@ function brokeRecentHighs(candles: Candle[], todayYMD: string, n = 3) {
   const priorMax = Math.max(...prior.map((c: Candle) => c.high));
   return last.close > priorMax;
 }
-// -------------------------------------------------------------------
 
-function getBaseUrl(req: Request){ const envBase=process.env.NEXT_PUBLIC_BASE_URL?.trim(); if(envBase) return envBase.replace(/\/+$/,""); const proto=(req.headers.get("x-forwarded-proto")||"http").split(",")[0].trim(); const host=(req.headers.get("x-forwarded-host")||req.headers.get("host")||"").split(",")[0].trim(); return `${proto}://${host}`; }
-async function getSnapshot(baseUrl: string){ try{ const r=await fetch(`${baseUrl}/api/stocks/snapshot`,{cache:"no-store"}); if(!r.ok) return null; const j=await r.json(); return {stocks:Array.isArray(j?.stocks)?j.stocks:[], updatedAt:j?.updatedAt||new Date().toISOString()}; } catch { return null; } }
+/** ───────────────── Snapshot helpers ───────────────── */
+function getBaseUrl(req: Request) {
+  const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
+  if (envBase) return envBase.replace(/\/+$/, "");
+  const proto = (req.headers.get("x-forwarded-proto") || "http").split(",")[0].trim();
+  const host  = (req.headers.get("x-forwarded-host") || req.headers.get("host") || "").split(",")[0].trim();
+  return `${proto}://${host}`;
+}
+async function getSnapshot(baseUrl: string): Promise<{ stocks: SnapStock[]; updatedAt: string } | null> {
+  try {
+    const r = await fetch(`${baseUrl}/api/stocks/snapshot`, { cache: "no-store" });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return { stocks: Array.isArray(j?.stocks) ? j.stocks : [], updatedAt: j?.updatedAt || new Date().toISOString() };
+  } catch { return null; }
+}
 
-async function ensureTodayRecommendationFromSnapshot(req: Request, top: SnapStock[]){
+async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: SnapStock[]) {
   const today = yyyyMmDdET();
   let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
-  const recDay = lastRec?.at instanceof Date ? `${lastRec.at.getFullYear()}-${String(lastRec.at.getMonth()+1).padStart(2,"0")}-${String(lastRec.at.getDate()).padStart(2,"0")}` : null;
-  if (lastRec && recDay === today) return lastRec;
-  if (!entryWindowOpenET() || !top.length) return lastRec || null;
 
-  try{
+  const recDay =
+    lastRec?.at instanceof Date
+      ? `${lastRec.at.getFullYear()}-${String(lastRec.at.getMonth() + 1).padStart(2, "0")}-${String(lastRec.at.getDate()).padStart(2, "0")}`
+      : null;
+
+  if (lastRec && recDay === today) return lastRec;
+  if (!entryWindowOpenET() || !topStocks.length) return lastRec || null;
+
+  try {
     const base = getBaseUrl(req);
-    const rRes = await fetch(`${base}/api/recommendation`, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ stocks: top }), cache:"no-store" });
+    const rRes = await fetch(`${base}/api/recommendation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stocks: topStocks }),
+      cache: "no-store",
+    });
     if (!rRes.ok) return lastRec || null;
+
     const rJson = await rRes.json();
     const txt: string = rJson?.recommendation || "";
     const m = /Pick:\s*([A-Z][A-Z0-9.\-]*)/i.exec(txt);
     const ticker = m?.[1]?.toUpperCase() || null;
     if (!ticker) return lastRec || null;
 
-    const priceCandidate = top.find((s: SnapStock) => s.ticker === ticker)?.price ?? (await getQuote(ticker));
+    const priceCandidate =
+      topStocks.find((s: SnapStock) => s.ticker === ticker)?.price ?? (await getQuote(ticker));
+
     if (priceCandidate == null || !Number.isFinite(Number(priceCandidate))) return lastRec || null;
 
     lastRec = await prisma.recommendation.create({ data: { ticker, price: Number(priceCandidate) } });
     return lastRec;
-  } catch { return lastRec || null; }
+  } catch {
+    return lastRec || null;
+  }
 }
 
-export async function GET(req: Request){ return handle(req); }
-export async function POST(req: Request){ return handle(req); }
+/** ───────────────── Route handlers ───────────────── */
+export async function GET(req: Request) { return handle(req); }
+export async function POST(req: Request) { return handle(req); }
 
-async function handle(req: Request){
+async function handle(req: Request) {
   const now = Date.now();
-  if (pendingTick){ const data = await pendingTick; return NextResponse.json(data); }
-  if (lastTickResponse && now - lastTickAt < MIN_TICK_MS) return NextResponse.json(lastTickResponse);
+
+  if (pendingTick) {
+    const data = await pendingTick;
+    return NextResponse.json(data);
+  }
+  if (lastTickResponse && now - lastTickAt < MIN_TICK_MS) {
+    return NextResponse.json(lastTickResponse);
+  }
 
   pendingTick = (async () => {
     const debug: any = { reasons: [] as string[] };
 
-    // Ensure state
+    // Ensure state exists
     let state = await prisma.botState.findUnique({ where: { id: 1 } });
-    if (!state) state = await prisma.botState.create({ data: { id: 1, cash: START_CASH, pnl: 0, equity: START_CASH } });
+    if (!state) {
+      state = await prisma.botState.create({ data: { id: 1, cash: START_CASH, pnl: 0, equity: START_CASH } });
+    }
 
     let openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
     let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
     let livePrice: number | null = null;
     const today = yyyyMmDdET();
 
-    // ---------- Mandatory exit (>= 15:55 ET) ----------
+    /** ── Mandatory exit at/after 15:55 ET (never hold overnight) ── */
     if (openPos && isMandatoryExitET()) {
-      const exitTicker = openPos.ticker; // capture before nulling
+      const exitTicker = openPos.ticker;
       try {
-        await closePositionMarket(exitTicker);
+        await closePositionMarket(exitTicker); // market close via Alpaca
+
         const pQuote = await getQuote(exitTicker);
-        const p = (pQuote != null && Number.isFinite(Number(pQuote))) ? Number(pQuote) : Number(openPos.entryPrice);
+        const p = (pQuote != null && Number.isFinite(Number(pQuote)))
+          ? Number(pQuote)
+          : Number(openPos.entryPrice);
 
-        const exitVal  = Number(openPos.shares) * p;
+        const shares   = Number(openPos.shares);
         const entry    = Number(openPos.entryPrice);
-        const realized = exitVal - Number(openPos.shares) * entry;
+        const exitVal  = shares * p;
+        const realized = exitVal - shares * entry;
 
-        await prisma.trade.create({ data: { side: "SELL", ticker: exitTicker, price: p, shares: openPos.shares } });
+        await prisma.trade.create({ data: { side: "SELL", ticker: exitTicker, price: p, shares } });
         await prisma.position.update({ where: { id: openPos.id }, data: { open: false, exitPrice: p, exitAt: nowET() } });
+
         state = await prisma.botState.update({
           where: { id: 1 },
           data: {
@@ -170,6 +236,7 @@ async function handle(req: Request){
             equity: Number(state.cash) + exitVal,
           },
         });
+
         openPos = null;
         debug.lastMessage = `⏱️ Mandatory 15:55+ exit ${exitTicker}`;
       } catch (e: any) {
@@ -178,37 +245,51 @@ async function handle(req: Request){
       }
     }
 
+    // Weekday/market-hours gates
     if (!isWeekdayET()) {
       debug.reasons.push("not_weekday");
-      return { state, lastRec, position: openPos, live: null, serverTimeET: nowET().toISOString(), skipped: "not_weekday", debug };
+      return {
+        state, lastRec, position: openPos, live: null,
+        serverTimeET: nowET().toISOString(), skipped: "not_weekday", debug
+      };
     }
     const marketOpen = isMarketHoursET();
 
-    // Snapshot
+    // Snapshot (coalesced upstream)
     const base = getBaseUrl(req);
     const snapshot = await getSnapshot(base);
-    if (!openPos && (!snapshot?.stocks?.length || (Date.now() - new Date(snapshot?.updatedAt || 0).getTime()) > SNAPSHOT_STALE_MS)) {
+
+    if (!openPos && (!snapshot?.stocks?.length ||
+        (Date.now() - new Date(snapshot?.updatedAt || 0).getTime()) > SNAPSHOT_STALE_MS)) {
       debug.reasons.push("no_or_stale_snapshot");
-      return { state, lastRec, position: openPos, live: null, serverTimeET: nowET().toISOString(), skipped: "no_or_stale_snapshot", debug };
+      return {
+        state, lastRec, position: openPos, live: null,
+        serverTimeET: nowET().toISOString(), skipped: "no_or_stale_snapshot", debug
+      };
     }
+
     const top8: SnapStock[] = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
 
-    // Live price for UI
-    const liveTicker: string | null = openPos ? openPos.ticker : lastRec ? (lastRec as any).ticker : null;
+    // Live price (for UI/status)
+    const liveTicker: string | null = openPos?.ticker ?? (lastRec as any)?.ticker ?? null;
     if (liveTicker) {
       const s = snapshot?.stocks?.find((x: SnapStock) => x.ticker === liveTicker);
-      livePrice = (s?.price != null && Number.isFinite(Number(s.price))) ? Number(s.price) : (await getQuote(liveTicker) ?? null) as any;
-      if (typeof livePrice === "string") livePrice = Number(livePrice);
+      if (s?.price != null && Number.isFinite(Number(s.price))) {
+        livePrice = Number(s.price);
+      } else {
+        const q = await getQuote(liveTicker);
+        if (q != null && Number.isFinite(Number(q))) livePrice = Number(q);
+      }
     }
 
     const inEntryWindow = entryWindowOpenET();
 
-    // Ensure same-day AI pick
+    // Ensure same-day AI pick (from top-8)
     if (!openPos && inEntryWindow && (!lastRec || !isSameETDay(lastRec.at ?? new Date(), today))) {
       lastRec = await ensureTodayRecommendationFromSnapshot(req, top8);
     }
 
-    // ---------- Entry (1/day) ----------
+    /** ───────────────── Entry (one/day) ───────────────── */
     if (!openPos && inEntryWindow && marketOpen && (state.lastRunDay !== today) && lastRec?.ticker) {
       try {
         const candles = await fetchCandles1m(lastRec.ticker, 240);
@@ -217,12 +298,12 @@ async function handle(req: Request){
           const orRange = computeOpeningRange(candles, today);
           const vwap    = computeSessionVWAP(candles, today);
           const vol     = computeVolumePulse(candles, today, 5);
-          const last    = day[day.length-1];
+          const last    = day[day.length - 1];
           const dayHigh = computeDayHighSoFar(candles, today);
 
           const aboveVWAP = vwap != null && last ? last.close >= vwap : false;
           const brokeOR   = !!(orRange && last && last.close > orRange.high);
-          const pullback  = !!(orRange && last && last.low >= orRange.high * 0.985);
+          const pullback  = !!(orRange && last && last.low   >= orRange.high * 0.985);
           const brokeDay  = (typeof dayHigh === "number" && last) ? last.close > dayHigh : brokeOR;
           const broke3    = brokeRecentHighs(candles, today, 3);
           const volOK     = (vol?.mult ?? 0) >= 1.1;
@@ -230,7 +311,7 @@ async function handle(req: Request){
           const armed = aboveVWAP && volOK && ((brokeOR && pullback) || brokeDay || broke3);
 
           if (armed || isForceBuyMinuteET()) {
-            // lock 1/day
+            // claim 1/day slot
             const claim = await prisma.botState.updateMany({
               where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
               data: { lastRunDay: today },
@@ -238,6 +319,7 @@ async function handle(req: Request){
             const claimed = claim.count === 1;
 
             if (claimed) {
+              // re-check after claim (safety)
               openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
               if (!openPos) {
                 // price source: snapshot -> rec.price -> live quote
@@ -245,7 +327,8 @@ async function handle(req: Request){
                   Number(snapshot?.stocks?.find((s: SnapStock) => s.ticker === lastRec!.ticker)?.price ?? NaN);
                 if (!Number.isFinite(entryRefPrice)) entryRefPrice = Number(lastRec!.price);
                 if (!Number.isFinite(entryRefPrice)) {
-                  const q = await getQuote(lastRec!.ticker); if (q != null && Number.isFinite(Number(q))) entryRefPrice = Number(q);
+                  const q = await getQuote(lastRec!.ticker);
+                  if (q != null && Number.isFinite(Number(q))) entryRefPrice = Number(q);
                 }
 
                 if (entryRefPrice != null && Number.isFinite(entryRefPrice)) {
@@ -259,17 +342,22 @@ async function handle(req: Request){
                   const shares  = Math.floor(budget / limit);
 
                   if (shares > 0) {
-                    // Place Alpaca bracket
-                    const order = await submitBracketBuy({ symbol: lastRec.ticker, qty: shares, limit, tp, sl, tif: "day" });
+                    // Place Alpaca bracket (DAY)
+                    const order = await submitBracketBuy({
+                      symbol: lastRec.ticker, qty: shares, limit, tp, sl, tif: "day",
+                    });
 
                     const used = shares * limit;
+
                     const pos = await prisma.position.create({
                       data: { ticker: lastRec.ticker, entryPrice: limit, shares, open: true, brokerOrderId: order.id },
                     });
                     openPos = pos;
+
                     await prisma.trade.create({
                       data: { side: "BUY", ticker: lastRec.ticker, price: limit, shares, brokerOrderId: order.id },
                     });
+
                     await prisma.botState.update({
                       where: { id: 1 },
                       data: { cash: cashNum - used, equity: cashNum - used + shares * (livePrice ?? limit) },
@@ -285,12 +373,17 @@ async function handle(req: Request){
       }
     }
 
-    // ---------- Holding (refresh equity) ----------
+    /** ───────────────── Holding: refresh equity ───────────────── */
     if (openPos) {
       let p: number | null = null;
       const s = snapshot?.stocks?.find((x: SnapStock) => x.ticker === openPos!.ticker);
-      if (s?.price != null && Number.isFinite(Number(s.price))) p = Number(s.price);
-      else { const q = await getQuote(openPos.ticker); if (q != null && Number.isFinite(Number(q))) p = Number(q); }
+      if (s?.price != null && Number.isFinite(Number(s.price))) {
+        p = Number(s.price);
+      } else {
+        const q = await getQuote(openPos.ticker);
+        if (q != null && Number.isFinite(Number(q))) p = Number(q);
+      }
+
       if (p != null) {
         const equityNow = Number(state.cash) + Number(openPos.shares) * p;
         if (Number(state.equity) !== equityNow) {
@@ -303,7 +396,7 @@ async function handle(req: Request){
       state,
       lastRec,
       position: openPos,
-      live: { ticker: liveTicker, price: livePrice },
+      live: { ticker: liveTicker, price: livePrice }, // reuse the single declaration
       serverTimeET: nowET().toISOString(),
       info: {
         entryWindowOpen_0934_1015: entryWindowOpenET(),
