@@ -69,7 +69,7 @@ async function fetchCandles1m(symbol: string, limit = 240): Promise<Candle[]> {
   }));
 }
 
-/** ───────────────── Intraday signals (typed) ───────────────── */
+/** ───────────────── Intraday signals ───────────────── */
 function computeOpeningRange(candles: Candle[], todayYMD: string) {
   const window = candles.filter((c: Candle) => {
     const d = toET(c.date);
@@ -245,7 +245,7 @@ async function handle(req: Request) {
       }
     }
 
-    // Weekday/market-hours gates
+    // Weekday gate
     if (!isWeekdayET()) {
       debug.reasons.push("not_weekday");
       return {
@@ -254,13 +254,16 @@ async function handle(req: Request) {
       };
     }
     const marketOpen = isMarketHoursET();
+    const inEntryWindow = entryWindowOpenET();
+    const forceMinute = isForceBuyMinuteET();
 
-    // Snapshot (coalesced upstream)
+    // Snapshot (coalesced upstream) — allow bypass at force minute
     const base = getBaseUrl(req);
     const snapshot = await getSnapshot(base);
+    const snapAgeMs = snapshot ? (Date.now() - new Date(snapshot.updatedAt).getTime()) : Number.POSITIVE_INFINITY;
+    const hasFreshSnapshot = !!(snapshot?.stocks?.length && snapAgeMs <= SNAPSHOT_STALE_MS);
 
-    if (!openPos && (!snapshot?.stocks?.length ||
-        (Date.now() - new Date(snapshot?.updatedAt || 0).getTime()) > SNAPSHOT_STALE_MS)) {
+    if (!openPos && !hasFreshSnapshot && !forceMinute) {
       debug.reasons.push("no_or_stale_snapshot");
       return {
         state, lastRec, position: openPos, live: null,
@@ -269,6 +272,9 @@ async function handle(req: Request) {
     }
 
     const top8: SnapStock[] = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
+    debug.snapshotAgeMs = Number.isFinite(snapAgeMs) ? snapAgeMs : null;
+    debug.forceMinuteBypass = forceMinute && !hasFreshSnapshot ? true : false;
+    debug.top8 = top8.map(s => s.ticker);
 
     // Live price (for UI/status)
     const liveTicker: string | null = openPos?.ticker ?? (lastRec as any)?.ticker ?? null;
@@ -282,11 +288,25 @@ async function handle(req: Request) {
       }
     }
 
-    const inEntryWindow = entryWindowOpenET();
-
-    // Ensure same-day AI pick (from top-8)
+    // Ensure same-day AI pick (from top-8). If force minute and no fresh snapshot,
+    // we still try with whatever snapshot we have; if still no pick, we will fallback to top8[0].
     if (!openPos && inEntryWindow && (!lastRec || !isSameETDay(lastRec.at ?? new Date(), today))) {
       lastRec = await ensureTodayRecommendationFromSnapshot(req, top8);
+      if (!lastRec && forceMinute && top8.length) {
+        // fallback pick at force minute using top-1 from snapshot (even if stale)
+        const t = top8[0];
+        let price = Number(t?.price ?? NaN);
+        if (!Number.isFinite(price)) {
+          const q = await getQuote(t.ticker);
+          if (q != null && Number.isFinite(Number(q))) price = Number(q);
+        }
+        if (Number.isFinite(price)) {
+          lastRec = await prisma.recommendation.create({ data: { ticker: t.ticker, price } });
+          debug.fallbackPickAtForceMinute = t.ticker;
+        } else {
+          debug.reasons.push("force_minute_no_price_for_fallback_pick");
+        }
+      }
     }
 
     /** ───────────────── Entry (one/day) ───────────────── */
@@ -310,13 +330,17 @@ async function handle(req: Request) {
 
           const armed = aboveVWAP && volOK && ((brokeOR && pullback) || brokeDay || broke3);
 
-          if (armed || isForceBuyMinuteET()) {
+          if (armed || forceMinute) {
             // claim 1/day slot
             const claim = await prisma.botState.updateMany({
               where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
               data: { lastRunDay: today },
             });
             const claimed = claim.count === 1;
+            debug.claimAttempted = true;
+            debug.claimWon = claimed;
+
+            let bought = false;
 
             if (claimed) {
               // re-check after claim (safety)
@@ -342,34 +366,60 @@ async function handle(req: Request) {
                   const shares  = Math.floor(budget / limit);
 
                   if (shares > 0) {
-                    // Place Alpaca bracket (DAY)
-                    const order = await submitBracketBuy({
-                      symbol: lastRec.ticker, qty: shares, limit, tp, sl, tif: "day",
-                    });
+                    try {
+                      // Place Alpaca bracket (DAY)
+                      const order = await submitBracketBuy({
+                        symbol: lastRec.ticker, qty: shares, limit, tp, sl, tif: "day",
+                      });
 
-                    const used = shares * limit;
+                      const used = shares * limit;
 
-                    const pos = await prisma.position.create({
-                      data: { ticker: lastRec.ticker, entryPrice: limit, shares, open: true, brokerOrderId: order.id },
-                    });
-                    openPos = pos;
+                      const pos = await prisma.position.create({
+                        data: { ticker: lastRec.ticker, entryPrice: limit, shares, open: true, brokerOrderId: order.id },
+                      });
+                      openPos = pos;
 
-                    await prisma.trade.create({
-                      data: { side: "BUY", ticker: lastRec.ticker, price: limit, shares, brokerOrderId: order.id },
-                    });
+                      await prisma.trade.create({
+                        data: { side: "BUY", ticker: lastRec.ticker, price: limit, shares, brokerOrderId: order.id },
+                      });
 
-                    await prisma.botState.update({
-                      where: { id: 1 },
-                      data: { cash: cashNum - used, equity: cashNum - used + shares * (livePrice ?? limit) },
-                    });
+                      await prisma.botState.update({
+                        where: { id: 1 },
+                        data: { cash: cashNum - used, equity: cashNum - used + shares * (livePrice ?? limit) },
+                      });
+
+                      bought = true;
+                      debug.lastMessage = `🚀 BUY ${lastRec!.ticker} @ ${limit.toFixed(2)} (armed=${armed} force=${forceMinute})`;
+                    } catch (e: any) {
+                      debug.reasons.push(`alpaca_submit_error:${e?.message || "unknown"}`);
+                    }
+                  } else {
+                    debug.reasons.push("insufficient_budget_for_one_share");
                   }
+                } else {
+                  debug.reasons.push("no_price_for_entry");
                 }
+              } else {
+                debug.reasons.push("position_open_after_claim");
               }
+
+              // 🔁 If we claimed but didn't buy, release the day lock so later ticks can retry
+              if (!bought) {
+                await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+                debug.releasedLock = true;
+              }
+            } else {
+              debug.reasons.push("day_lock_already_claimed");
             }
+          } else {
+            debug.reasons.push("signals_not_armed");
           }
+        } else {
+          debug.reasons.push("no_day_candles");
         }
       } catch (e: any) {
         console.error("entry evaluation error", e?.message || e);
+        debug.reasons.push("entry_exception");
       }
     }
 
@@ -396,13 +446,13 @@ async function handle(req: Request) {
       state,
       lastRec,
       position: openPos,
-      live: { ticker: liveTicker, price: livePrice }, // reuse the single declaration
+      live: { ticker: openPos?.ticker ?? (lastRec as any)?.ticker ?? null, price: livePrice },
       serverTimeET: nowET().toISOString(),
       info: {
-        entryWindowOpen_0934_1015: entryWindowOpenET(),
-        isForceBuyMinute_1015: isForceBuyMinuteET(),
+        entryWindowOpen_0934_1015: inEntryWindow,
+        isForceBuyMinute_1015: forceMinute,
         isMandatoryExit_1555: isMandatoryExitET(),
-        snapshotAgeMs: snapshot ? (Date.now() - new Date(snapshot.updatedAt).getTime()) : null,
+        snapshotAgeMs: Number.isFinite(snapAgeMs) ? snapAgeMs : null,
         investBudget: INVEST_BUDGET,
       },
       debug,
