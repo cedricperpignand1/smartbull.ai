@@ -25,15 +25,19 @@ const SNAPSHOT_STALE_MS = 5_000;
 const TOP_CANDIDATES    = 8;
 
 /** ───────────────── Time Windows (ET) ───────────────── */
+// Standard entry window 09:34–10:15 ET
 function entryWindowOpenET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
   return mins >= (9 * 60 + 34) && mins <= (10 * 60 + 15);
 }
-function isForceBuyMinuteET() {
+// Force-buy retry window 10:15–10:16 ET (no signal checks, but still requires AI pick)
+function isForceBuyWindowET() {
   const d = nowET();
-  return d.getHours() === 10 && d.getMinutes() === 15;
+  const mins = d.getHours() * 60 + d.getMinutes();
+  return mins >= (10 * 60 + 15) && mins <= (10 * 60 + 16);
 }
+// Never hold overnight
 function isMandatoryExitET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
@@ -140,6 +144,7 @@ async function getSnapshot(baseUrl: string): Promise<{ stocks: SnapStock[]; upda
   } catch { return null; }
 }
 
+/** Only asks AI to pick from provided top stocks; never falls back to anything else */
 async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: SnapStock[]) {
   const today = yyyyMmDdET();
   let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
@@ -150,7 +155,7 @@ async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: Sn
       : null;
 
   if (lastRec && recDay === today) return lastRec;
-  if (!entryWindowOpenET() || !topStocks.length) return lastRec || null;
+  if (!topStocks.length) return lastRec || null;
 
   try {
     const base = getBaseUrl(req);
@@ -209,11 +214,11 @@ async function handle(req: Request) {
     let livePrice: number | null = null;
     const today = yyyyMmDdET();
 
-    /** ── Mandatory exit at/after 15:55 ET (never hold overnight) ── */
+    /** ── Mandatory exit at/after 15:55 ET ── */
     if (openPos && isMandatoryExitET()) {
       const exitTicker = openPos.ticker;
       try {
-        await closePositionMarket(exitTicker); // market close via Alpaca
+        await closePositionMarket(exitTicker);
 
         const pQuote = await getQuote(exitTicker);
         const p = (pQuote != null && Number.isFinite(Number(pQuote)))
@@ -253,17 +258,18 @@ async function handle(req: Request) {
         serverTimeET: nowET().toISOString(), skipped: "not_weekday", debug
       };
     }
-    const marketOpen = isMarketHoursET();
-    const inEntryWindow = entryWindowOpenET();
-    const forceMinute = isForceBuyMinuteET();
 
-    // Snapshot (coalesced upstream) — allow bypass at force minute
+    const marketOpen    = isMarketHoursET();
+    const inEntryWindow = entryWindowOpenET();
+    const forceWindow   = isForceBuyWindowET();
+
+    // Snapshot (coalesced upstream) — allow bypass during force window
     const base = getBaseUrl(req);
     const snapshot = await getSnapshot(base);
     const snapAgeMs = snapshot ? (Date.now() - new Date(snapshot.updatedAt).getTime()) : Number.POSITIVE_INFINITY;
     const hasFreshSnapshot = !!(snapshot?.stocks?.length && snapAgeMs <= SNAPSHOT_STALE_MS);
 
-    if (!openPos && !hasFreshSnapshot && !forceMinute) {
+    if (!openPos && !hasFreshSnapshot && !forceWindow) {
       debug.reasons.push("no_or_stale_snapshot");
       return {
         state, lastRec, position: openPos, live: null,
@@ -273,10 +279,10 @@ async function handle(req: Request) {
 
     const top8: SnapStock[] = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
     debug.snapshotAgeMs = Number.isFinite(snapAgeMs) ? snapAgeMs : null;
-    debug.forceMinuteBypass = forceMinute && !hasFreshSnapshot ? true : false;
+    debug.forceWindowBypass = forceWindow && !hasFreshSnapshot ? true : false;
     debug.top8 = top8.map(s => s.ticker);
 
-    // Live price (for UI/status)
+    // Live price for UI
     const liveTicker: string | null = openPos?.ticker ?? (lastRec as any)?.ticker ?? null;
     if (liveTicker) {
       const s = snapshot?.stocks?.find((x: SnapStock) => x.ticker === liveTicker);
@@ -288,29 +294,14 @@ async function handle(req: Request) {
       }
     }
 
-    // Ensure same-day AI pick (from top-8). If force minute and no fresh snapshot,
-    // we still try with whatever snapshot we have; if still no pick, we will fallback to top8[0].
-    if (!openPos && inEntryWindow && (!lastRec || !isSameETDay(lastRec.at ?? new Date(), today))) {
+    // Ensure same-day AI pick ONLY (no fallback). During force window we still try
+    // to ask AI, but if AI doesn't return a pick, we DO NOT buy.
+    if (!openPos && (inEntryWindow || forceWindow) && (!lastRec || !isSameETDay(lastRec.at ?? new Date(), today))) {
       lastRec = await ensureTodayRecommendationFromSnapshot(req, top8);
-      if (!lastRec && forceMinute && top8.length) {
-        // fallback pick at force minute using top-1 from snapshot (even if stale)
-        const t = top8[0];
-        let price = Number(t?.price ?? NaN);
-        if (!Number.isFinite(price)) {
-          const q = await getQuote(t.ticker);
-          if (q != null && Number.isFinite(Number(q))) price = Number(q);
-        }
-        if (Number.isFinite(price)) {
-          lastRec = await prisma.recommendation.create({ data: { ticker: t.ticker, price } });
-          debug.fallbackPickAtForceMinute = t.ticker;
-        } else {
-          debug.reasons.push("force_minute_no_price_for_fallback_pick");
-        }
-      }
     }
 
-    /** ───────────────── Entry (one/day) ───────────────── */
-    if (!openPos && inEntryWindow && marketOpen && (state.lastRunDay !== today) && lastRec?.ticker) {
+    /** ───────────────── Entry (one/day; requires AI pick) ───────────────── */
+    if (!openPos && (inEntryWindow || forceWindow) && marketOpen && (state.lastRunDay !== today) && lastRec?.ticker) {
       try {
         const candles = await fetchCandles1m(lastRec.ticker, 240);
         const day = candles.filter((c: Candle) => isSameETDay(toET(c.date), today));
@@ -328,9 +319,10 @@ async function handle(req: Request) {
           const broke3    = brokeRecentHighs(candles, today, 3);
           const volOK     = (vol?.mult ?? 0) >= 1.1;
 
-          const armed = aboveVWAP && volOK && ((brokeOR && pullback) || brokeDay || broke3);
+          // Signals are required in normal window; in force window we skip signals but STILL require an AI pick.
+          const armedOrForce = (aboveVWAP && volOK && ((brokeOR && pullback) || brokeDay || broke3)) || forceWindow;
 
-          if (armed || forceMinute) {
+          if (armedOrForce) {
             // claim 1/day slot
             const claim = await prisma.botState.updateMany({
               where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
@@ -367,7 +359,6 @@ async function handle(req: Request) {
 
                   if (shares > 0) {
                     try {
-                      // Place Alpaca bracket (DAY)
                       const order = await submitBracketBuy({
                         symbol: lastRec.ticker, qty: shares, limit, tp, sl, tif: "day",
                       });
@@ -389,7 +380,7 @@ async function handle(req: Request) {
                       });
 
                       bought = true;
-                      debug.lastMessage = `🚀 BUY ${lastRec!.ticker} @ ${limit.toFixed(2)} (armed=${armed} force=${forceMinute})`;
+                      debug.lastMessage = `🚀 BUY (AI) ${lastRec!.ticker} @ ${limit.toFixed(2)} (forceWindow=${forceWindow})`;
                     } catch (e: any) {
                       debug.reasons.push(`alpaca_submit_error:${e?.message || "unknown"}`);
                     }
@@ -403,7 +394,7 @@ async function handle(req: Request) {
                 debug.reasons.push("position_open_after_claim");
               }
 
-              // 🔁 If we claimed but didn't buy, release the day lock so later ticks can retry
+              // If claimed but didn’t buy, release lock so the next tick can retry (esp. inside force window)
               if (!bought) {
                 await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
                 debug.releasedLock = true;
@@ -421,6 +412,10 @@ async function handle(req: Request) {
         console.error("entry evaluation error", e?.message || e);
         debug.reasons.push("entry_exception");
       }
+    } else if (!openPos && (inEntryWindow || forceWindow) && marketOpen && (state.lastRunDay !== today) && !lastRec?.ticker) {
+      // We are asked to buy (window open), but AI has not produced a pick.
+      // Do nothing — strictly no fallback.
+      debug.reasons.push("ai_pick_missing_no_fallback");
     }
 
     /** ───────────────── Holding: refresh equity ───────────────── */
@@ -450,7 +445,7 @@ async function handle(req: Request) {
       serverTimeET: nowET().toISOString(),
       info: {
         entryWindowOpen_0934_1015: inEntryWindow,
-        isForceBuyMinute_1015: forceMinute,
+        isForceBuyWindow_1015_1016: forceWindow,
         isMandatoryExit_1555: isMandatoryExitET(),
         snapshotAgeMs: Number.isFinite(snapAgeMs) ? snapAgeMs : null,
         investBudget: INVEST_BUDGET,
