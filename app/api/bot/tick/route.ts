@@ -24,6 +24,11 @@ const MAX_SLIPPAGE_PCT = 0.003; // +0.3% above ref price
 const SNAPSHOT_STALE_MS = 5_000;
 const TOP_CANDIDATES    = 8;
 
+/** >>> TEST OVERRIDE (FORCE BUY @ 10:30 ET) <<< */
+const TEST_FORCE_BUY_1030 = true;         // set to false to disable
+const TEST_SYMBOL = "SPY";                // used if no AI pick available
+const TEST_WINDOW_SECONDS = 60;           // 10:30:00–10:30:59 ET
+
 /** ───────────────── Time Windows (ET) ───────────────── */
 // Standard entry window 09:34–10:15 ET
 function entryWindowOpenET() {
@@ -37,11 +42,16 @@ function isForceBuyWindowET() {
   const mins = d.getHours() * 60 + d.getMinutes();
   return mins >= (10 * 60 + 15) && mins <= (10 * 60 + 16);
 }
-// Never hold overnight
+// Mandatory same-day exit after 15:55 ET
 function isMandatoryExitET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
   return mins >= (15 * 60 + 55);
+}
+// Test-only exact 10:30:00–10:30:59 ET window
+function isTestBuyWindow1030ET() {
+  const d = nowET();
+  return d.getHours() === 10 && d.getMinutes() === 30;
 }
 
 /** ───────────────── Types & helpers ───────────────── */
@@ -84,7 +94,6 @@ function computeOpeningRange(candles: Candle[], todayYMD: string) {
   const low  = Math.min(...window.map((c: Candle) => c.low));
   return { high, low, count: window.length };
 }
-
 function computeSessionVWAP(candles: Candle[], todayYMD: string) {
   const session = candles.filter((c: Candle) => {
     const d = toET(c.date);
@@ -100,7 +109,6 @@ function computeSessionVWAP(candles: Candle[], todayYMD: string) {
   }
   return volSum > 0 ? pvSum / volSum : null;
 }
-
 function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
   const dayC = candles.filter((c: Candle) => isSameETDay(toET(c.date), todayYMD));
   if (dayC.length < lookback + 1) return null;
@@ -110,14 +118,12 @@ function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
   if (!avgPrior) return { mult: null as number | null, latestVol: latest.volume, avgPrior };
   return { mult: latest.volume / avgPrior, latestVol: latest.volume, avgPrior };
 }
-
 function computeDayHighSoFar(candles: Candle[], todayYMD: string) {
   const day = candles.filter((c: Candle) => isSameETDay(toET(c.date), todayYMD));
   if (day.length < 2) return null;
   const prior = day.slice(0, -1);
   return Math.max(...prior.map((c: Candle) => c.high));
 }
-
 function brokeRecentHighs(candles: Candle[], todayYMD: string, n = 3) {
   const day = candles.filter((c: Candle) => isSameETDay(toET(c.date), todayYMD));
   if (day.length < n + 1) return false;
@@ -250,7 +256,7 @@ async function handle(req: Request) {
       }
     }
 
-    // Weekday gate
+    // Weekday + market open gates
     if (!isWeekdayET()) {
       debug.reasons.push("not_weekday");
       return {
@@ -258,8 +264,95 @@ async function handle(req: Request) {
         serverTimeET: nowET().toISOString(), skipped: "not_weekday", debug
       };
     }
+    const marketOpen = isMarketHoursET();
 
-    const marketOpen    = isMarketHoursET();
+    /** ───────────────── TEST OVERRIDE: FORCE BUY @ 10:30 ET ─────────────────
+     *  - Executes once per day between 10:30:00–10:30:59 ET
+     *  - Ignores signals and AI requirement
+     *  - Uses lastRec.ticker if present, otherwise TEST_SYMBOL
+     *  - Uses bracket order with TP/SL
+     */
+    if (
+      TEST_FORCE_BUY_1030 &&
+      !openPos &&
+      marketOpen &&
+      isTestBuyWindow1030ET() &&
+      state.lastRunDay !== today
+    ) {
+      const symbol = lastRec?.ticker || TEST_SYMBOL;
+      try {
+        // claim 1/day slot
+        const claim = await prisma.botState.updateMany({
+          where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
+          data: { lastRunDay: today },
+        });
+        const claimed = claim.count === 1;
+        debug.testForceClaimed = claimed;
+
+        if (claimed) {
+          // re-check position after claim
+          openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+          if (!openPos) {
+            let ref = await getQuote(symbol);
+            if (ref == null || !Number.isFinite(Number(ref))) {
+              // last-ditch: try snapshot price if available (later we fetch snapshot anyway)
+              ref = Number(lastRec?.price ?? NaN);
+            }
+            if (ref != null && Number.isFinite(Number(ref))) {
+              const mid = Number(ref);
+              const limit = mid * (1 + MAX_SLIPPAGE_PCT);
+              const tp    = limit * (1 + TARGET_PCT);
+              const sl    = limit * (1 + STOP_PCT);
+
+              const cashNum = Number(state.cash);
+              const budget  = Math.min(cashNum, INVEST_BUDGET);
+              const shares  = Math.floor(budget / limit);
+
+              if (shares > 0) {
+                const order = await submitBracketBuy({
+                  symbol, qty: shares, limit, tp, sl, tif: "day",
+                });
+
+                const used = shares * limit;
+
+                const pos = await prisma.position.create({
+                  data: { ticker: symbol, entryPrice: limit, shares, open: true, brokerOrderId: order.id },
+                });
+                openPos = pos;
+
+                await prisma.trade.create({
+                  data: { side: "BUY", ticker: symbol, price: limit, shares, brokerOrderId: order.id },
+                });
+
+                await prisma.botState.update({
+                  where: { id: 1 },
+                  data: { cash: cashNum - used, equity: cashNum - used + shares * limit },
+                });
+
+                debug.lastMessage = `🧪 TEST BUY @10:30ET ${symbol} @ ${limit.toFixed(2)} (shares=${shares})`;
+              } else {
+                debug.reasons.push("test_insufficient_budget_for_one_share");
+                // release lock so normal logic can try later if needed
+                await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+              }
+            } else {
+              debug.reasons.push("test_no_price_for_entry");
+              await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+            }
+          } else {
+            debug.reasons.push("test_position_open_after_claim");
+          }
+        } else {
+          debug.reasons.push("test_day_lock_already_claimed");
+        }
+      } catch (e: any) {
+        debug.reasons.push(`test_entry_exception:${e?.message || "unknown"}`);
+      }
+    }
+
+    // From here down is your existing logic (AI pick + signals) — unchanged except that
+    // the test block above may have already opened a position.
+
     const inEntryWindow = entryWindowOpenET();
     const forceWindow   = isForceBuyWindowET();
 
@@ -449,6 +542,8 @@ async function handle(req: Request) {
         isMandatoryExit_1555: isMandatoryExitET(),
         snapshotAgeMs: Number.isFinite(snapAgeMs) ? snapAgeMs : null,
         investBudget: INVEST_BUDGET,
+        testForce1030Enabled: TEST_FORCE_BUY_1030,
+        testSymbol: TEST_SYMBOL,
       },
       debug,
     };
