@@ -13,30 +13,32 @@ import { submitBracketBuy, closePositionMarket } from "@/lib/alpaca";
 let lastTickAt = 0;
 let lastTickResponse: any = null;
 let pendingTick: Promise<any> | null = null;
-// Tick fast during the 11:05 window
-const MIN_TICK_MS = 300;
+// tick fast; we also run an internal burst within the handler
+const MIN_TICK_MS = 200;
 
 /** ───────────────── Config ───────────────── */
 const START_CASH = 4000;
-const INVEST_BUDGET = 4000;        // cap per trade; if cash < 4k use all cash
-const TARGET_PCT = 0.10;           // +10% TP
-const STOP_PCT   = -0.05;          // -5% SL
-const BASE_SLIPPAGE = 0.003;       // 0.30%
-const MAX_SLIPPAGE  = 0.010;       // 1.00% hard ceiling
-const SLIPPAGE_STEPS = [0.003, 0.006, 0.010]; // widen if broker rejects
+const INVEST_BUDGET = 4000;          // cap per trade; if cash < 4k, use all cash
+const TARGET_PCT = 0.10;             // +10% take-profit
+const STOP_PCT   = -0.05;            // -5% stop-loss
+const SLIPPAGE_STEPS = [0.003, 0.006, 0.010]; // widen if order rejected
 const TOP_CANDIDATES = 8;
 
-/** ───────────────── 11:05 ET AI Buy Plan ─────────────────
- *  - Prewarm: 11:04:30–11:04:59 (ask AI early)
- *  - Mandatory AI-buy window: 11:05:00–11:06:59 (2 minutes for robust retries)
+// Must the AI pick? (set to false if you want a hard fallback to top[0])
+const REQUIRE_AI_PICK = true;
+
+/** ───────────────── 11:20 ET plan ─────────────────
+ * Prewarm:      11:19:30–11:19:59
+ * Buy window:   11:20:00–11:21:59 (2 minutes)
+ * Internal burst: 12 tries ~ every 300ms inside a single invocation
  */
-function inAiPrewarmWindow1105() {
+function inPrewarmWindow() {
   const d = nowET();
-  return d.getHours() === 11 && d.getMinutes() === 4 && d.getSeconds() >= 30;
+  return d.getHours() === 11 && d.getMinutes() === 19 && d.getSeconds() >= 30;
 }
-function inAiMandatoryBuyWindow1105() {
+function inBuyWindow() {
   const d = nowET();
-  return d.getHours() === 11 && (d.getMinutes() === 5 || d.getMinutes() === 6);
+  return d.getHours() === 11 && (d.getMinutes() === 20 || d.getMinutes() === 21);
 }
 
 /** ───────────────── Exit Rule ───────────────── */
@@ -55,12 +57,6 @@ type SnapStock = {
   avgVolume?: number | null;
   marketCap?: number | null;
 };
-
-function isSameETDay(d: Date, ymd: string) {
-  const mo = String(d.getMonth() + 1).padStart(2, "0");
-  const da = String(d.getDate()).padStart(2, "0");
-  return `${d.getFullYear()}-${mo}-${da}` === ymd;
-}
 
 function getBaseUrl(req: Request) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
@@ -84,15 +80,19 @@ async function getSnapshot(baseUrl: string): Promise<{ stocks: SnapStock[]; upda
   }
 }
 
+function yyyyMmDd(date: Date) {
+  const mo = String(date.getMonth() + 1).padStart(2, "0");
+  const da = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${mo}-${da}`;
+}
+
 /** Ask AI for today's pick from top stocks; if already have today's pick, return it. */
 async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: SnapStock[]) {
-  const today = yyyyMmDdET();
+  const today = yyyyMmDd(nowET());
   let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
 
   const recDay =
-    lastRec?.at instanceof Date
-      ? `${lastRec.at.getFullYear()}-${String(lastRec.at.getMonth() + 1).padStart(2, "0")}-${String(lastRec.at.getDate()).padStart(2, "0")}`
-      : null;
+    lastRec?.at instanceof Date ? yyyyMmDd(lastRec.at) : null;
 
   if (lastRec && recDay === today) return lastRec;
 
@@ -101,7 +101,7 @@ async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: Sn
     const rRes = await fetch(`${base}/api/recommendation`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // Nudge your handler to always pick one
+      // nudge your handler to always produce a concrete pick
       body: JSON.stringify({ stocks: topStocks, forcePick: true, requirePick: true }),
       cache: "no-store",
     });
@@ -114,7 +114,7 @@ async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: Sn
     const ticker = m?.[1]?.toUpperCase() || null;
     if (!ticker) return lastRec || null;
 
-    // Prefer snapshot price to avoid extra API call; fallback to live quote
+    // prefer snapshot price; fallback to live quote
     const snapPrice = topStocks.find((s) => s.ticker === ticker)?.price;
     const priceCandidate = snapPrice ?? (await getQuote(ticker));
     if (priceCandidate == null || !Number.isFinite(Number(priceCandidate))) return lastRec || null;
@@ -126,12 +126,12 @@ async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: Sn
   }
 }
 
-/** Repeatedly ask AI until it returns a pick. */
+/** Aggressively ask AI up to N times with short delays. */
 async function ensureTodayRecommendationWithRetries(
   req: Request,
   topStocks: SnapStock[],
-  tries = 10,
-  delayMs = 500
+  tries = 12,
+  delayMs = 300
 ) {
   for (let i = 0; i < tries; i++) {
     const rec = await ensureTodayRecommendationFromSnapshot(req, topStocks);
@@ -149,8 +149,7 @@ async function submitBuyWithWideningSlippage(
 ) {
   let lastErr: any = null;
   for (const slip of SLIPPAGE_STEPS) {
-    // refresh quote each attempt to avoid stale price rejects
-    const q = await getQuote(symbol);
+    const q = await getQuote(symbol); // refresh quote each attempt
     const ref = Number.isFinite(Number(q)) ? Number(q) : baseRefPrice;
 
     const limit = ref * (1 + slip);
@@ -199,7 +198,7 @@ async function handle(req: Request) {
   pendingTick = (async () => {
     const debug: any = { reasons: [] as string[] };
 
-    // Ensure state row exists
+    // Ensure state exists
     let state = await prisma.botState.findUnique({ where: { id: 1 } });
     if (!state) {
       state = await prisma.botState.create({
@@ -245,11 +244,10 @@ async function handle(req: Request) {
         debug.lastMessage = `⏱️ Mandatory 15:55+ exit ${exitTicker}`;
       } catch (e: any) {
         debug.reasons.push("mandatory_exit_exception");
-        console.error("mandatory exit error", e?.message || e);
       }
     }
 
-    // Weekday & market open gates
+    // Weekday & market gates
     if (!isWeekdayET()) {
       debug.reasons.push("not_weekday");
       return {
@@ -259,12 +257,10 @@ async function handle(req: Request) {
     }
     const marketOpen = isMarketHoursET();
 
-    /** ───────────────── 11:04:30–11:04:59 Pre-warm ─────────────────
-     *  Ask the AI early so the pick exists at 11:05.
-     */
-    if (!openPos && marketOpen && inAiPrewarmWindow1105()) {
+    /** ───────────────── 11:19:30–11:19:59 Pre-warm ───────────────── */
+    if (!openPos && marketOpen && inPrewarmWindow()) {
       const base = getBaseUrl(req);
-      const snapshot = await getSnapshot(base); // no freshness requirement in prewarm
+      const snapshot = await getSnapshot(base); // freshness bypass ok
       const top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
       debug.prewarm_top = top.map((s) => s.ticker);
       try {
@@ -279,84 +275,107 @@ async function handle(req: Request) {
       }
     }
 
-    /** ───────────────── 11:05:00–11:06:59 Mandatory AI Buy ─────────────────
-     *  Only if: marketOpen, no open position, and day lock unused.
-     *  Steps:
-     *   1) Get snapshot (no freshness requirement here).
-     *   2) Aggressively ensure AI pick (up to ~10 tries).
-     *   3) Claim daily lock.
-     *   4) Submit bracket buy with widening slippage and refreshed quotes.
-     *   5) If any stage fails, release the lock so we can retry again in-window.
-     */
-    if (!openPos && marketOpen && inAiMandatoryBuyWindow1105() && state.lastRunDay !== today) {
+    /** ───────────────── 11:20:00–11:21:59 Buy Window ───────────────── */
+    if (!openPos && marketOpen && inBuyWindow() && state.lastRunDay !== today) {
       const base = getBaseUrl(req);
-      const snapshot = await getSnapshot(base); // bypass freshness in this window
+      const snapshot = await getSnapshot(base); // bypass freshness in window
       const top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
-      debug.buy1105_top = top.map((s) => s.ticker);
+      debug.buy1120_top = top.map((s) => s.ticker);
 
-      // 1 & 2: Ensure AI pick with retries
-      lastRec = await ensureTodayRecommendationWithRetries(req, top, 10, 500);
-      if (!lastRec?.ticker) {
-        debug.reasons.push("1105_ai_pick_missing_after_retries");
-      } else {
-        // 3: Try to claim daily lock
+      // Internal burst loop: several tries in one invocation
+      const BURST_TRIES = 12;
+      const BURST_DELAY_MS = 300;
+
+      for (let i = 0; i < BURST_TRIES; i++) {
+        // 1) Make sure we have an AI pick (or fallback if allowed)
+        let rec = await ensureTodayRecommendationFromSnapshot(req, top);
+        if (!rec?.ticker && !REQUIRE_AI_PICK && top.length) {
+          // HARD FALLBACK if allowed
+          const fallbackTicker = top[0].ticker;
+          const fallbackPrice = top[0].price ?? (await getQuote(fallbackTicker));
+          if (fallbackTicker && fallbackPrice && Number.isFinite(Number(fallbackPrice))) {
+            rec = await prisma.recommendation.create({
+              data: { ticker: fallbackTicker, price: Number(fallbackPrice) },
+            });
+            debug.fallback_used = true;
+          }
+        }
+
+        if (!rec?.ticker) {
+          debug.reasons.push(`1120_no_pick_iter_${i}`);
+          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          continue;
+        }
+
+        lastRec = rec;
+
+        // 2) Claim daily lock
         const claim = await prisma.botState.updateMany({
           where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
           data: { lastRunDay: today },
         });
         const claimed = claim.count === 1;
-        debug.buy1105_claimed = claimed;
+        debug[`iter_${i}_claimed`] = claimed;
 
-        if (claimed) {
-          // Re-check no position after claim
-          openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-          if (!openPos) {
-            // Price ref: snapshot -> rec.price -> live quote
-            let ref: number | null =
-              Number(snapshot?.stocks?.find((s) => s.ticker === lastRec!.ticker)?.price ?? NaN);
-            if (!Number.isFinite(ref)) ref = Number(lastRec!.price);
-            if (!Number.isFinite(ref)) {
-              const q = await getQuote(lastRec!.ticker);
-              if (q != null && Number.isFinite(Number(q))) ref = Number(q);
-            }
+        if (!claimed) {
+          debug.reasons.push(`1120_day_lock_already_claimed_iter_${i}`);
+          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          continue;
+        }
 
-            if (ref != null && Number.isFinite(Number(ref))) {
-              // 4: Submit with widening slippage
-              const cashNum = Number(state.cash);
-              const result = await submitBuyWithWideningSlippage(lastRec!.ticker, cashNum, ref);
+        // 3) After claiming, re-check no open pos
+        openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+        if (openPos) {
+          debug.reasons.push(`1120_position_open_after_claim_iter_${i}`);
+          break; // someone else bought
+        }
 
-              if (result.ok) {
-                const { order, limit, shares } = result;
+        // 4) Build entry ref price: snapshot -> rec.price -> quote
+        let ref: number | null =
+          Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
+        if (!Number.isFinite(ref)) ref = Number(rec!.price);
+        if (!Number.isFinite(ref)) {
+          const q = await getQuote(rec!.ticker);
+          if (q != null && Number.isFinite(Number(q))) ref = Number(q);
+        }
 
-                const pos = await prisma.position.create({
-                  data: { ticker: lastRec!.ticker, entryPrice: limit, shares, open: true, brokerOrderId: order.id },
-                });
-                openPos = pos;
+        if (ref == null || !Number.isFinite(ref)) {
+          debug.reasons.push(`1120_no_price_for_entry_iter_${i}`);
+          // release lock and retry
+          await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          continue;
+        }
 
-                await prisma.trade.create({
-                  data: { side: "BUY", ticker: lastRec!.ticker, price: limit, shares, brokerOrderId: order.id },
-                });
+        // 5) Submit with widening slippage
+        const cashNum = Number(state.cash);
+        const result = await submitBuyWithWideningSlippage(rec!.ticker, cashNum, ref);
 
-                await prisma.botState.update({
-                  where: { id: 1 },
-                  data: { cash: cashNum - shares * limit, equity: cashNum - shares * limit + shares * limit },
-                });
+        if (result.ok) {
+          const { order, limit, shares } = result;
 
-                debug.lastMessage = `✅ 11:05 BUY (AI) ${lastRec!.ticker} @ ${limit.toFixed(2)} (shares=${shares})`;
-              } else {
-                // 5: Release lock so we can retry within the window
-                await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-                debug.reasons.push(`1105_alpaca_submit_failed:${result.error?.message || "unknown"}`);
-              }
-            } else {
-              await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-              debug.reasons.push("1105_no_price_for_entry");
-            }
-          } else {
-            debug.reasons.push("1105_position_open_after_claim");
-          }
+          const pos = await prisma.position.create({
+            data: { ticker: rec!.ticker, entryPrice: limit, shares, open: true, brokerOrderId: order.id },
+          });
+          openPos = pos;
+
+          await prisma.trade.create({
+            data: { side: "BUY", ticker: rec!.ticker, price: limit, shares, brokerOrderId: order.id },
+          });
+
+          await prisma.botState.update({
+            where: { id: 1 },
+            data: { cash: cashNum - shares * limit, equity: cashNum - shares * limit + shares * limit },
+          });
+
+          debug.lastMessage = `✅ 11:20 BUY (AI${REQUIRE_AI_PICK ? "" : " or Fallback"}) ${rec!.ticker} @ ${limit.toFixed(2)} (shares=${shares})`;
+          break; // success
         } else {
-          debug.reasons.push("1105_day_lock_already_claimed");
+          // release lock so we can retry within the window
+          await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+          debug.reasons.push(`1120_alpaca_submit_failed_iter_${i}:${result.error?.message || "unknown"}`);
+          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          continue;
         }
       }
     }
@@ -373,7 +392,6 @@ async function handle(req: Request) {
         livePrice = p;
       }
     } else if (lastRec?.ticker) {
-      // show live price of the candidate when not in a position
       const q = await getQuote(lastRec.ticker);
       if (q != null && Number.isFinite(Number(q))) livePrice = Number(q);
     }
@@ -385,9 +403,9 @@ async function handle(req: Request) {
       live: { ticker: openPos?.ticker ?? lastRec?.ticker ?? null, price: livePrice },
       serverTimeET: nowET().toISOString(),
       info: {
-        prewarm_110430_110459: inAiPrewarmWindow1105(),
-        mandatoryAiBuyWindow_110500_110659: inAiMandatoryBuyWindow1105(),
-        isMandatoryExit_1555: isMandatoryExitET(),
+        prewarm_111930_111959: inPrewarmWindow(),
+        buyWindow_112000_112159: inBuyWindow(),
+        requireAiPick: REQUIRE_AI_PICK,
         targetPct: TARGET_PCT,
         stopPct: STOP_PCT,
         slippageSteps: SLIPPAGE_STEPS,
