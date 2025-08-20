@@ -13,7 +13,6 @@ import { submitBracketBuy, closePositionMarket } from "@/lib/alpaca";
 let lastTickAt = 0;
 let lastTickResponse: any = null;
 let pendingTick: Promise<any> | null = null;
-// tick fast; we also run an internal burst within the handler
 const MIN_TICK_MS = 200;
 
 /** ───────────────── Config ───────────────── */
@@ -21,32 +20,37 @@ const START_CASH = 4000;
 const INVEST_BUDGET = 4000;          // cap per trade; if cash < 4k, use all cash
 const TARGET_PCT = 0.10;             // +10% take-profit
 const STOP_PCT   = -0.05;            // -5% stop-loss
-const SLIPPAGE_STEPS = [0.003, 0.006, 0.010]; // kept for info/debug display
 const TOP_CANDIDATES = 8;
 
-// Must the AI pick? (set to false if you want a hard fallback to top[0])
+// Must the AI pick? (true = no fallback)
 const REQUIRE_AI_PICK = true;
 
-/** ───────────────── 12:30 ET plan ─────────────────
- * Prewarm:      12:29:30–12:29:59
- * Buy window:   12:30:00–12:31:59 (2 minutes)
- * Internal burst: 12 tries ~ every 300ms inside a single invocation
+/** ───────────────── Time Windows (ET) ─────────────────
+ * Scan   : 09:34:00–10:14:59 (require setups)
+ * Force  : 10:15:00–10:16:59 (buy AI pick, ignore setups)
+ * Prewarm: 09:33:30–09:33:59 and 10:14:30–10:14:59
+ * Exit   : 15:55+
  */
+function inScanWindow() {
+  const d = nowET();
+  const m = d.getHours() * 60 + d.getMinutes();
+  const s = d.getSeconds();
+  // 9:34:00 (574) to 10:14:59 (614 with seconds<60)
+  return m >= 9 * 60 + 34 && m <= 10 * 60 + 14 && s <= 59;
+}
+function inForceWindow() {
+  const d = nowET();
+  return d.getHours() === 10 && (d.getMinutes() === 15 || d.getMinutes() === 16);
+}
 function inPrewarmWindow() {
   const d = nowET();
-  return d.getHours() === 12 && d.getMinutes() === 29 && d.getSeconds() >= 30;
+  const h = d.getHours(), mi = d.getMinutes(), s = d.getSeconds();
+  return (h === 9 && mi === 33 && s >= 30) || (h === 10 && mi === 14 && s >= 30);
 }
-function inBuyWindow() {
+function inEndOfForceFailsafe() {
   const d = nowET();
-  return d.getHours() === 12 && (d.getMinutes() === 30 || d.getMinutes() === 31);
+  return d.getHours() === 10 && d.getMinutes() === 16 && d.getSeconds() >= 30;
 }
-// Failsafe to clear a stuck lock near end of window
-function inEndOfWindowFailsafe() {
-  const d = nowET();
-  return d.getHours() === 12 && d.getMinutes() === 31 && d.getSeconds() >= 30;
-}
-
-/** ───────────────── Exit Rule ───────────────── */
 function isMandatoryExitET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
@@ -62,6 +66,7 @@ type SnapStock = {
   avgVolume?: number | null;
   marketCap?: number | null;
 };
+type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
 
 function getBaseUrl(req: Request) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
@@ -105,31 +110,115 @@ function yyyyMmDdLocal(d: Date) {
   const da = String(dt.getDate()).padStart(2, "0");
   return `${dt.getFullYear()}-${mo}-${da}`;
 }
-
-// ✅ fixed: getMonth() not getMonth
 function yyyyMmDd(date: Date) {
   const mo = String(date.getMonth() + 1).padStart(2, "0");
   const da = String(date.getDate()).padStart(2, "0");
   return `${date.getFullYear()}-${mo}-${da}`;
 }
 
-/** Parse AI recommendation in multiple formats */
+/** Robust AI recommendation parser */
 function parseAIPick(rJson: any): string | null {
-  // JSON fields first
-  const direct =
-    rJson?.ticker ||
-    rJson?.symbol ||
-    rJson?.pick ||
-    rJson?.Pick ||
-    rJson?.data?.ticker ||
-    rJson?.data?.symbol;
-  if (typeof direct === "string" && /^[A-Za-z][A-Za-z0-9.\-]*$/.test(direct)) {
-    return direct.toUpperCase();
+  // 1) Direct JSON fields
+  const fields = [
+    rJson?.ticker,
+    rJson?.symbol,
+    rJson?.pick,
+    rJson?.Pick,
+    rJson?.data?.ticker,
+    rJson?.data?.symbol,
+  ];
+  for (const f of fields) {
+    if (typeof f === "string" && /^[A-Za-z][A-Za-z0-9.\-]*$/.test(f)) {
+      return f.toUpperCase();
+    }
   }
-  // Then free-text "Pick: TICKER"
-  const txt: string = (rJson?.recommendation ?? rJson?.text ?? rJson?.message ?? "") + "";
-  const m = /Pick:\s*([A-Z][A-Z0-9.\-]*)/i.exec(txt);
-  return m?.[1]?.toUpperCase() || null;
+  // 2) Context array: { context: { tickers: [ { ticker: "XYZ" } ] } }
+  const ctxTicker = rJson?.context?.tickers?.[0]?.ticker;
+  if (typeof ctxTicker === "string" && /^[A-Za-z][A-Za-z0-9.\-]*$/.test(ctxTicker)) {
+    return ctxTicker.toUpperCase();
+  }
+  // 3) Free text / markdown: "**Pick:** XYZ" or "Pick: XYZ" / "Pick - XYZ"
+  let txt = String(rJson?.recommendation ?? rJson?.text ?? rJson?.message ?? "");
+  txt = txt.replace(/[*_`~]/g, "").replace(/^-+\s*/gm, "");
+  const m1 = /Pick\s*:?\s*([A-Z][A-Z0-9.\-]*)/i.exec(txt);
+  const m2 = /Pick\s*[-–—]\s*([A-Z][A-Z0-9.\-]*)/i.exec(txt);
+  const sym = (m1?.[1] || m2?.[1])?.toUpperCase();
+  return sym || null;
+}
+
+/** ───────────────── Intraday 1-min data helpers ───────────────── */
+function toET(dateIso: string) {
+  return new Date(new Date(dateIso).toLocaleString("en-US", { timeZone: "America/New_York" }));
+}
+function isSameETDay(d: Date, ymd: string) {
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mo}-${da}` === ymd;
+}
+async function fetchCandles1m(symbol: string, limit = 240): Promise<Candle[]> {
+  const rel = `/api/fmp/candles?symbol=${encodeURIComponent(symbol)}&interval=1min&limit=${limit}`;
+  const res = await fetch(rel, { cache: "no-store" });
+  if (!res.ok) return [];
+  const j = await res.json();
+  const arr = Array.isArray(j?.candles) ? j.candles : [];
+  return arr.map((c: any) => ({
+    date: c.date,
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close),
+    volume: Number(c.volume),
+  }));
+}
+
+/** ───────────────── Intraday signals ───────────────── */
+function computeOpeningRange(candles: Candle[], todayYMD: string) {
+  const window = candles.filter((c) => {
+    const d = toET(c.date);
+    return isSameETDay(d, todayYMD) && d.getHours() === 9 && d.getMinutes() >= 30 && d.getMinutes() <= 34;
+  });
+  if (!window.length) return null;
+  const high = Math.max(...window.map((c) => c.high));
+  const low  = Math.min(...window.map((c) => c.low));
+  return { high, low, count: window.length };
+}
+function computeSessionVWAP(candles: Candle[], todayYMD: string) {
+  const session = candles.filter((c) => {
+    const d = toET(c.date);
+    const mins = d.getHours() * 60 + d.getMinutes();
+    return isSameETDay(d, todayYMD) && mins >= 9 * 60 + 30;
+  });
+  if (!session.length) return null;
+  let pvSum = 0, volSum = 0;
+  for (const c of session) {
+    const typical = (c.high + c.low + c.close) / 3;
+    pvSum += typical * c.volume;
+    volSum += c.volume;
+  }
+  return volSum > 0 ? pvSum / volSum : null;
+}
+function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
+  const dayC = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
+  if (dayC.length < lookback + 1) return null;
+  const latest = dayC[dayC.length - 1];
+  const prior  = dayC.slice(-1 - lookback, -1);
+  const avgPrior = prior.reduce((s, c) => s + c.volume, 0) / lookback;
+  if (!avgPrior) return { mult: null as number | null, latestVol: latest.volume, avgPrior };
+  return { mult: latest.volume / avgPrior, latestVol: latest.volume, avgPrior };
+}
+function computeDayHighSoFar(candles: Candle[], todayYMD: string) {
+  const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
+  if (day.length < 2) return null;
+  const prior = day.slice(0, -1);
+  return Math.max(...prior.map((c) => c.high));
+}
+function brokeRecentHighs(candles: Candle[], todayYMD: string, n = 3) {
+  const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
+  if (day.length < n + 1) return false;
+  const last  = day[day.length - 1];
+  const prior = day.slice(-1 - n, -1);
+  const priorMax = Math.max(...prior.map((c) => c.high));
+  return last.close > priorMax;
 }
 
 /** Ask AI for today's pick from top stocks; if already have today's pick, return it. */
@@ -137,9 +226,7 @@ async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: Sn
   const today = yyyyMmDd(nowET());
   let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
 
-  const recDay =
-    lastRec?.at instanceof Date ? yyyyMmDd(lastRec.at) : null;
-
+  const recDay = lastRec?.at instanceof Date ? yyyyMmDd(lastRec.at) : null;
   if (lastRec && recDay === today) return lastRec;
 
   try {
@@ -167,61 +254,6 @@ async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: Sn
   } catch {
     return lastRec || null;
   }
-}
-
-/** Aggressively ask AI up to N times with short delays. */
-async function ensureTodayRecommendationWithRetries(
-  req: Request,
-  topStocks: SnapStock[],
-  tries = 12,
-  delayMs = 300
-) {
-  for (let i = 0; i < tries; i++) {
-    const rec = await ensureTodayRecommendationFromSnapshot(req, topStocks);
-    if (rec?.ticker) return rec;
-    await new Promise((res) => setTimeout(res, delayMs));
-  }
-  return null;
-}
-
-/** (Kept for reference) Widening-limit helper — not used when market entry is enabled */
-async function submitBuyWithWideningSlippage(
-  symbol: string,
-  cashAvailable: number,
-  baseRefPrice: number
-) {
-  let lastErr: any = null;
-  for (const slip of SLIPPAGE_STEPS) {
-    const q = await getQuote(symbol); // refresh quote each attempt
-    const ref = Number.isFinite(Number(q)) ? Number(q) : baseRefPrice;
-
-    const limit = ref * (1 + slip);
-    const tp    = limit * (1 + TARGET_PCT);
-    const sl    = limit * (1 + STOP_PCT);
-
-    const budget = Math.min(cashAvailable, INVEST_BUDGET);
-    const shares = Math.floor(budget / limit);
-    if (shares <= 0) {
-      lastErr = new Error("insufficient_cash_for_one_share");
-      continue;
-    }
-
-    try {
-      const order = await submitBracketBuy({
-        symbol,
-        qty: shares,
-        entryType: "limit",
-        limit,
-        tp,
-        sl,
-        tif: "day",
-      });
-      return { ok: true as const, order, priceUsed: limit, shares };
-    } catch (e: any) {
-      lastErr = e;
-    }
-  }
-  return { ok: false as const, error: lastErr };
 }
 
 /** ───────────────── Route handlers ───────────────── */
@@ -301,99 +333,207 @@ async function handle(req: Request) {
     }
     const marketOpen = isMarketHoursET();
 
-    /** ───────────────── 12:29:30–12:29:59 Pre-warm ───────────────── */
+    /** ───────────────── Pre-warm AI pick ───────────────── */
     if (!openPos && marketOpen && inPrewarmWindow()) {
       const base = getBaseUrl(req);
-      const snapshot = await getSnapshot(base); // freshness bypass ok
+      const snapshot = await getSnapshot(base);
       const top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
 
-      // prefer affordable candidates to avoid shares=0
       const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
       const candidates = affordableTop.length ? affordableTop : top;
+
       debug.prewarm_top = candidates.map((s) => s.ticker);
       debug.prewarm_affordable_count = affordableTop.length;
 
       try {
         const rec = await ensureTodayRecommendationFromSnapshot(req, candidates);
-        if (rec?.ticker) {
-          debug.prewarm_pick = rec.ticker;
-        } else {
-          debug.reasons.push("prewarm_no_pick_yet");
-        }
+        if (rec?.ticker) debug.prewarm_pick = rec.ticker;
+        else debug.reasons.push("prewarm_no_pick_yet");
       } catch (e: any) {
         debug.reasons.push(`prewarm_exception:${e?.message || "unknown"}`);
       }
     }
 
-    /** ───────────────── 12:30:00–12:31:59 Buy Window ───────────────── */
-    if (!openPos && marketOpen && inBuyWindow() && state.lastRunDay !== today) {
+    /** ───────────────── 09:34–10:14 Scan Window (signals required) ───────────────── */
+    if (!openPos && marketOpen && inScanWindow() && state.lastRunDay !== today) {
       const base = getBaseUrl(req);
-      let snapshot = await getSnapshot(base); // bypass freshness in window
+      let snapshot = await getSnapshot(base);
       let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
 
-      // Fallback to last-good if empty
       if (!top.length && lastGoodSnapshot && lastGoodSnapshotDay === today) {
         top = lastGoodSnapshot.stocks.slice(0, TOP_CANDIDATES);
-        debug.used_last_good_snapshot = true;
+        debug.used_last_good_snapshot_scan = true;
       }
 
-      // prefer affordable candidates to avoid shares=0
       const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
       const candidates = affordableTop.length ? affordableTop : top;
 
-      debug.buy1230_top = candidates.map((s) => s.ticker);
-      debug.buy1230_affordable_count = affordableTop.length;
+      debug.scan_top = candidates.map((s) => s.ticker);
+      debug.scan_affordable_count = affordableTop.length;
 
-      // Internal burst loop: several tries in one invocation
+      const rec = await ensureTodayRecommendationFromSnapshot(req, candidates);
+      if (!rec?.ticker) {
+        debug.reasons.push("scan_no_ai_pick_yet");
+      } else {
+        lastRec = rec;
+        // compute setups
+        try {
+          const candles = await fetchCandles1m(rec!.ticker, 240);
+          const day = candles.filter((c) => isSameETDay(toET(c.date), today));
+          if (!day.length) {
+            debug.reasons.push("scan_no_day_candles");
+          } else {
+            const orRange = computeOpeningRange(candles, today);
+            const vwap    = computeSessionVWAP(candles, today);
+            const vol     = computeVolumePulse(candles, today, 5);
+            const last    = day[day.length - 1];
+            const dayHigh = computeDayHighSoFar(candles, today);
+
+            const aboveVWAP = vwap != null && last ? last.close >= vwap : false;
+            const brokeOR   = !!(orRange && last && last.close > orRange.high);
+            const pullback  = !!(orRange && last && last.low   >= orRange.high * 0.985);
+            const brokeDay  = (typeof dayHigh === "number" && last) ? last.close > dayHigh : brokeOR;
+            const broke3    = brokeRecentHighs(candles, today, 3);
+            const volOK     = (vol?.mult ?? 0) >= 1.1;
+
+            const armed = aboveVWAP && volOK && ((brokeOR && pullback) || brokeDay || broke3);
+            debug.scan_signals = { aboveVWAP, brokeOR, pullback, brokeDay, broke3, volMult: vol?.mult ?? null };
+
+            if (armed) {
+              // claim lock
+              const claim = await prisma.botState.updateMany({
+                where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
+                data: { lastRunDay: today },
+              });
+              const claimed = claim.count === 1;
+              if (!claimed) {
+                debug.reasons.push("scan_day_lock_already_claimed");
+              } else {
+                // re-check and place order
+                openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+                if (openPos) {
+                  debug.reasons.push("scan_pos_open_after_claim");
+                } else {
+                  // reference price for sizing / TP/SL
+                  let ref: number | null =
+                    Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
+                  if (!Number.isFinite(Number(ref))) ref = Number(rec!.price);
+                  if (!Number.isFinite(Number(ref))) {
+                    const q = await getQuote(rec!.ticker);
+                    if (q != null && Number.isFinite(Number(q))) ref = Number(q);
+                  }
+
+                  if (ref == null || !Number.isFinite(Number(ref))) {
+                    debug.reasons.push("scan_no_price_for_entry");
+                    await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+                  } else {
+                    const cashNum = Number(state.cash);
+                    const shares = Math.floor(Math.min(cashNum, INVEST_BUDGET) / ref);
+                    if (shares <= 0) {
+                      debug.reasons.push(`scan_insufficient_cash_for_one_share_ref_${ref.toFixed(2)}`);
+                      await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+                    } else {
+                      const tp = ref * (1 + TARGET_PCT);
+                      const sl = ref * (1 + STOP_PCT);
+
+                      try {
+                        const order = await submitBracketBuy({
+                          symbol: rec!.ticker,
+                          qty: shares,
+                          entryType: "market",
+                          tp,
+                          sl,
+                          tif: "day",
+                        });
+
+                        const pos = await prisma.position.create({
+                          data: { ticker: rec!.ticker, entryPrice: ref, shares, open: true, brokerOrderId: order.id },
+                        });
+                        openPos = pos;
+
+                        await prisma.trade.create({
+                          data: { side: "BUY", ticker: rec!.ticker, price: ref, shares, brokerOrderId: order.id },
+                        });
+
+                        await prisma.botState.update({
+                          where: { id: 1 },
+                          data: { cash: cashNum - shares * ref, equity: cashNum - shares * ref + shares * ref },
+                        });
+
+                        debug.lastMessage = `✅ 09:34–10:14 BUY (signals armed) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
+                      } catch (e: any) {
+                        const msg = e?.message || "unknown";
+                        const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
+                        debug.reasons.push(`scan_alpaca_submit_failed:${msg}${body ? " body="+body : ""}`);
+                        await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+                      }
+                    }
+                  }
+                }
+              }
+            } else {
+              debug.reasons.push("scan_signals_not_armed");
+            }
+          }
+        } catch (e: any) {
+          debug.reasons.push(`scan_signal_exception:${e?.message || "unknown"}`);
+        }
+      }
+    }
+
+    /** ───────────────── 10:15–10:16 Force Window (signals ignored) ───────────────── */
+    if (!openPos && marketOpen && inForceWindow() && state.lastRunDay !== today) {
+      const base = getBaseUrl(req);
+      let snapshot = await getSnapshot(base);
+      let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
+
+      if (!top.length && lastGoodSnapshot && lastGoodSnapshotDay === today) {
+        top = lastGoodSnapshot.stocks.slice(0, TOP_CANDIDATES);
+        debug.used_last_good_snapshot_force = true;
+      }
+
+      const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
+      const candidates = affordableTop.length ? affordableTop : top;
+
+      debug.force_top = candidates.map((s) => s.ticker);
+      debug.force_affordable_count = affordableTop.length;
+
+      // small burst inside force window to ensure we place something
       const BURST_TRIES = 12;
       const BURST_DELAY_MS = 300;
 
-      for (let i = 0; i < BURST_TRIES; i++) {
-        // 1) Make sure we have an AI pick (or fallback if allowed)
-        let rec = await ensureTodayRecommendationFromSnapshot(req, candidates);
-        if (!rec?.ticker && !REQUIRE_AI_PICK && candidates.length) {
-          // HARD FALLBACK if allowed
-          const fb = candidates[0];
-          const fallbackTicker = fb.ticker;
-          const fallbackPrice = fb.price ?? (await getQuote(fallbackTicker));
-          if (fallbackTicker && fallbackPrice && Number.isFinite(Number(fallbackPrice))) {
-            rec = await prisma.recommendation.create({
-              data: { ticker: fallbackTicker, price: Number(fallbackPrice) },
-            });
-            debug.fallback_used = true;
-          }
-        }
-
+      for (let i = 0; i < BURST_TRIES && !openPos; i++) {
+        const rec = await ensureTodayRecommendationFromSnapshot(req, candidates);
         if (!rec?.ticker) {
-          debug.reasons.push(`1230_no_pick_iter_${i}`);
+          debug.reasons.push(`force_no_ai_pick_iter_${i}`);
           await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
           continue;
         }
 
         lastRec = rec;
 
-        // 2) Claim daily lock
+        // claim lock
         const claim = await prisma.botState.updateMany({
           where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
           data: { lastRunDay: today },
         });
         const claimed = claim.count === 1;
-        debug[`iter_${i}_claimed`] = claimed;
+        debug[`force_iter_${i}_claimed`] = claimed;
 
         if (!claimed) {
-          debug.reasons.push(`1230_day_lock_already_claimed_iter_${i}`);
+          debug.reasons.push(`force_day_lock_already_claimed_iter_${i}`);
           await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
           continue;
         }
 
-        // 3) After claiming, re-check no open pos
+        // ensure no pos after claim
         openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
         if (openPos) {
-          debug.reasons.push(`1230_position_open_after_claim_iter_${i}`);
-          break; // someone else bought
+          debug.reasons.push(`force_pos_open_after_claim_iter_${i}`);
+          break;
         }
 
-        // 4) Build entry ref price: snapshot -> rec.price -> quote
+        // ref price
         let ref: number | null =
           Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
         if (!Number.isFinite(Number(ref))) ref = Number(rec!.price);
@@ -401,22 +541,17 @@ async function handle(req: Request) {
           const q = await getQuote(rec!.ticker);
           if (q != null && Number.isFinite(Number(q))) ref = Number(q);
         }
-
         if (ref == null || !Number.isFinite(Number(ref))) {
-          debug.reasons.push(`1230_no_price_for_entry_iter_${i}`);
-          // release lock and retry
+          debug.reasons.push(`force_no_price_for_entry_iter_${i}`);
           await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
           await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
           continue;
         }
 
-        // 5) Submit as a MARKET bracket (fills immediately)
         const cashNum = Number(state.cash);
         const shares = Math.floor(Math.min(cashNum, INVEST_BUDGET) / ref);
-
         if (shares <= 0) {
-          debug.reasons.push(`1230_insufficient_cash_for_one_share_ref_${ref.toFixed(2)}`);
-          // release lock so next iteration can try again (or another pick)
+          debug.reasons.push(`force_insufficient_cash_for_one_share_ref_${ref.toFixed(2)}`);
           await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
           await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
           continue;
@@ -429,7 +564,7 @@ async function handle(req: Request) {
           const order = await submitBracketBuy({
             symbol: rec!.ticker,
             qty: shares,
-            entryType: "market",   // key change
+            entryType: "market",
             tp,
             sl,
             tif: "day",
@@ -449,13 +584,12 @@ async function handle(req: Request) {
             data: { cash: cashNum - shares * ref, equity: cashNum - shares * ref + shares * ref },
           });
 
-          debug.lastMessage = `✅ 12:30 BUY (market bracket) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
-          break; // success
+          debug.lastMessage = `✅ 10:15 FORCE BUY (market bracket) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
+          break;
         } catch (e: any) {
           const msg = e?.message || "unknown";
           const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
-          debug.reasons.push(`1230_alpaca_submit_failed_iter_${i}:${msg}${body ? " body="+body : ""}`);
-          // release lock so we can retry within the window
+          debug.reasons.push(`force_alpaca_submit_failed_iter_${i}:${msg}${body ? " body="+body : ""}`);
           await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
           await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
           continue;
@@ -463,11 +597,11 @@ async function handle(req: Request) {
       }
     }
 
-    /** ── End-of-window lock failsafe (clear stuck lock so next tick can retry) ── */
-    if (!openPos && inEndOfWindowFailsafe()) {
+    /** ── End-of-force failsafe: clear stuck lock ── */
+    if (!openPos && inEndOfForceFailsafe()) {
       if (state.lastRunDay === yyyyMmDdET()) {
         await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-        (debug.reasons as string[]).push("1230_failsafe_cleared_day_lock");
+        (debug.reasons as string[]).push("force_failsafe_cleared_day_lock");
       }
     }
 
@@ -494,12 +628,12 @@ async function handle(req: Request) {
       live: { ticker: openPos?.ticker ?? lastRec?.ticker ?? null, price: livePrice },
       serverTimeET: nowET().toISOString(),
       info: {
-        prewarm_122930_122959: inPrewarmWindow(),
-        buyWindow_123000_123159: inBuyWindow(),
+        scan_0934_1014: inScanWindow(),
+        force_1015_1016: inForceWindow(),
+        prewarm: inPrewarmWindow(),
         requireAiPick: REQUIRE_AI_PICK,
         targetPct: TARGET_PCT,
         stopPct: STOP_PCT,
-        slippageSteps: SLIPPAGE_STEPS,
       },
       debug,
     };

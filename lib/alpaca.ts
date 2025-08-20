@@ -16,6 +16,7 @@ const SEC =
   process.env.NEXT_PUBLIC_ALPACA_API_SECRET_KEY ||
   "";
 
+// ---- helpers ----
 function headers() {
   return {
     "APCA-API-KEY-ID": KEY,
@@ -41,6 +42,21 @@ async function alpacaFetch(path: string, opts: RequestInit = {}) {
   return json;
 }
 
+// ---- Tick math (US equities) ----
+// ≥ $1 -> $0.01 ticks; < $1 -> $0.0001 ticks.
+function tickSizeFor(price: number) {
+  return price >= 1 ? 0.01 : 0.0001;
+}
+function ceilToTick(x: number, tick: number) {
+  return Math.ceil(x / tick) * tick;
+}
+function floorToTick(x: number, tick: number) {
+  return Math.floor(x / tick) * tick;
+}
+function decsForTick(tick: number) {
+  return tick === 0.01 ? 2 : 4;
+}
+
 // ---- Types ----
 export type AlpacaOrder = {
   id: string;
@@ -61,11 +77,11 @@ export type AlpacaOrder = {
 // entryType: "market" (recommended) or "limit" (provide limit)
 export async function submitBracketBuy(params: {
   symbol: string;
-  qty: number; // whole shares
+  qty: number;                // whole shares
   entryType?: "market" | "limit";
-  limit?: number; // required if entryType="limit"
-  tp: number;     // take-profit limit price
-  sl: number;     // stop-loss stop price
+  limit?: number;             // required if entryType="limit" (unrounded)
+  tp: number;                 // take-profit target (unrounded)
+  sl: number;                 // stop-loss trigger (unrounded)
   tif?: "day" | "gtc" | "opg" | "ioc" | "fok" | "cls";
   extended_hours?: boolean;
 }) {
@@ -80,6 +96,14 @@ export async function submitBracketBuy(params: {
     extended_hours = false,
   } = params;
 
+  // ----- Round TP/SL to valid exchange ticks -----
+  const tpTick = tickSizeFor(tp);
+  const slTick = tickSizeFor(sl);
+  const tpRO   = ceilToTick(tp, tpTick);      // round UP for TP limit
+  const slRO   = floorToTick(sl, slTick);     // round DOWN for SL stop
+  const tpStr  = tpRO.toFixed(decsForTick(tpTick));
+  const slStr  = slRO.toFixed(decsForTick(slTick));
+
   const body: any = {
     symbol,
     qty: String(qty),
@@ -88,15 +112,19 @@ export async function submitBracketBuy(params: {
     time_in_force: tif,
     extended_hours,
     order_class: "bracket",
-    take_profit: { limit_price: Number(tp).toFixed(4) },
-    stop_loss:   { stop_price:  Number(sl).toFixed(4) },
+    take_profit: { limit_price: tpStr },
+    // Stop MARKET for reliability (only stop_price needed)
+    stop_loss:   { stop_price:  slStr },
   };
 
   if (entryType === "limit") {
     if (!Number.isFinite(Number(limit))) {
       throw new Error("submitBracketBuy: limit price required for limit entry");
     }
-    body.limit_price = Number(limit).toFixed(4);
+    // For a BUY limit, bias UP to ensure it’s not sub-tick and has better fill odds
+    const limTick = tickSizeFor(Number(limit));
+    const limRO   = ceilToTick(Number(limit), limTick);
+    body.limit_price = limRO.toFixed(decsForTick(limTick));
   }
 
   // Correct path: BASE + /v2/orders
@@ -107,7 +135,7 @@ export async function submitBracketBuy(params: {
 }
 
 export async function closePositionMarket(symbol: string) {
-  // DELETE closes at market and cancels related legs
+  // DELETE closes at market and cancels related bracket legs
   return alpacaFetch(`/v2/positions/${encodeURIComponent(symbol)}`, {
     method: "DELETE",
   });
@@ -115,5 +143,7 @@ export async function closePositionMarket(symbol: string) {
 
 // ---- Optional: quick health helpers ----
 export async function getAccount() { return alpacaFetch("/v2/account"); }
-export async function getClock() { return alpacaFetch("/v2/clock"); }
-export async function getAsset(symbol: string) { return alpacaFetch(`/v2/assets/${encodeURIComponent(symbol)}`); }
+export async function getClock()   { return alpacaFetch("/v2/clock"); }
+export async function getAsset(symbol: string) {
+  return alpacaFetch(`/v2/assets/${encodeURIComponent(symbol)}`);
+}

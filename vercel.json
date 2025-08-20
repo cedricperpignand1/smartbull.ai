@@ -2,9 +2,9 @@
   "version": 2,
   "crons": [
     { "path": "/api/bot/tick", "schedule": "34-59 13 * * 1-5" },
-    { "path": "/api/bot/tick", "schedule": "0-15 14 * * 1-5" },
+    { "path": "/api/bot/tick", "schedule": "0-14 14 * * 1-5" },
 
-    { "path": "/api/bot/tick", "schedule": "29-31 16 * * 1-5" },
+    { "path": "/api/bot/tick", "schedule": "15-16 14 * * 1-5" },
 
     { "path": "/api/bot/tick", "schedule": "55 19 * * 1-5" },
     { "path": "/api/bot/tick", "schedule": "56 19 * * 1-5" },
