@@ -1,7 +1,20 @@
 // app/lib/alpaca.ts
-const BASE = process.env.ALPACA_BASE_URL?.trim() || "https://paper-api.alpaca.markets";
-const KEY  = process.env.ALPACA_API_KEY_ID!;
-const SEC  = process.env.ALPACA_API_SECRET_KEY!;
+
+// ---- Base & Keys (robust) ----
+const RAW_BASE =
+  (process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets").trim();
+// remove trailing slashes and a trailing "/v2" if present
+const BASE = RAW_BASE.replace(/\/+$/, "").replace(/\/v2$/, "");
+const KEY =
+  process.env.ALPACA_API_KEY_ID ||
+  process.env.ALPACA_API_KEY ||
+  process.env.NEXT_PUBLIC_ALPACA_API_KEY_ID ||
+  "";
+const SEC =
+  process.env.ALPACA_API_SECRET_KEY ||
+  process.env.ALPACA_SECRET_KEY ||
+  process.env.NEXT_PUBLIC_ALPACA_API_SECRET_KEY ||
+  "";
 
 function headers() {
   return {
@@ -11,6 +24,24 @@ function headers() {
   };
 }
 
+async function alpacaFetch(path: string, opts: RequestInit = {}) {
+  const url = `${BASE}${path.startsWith("/") ? "" : "/"}${path}`;
+  const res = await fetch(url, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+  const text = await res.text();
+  let json: any = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* keep raw */ }
+
+  if (!res.ok) {
+    const msg = json?.message || json?.error || text || `HTTP ${res.status}`;
+    const err = new Error(`Alpaca error: ${msg}`);
+    (err as any).status = res.status;
+    (err as any).body = json ?? text;
+    throw err;
+  }
+  return json;
+}
+
+// ---- Types ----
 export type AlpacaOrder = {
   id: string;
   client_order_id: string;
@@ -26,50 +57,63 @@ export type AlpacaOrder = {
   legs?: AlpacaOrder[];
 };
 
+// ---- Orders ----
+// entryType: "market" (recommended) or "limit" (provide limit)
 export async function submitBracketBuy(params: {
   symbol: string;
-  qty: number;          // whole shares
-  limit: number;        // entry limit
-  tp: number;           // take-profit limit
-  sl: number;           // stop-loss stop
-  tif?: "day" | "gtc";
+  qty: number; // whole shares
+  entryType?: "market" | "limit";
+  limit?: number; // required if entryType="limit"
+  tp: number;     // take-profit limit price
+  sl: number;     // stop-loss stop price
+  tif?: "day" | "gtc" | "opg" | "ioc" | "fok" | "cls";
+  extended_hours?: boolean;
 }) {
-  const body = {
-    symbol: params.symbol,
-    qty: String(params.qty),
+  const {
+    symbol,
+    qty,
+    entryType = "market",
+    limit,
+    tp,
+    sl,
+    tif = "day",
+    extended_hours = false,
+  } = params;
+
+  const body: any = {
+    symbol,
+    qty: String(qty),
     side: "buy",
-    type: "limit",
-    time_in_force: params.tif || "day",
-    limit_price: Number(params.limit).toFixed(4),
-    extended_hours: false,
+    type: entryType, // "market" or "limit"
+    time_in_force: tif,
+    extended_hours,
     order_class: "bracket",
-    take_profit: { limit_price: Number(params.tp).toFixed(4) },
-    stop_loss:   { stop_price:  Number(params.sl).toFixed(4) },
+    take_profit: { limit_price: Number(tp).toFixed(4) },
+    stop_loss:   { stop_price:  Number(sl).toFixed(4) },
   };
 
-  const res = await fetch(`${BASE}/v2/orders`, {
-    method: "POST",
-    headers: headers(),
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Alpaca order failed (${res.status}): ${txt}`);
+  if (entryType === "limit") {
+    if (!Number.isFinite(Number(limit))) {
+      throw new Error("submitBracketBuy: limit price required for limit entry");
+    }
+    body.limit_price = Number(limit).toFixed(4);
   }
-  return (await res.json()) as AlpacaOrder;
+
+  // Correct path: BASE + /v2/orders
+  return (await alpacaFetch("/v2/orders", {
+    method: "POST",
+    body: JSON.stringify(body),
+  })) as AlpacaOrder;
 }
 
 export async function closePositionMarket(symbol: string) {
-  // Market-close entire position; Alpaca cancels related bracket legs automatically
-  const res = await fetch(`${BASE}/v2/positions/${encodeURIComponent(symbol)}`, {
+  // DELETE closes at market and cancels related legs
+  return alpacaFetch(`/v2/positions/${encodeURIComponent(symbol)}`, {
     method: "DELETE",
-    headers: headers(),
-    cache: "no-store",
   });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Alpaca close position failed (${res.status}): ${txt}`);
-  }
-  return res.json().catch(() => ({}));
 }
+
+// ---- Optional: quick health helpers ----
+export async function getAccount() { return alpacaFetch("/v2/account"); }
+export async function getClock() { return alpacaFetch("/v2/clock"); }
+export async function getAsset(symbol: string) { return alpacaFetch(`/v2/assets/${encodeURIComponent(symbol)}`); }

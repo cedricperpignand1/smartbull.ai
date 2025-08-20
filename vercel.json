@@ -4,7 +4,7 @@
     { "path": "/api/bot/tick", "schedule": "34-59 13 * * 1-5" },
     { "path": "/api/bot/tick", "schedule": "0-15 14 * * 1-5" },
 
-    { "path": "/api/bot/tick", "schedule": "19-21 15 * * 1-5" },
+    { "path": "/api/bot/tick", "schedule": "51-53 15 * * 1-5" },
 
     { "path": "/api/bot/tick", "schedule": "55 19 * * 1-5" },
     { "path": "/api/bot/tick", "schedule": "56 19 * * 1-5" },
