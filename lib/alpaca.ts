@@ -67,10 +67,14 @@ export type AlpacaOrder = {
   type: "market" | "limit" | "stop" | "stop_limit";
   qty?: string;
   filled_qty?: string;
+  filled_avg_price?: string;
   limit_price?: string;
   stop_price?: string;
   order_class?: "simple" | "bracket" | "oco" | "oto";
   legs?: AlpacaOrder[];
+  parent_order_id?: string;
+  submitted_at?: string;
+  filled_at?: string;
 };
 
 // ---- Orders ----
@@ -146,4 +150,45 @@ export async function getAccount() { return alpacaFetch("/v2/account"); }
 export async function getClock()   { return alpacaFetch("/v2/clock"); }
 export async function getAsset(symbol: string) {
   return alpacaFetch(`/v2/assets/${encodeURIComponent(symbol)}`);
+}
+
+// ---- Extra helpers for syncing orders/positions ----
+export async function getOrder(id: string, nested = true) {
+  const qs = nested ? "?nested=true" : "";
+  return alpacaFetch(`/v2/orders/${encodeURIComponent(id)}${qs}`);
+}
+
+export async function listOrders(params: {
+  status?: "open" | "closed" | "all";
+  symbols?: string[];
+  after?: string;   // ISO8601
+  until?: string;   // ISO8601
+  limit?: number;
+  nested?: boolean;
+} = {}) {
+  const q = new URLSearchParams();
+  if (params.status) q.set("status", params.status);
+  if (params.after)  q.set("after", params.after);
+  if (params.until)  q.set("until", params.until);
+  if (params.limit)  q.set("limit", String(params.limit));
+  if (params.nested) q.set("nested", "true");
+  if (params.symbols && params.symbols.length) {
+    q.set("symbols", params.symbols.join(","));
+  }
+  const suf = q.toString() ? `?${q.toString()}` : "";
+  return alpacaFetch(`/v2/orders${suf}`);
+}
+
+export async function listPositions() {
+  return alpacaFetch(`/v2/positions`);
+}
+
+// returns null if no active position for symbol
+export async function getPosition(symbol: string) {
+  try {
+    return await alpacaFetch(`/v2/positions/${encodeURIComponent(symbol)}`);
+  } catch (e: any) {
+    if (e?.status === 404) return null;
+    throw e;
+  }
 }
