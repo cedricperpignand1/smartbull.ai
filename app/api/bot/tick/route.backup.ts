@@ -7,7 +7,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getQuote } from "@/lib/quote";
 import { isWeekdayET, isMarketHoursET, yyyyMmDdET, nowET } from "@/lib/market";
-import { submitBracketBuy, closePositionMarket, replaceTpSlIfBetter } from "@/lib/alpaca";
+import { submitBracketBuy, closePositionMarket } from "@/lib/alpaca";
 
 /** ───────────────── Throttle / Coalesce ───────────────── */
 let lastTickAt = 0;
@@ -21,16 +21,6 @@ const INVEST_BUDGET = 4000;          // cap per trade; if cash < 4k, use all cas
 const TARGET_PCT = 0.10;             // +10% take-profit
 const STOP_PCT   = -0.05;            // -5% stop-loss
 const TOP_CANDIDATES = 8;
-
-// Ratchet config (NEW)
-const RATCHET_ENABLED = true;                 // master switch
-const RATCHET_STEP_PCT = 0.05;                // 5% steps off entry (tunable)
-const RATCHET_LIFT_BROKER_CHILDREN = true;    // raise Alpaca TP/SL legs
-const RATCHET_VIRTUAL_EXITS = true;           // app exits at market on dynTP/dynSL
-
-// ⛔ Alpaca safety: cooldown TP/SL lifts (per symbol)
-const LIFT_COOLDOWN_MS = 6000; // ~1 call per 6s per symbol (well under free-tier limits)
-const ratchetLiftMemo: Record<string, { lastStep: number; lastLiftAt: number }> = {};
 
 // Risk tuning (slightly spicier but still healthy)
 const VOL_MULT_MIN   = 1.00;         // was ~1.1; allow earlier momentum
@@ -234,39 +224,6 @@ function brokeRecentHighs(candles: Candle[], todayYMD: string, n = 3) {
   return last.close > priorMax;
 }
 
-/** ───────────────── Ratcheting targets (configurable steps off entry) ─────────────────
- * Steps = number of +(RATCHET_STEP_PCT) “high-water” increments from entry.
- * initialSL = entry * (1 + STOP_PCT)
- * initialTP = entry * (1 + TARGET_PCT)
- * Ratchet factor = ((1 + RATCHET_STEP_PCT) ** steps) applied to BOTH.
- */
-function computeRatchetTargets(entry: number, dayHighSinceOpen: number) {
-  if (!RATCHET_ENABLED) return null;
-  if (!Number.isFinite(entry) || !Number.isFinite(dayHighSinceOpen) || entry <= 0) {
-    return null;
-  }
-  const upFromEntry = dayHighSinceOpen / entry - 1;
-  const step = Math.max(0.0001, RATCHET_STEP_PCT); // guard
-  const steps = Math.max(0, Math.floor(upFromEntry / step));
-  const factor = Math.pow(1 + step, steps);
-
-  const initialSL = entry * (1 + STOP_PCT);
-  const initialTP = entry * (1 + TARGET_PCT);
-
-  const dynSL = initialSL * factor;
-  const dynTP = initialTP * factor;
-
-  const round2 = (n: number) => Math.round(n * 100) / 100;
-
-  return {
-    steps,
-    dynSL: round2(dynSL),
-    dynTP: round2(dynTP),
-    initialSL: round2(initialSL),
-    initialTP: round2(initialTP),
-  };
-}
-
 /** Keep AI pick “rolling” during scan/force windows (updates every FRESHNESS_MS or if not in top-8) */
 async function ensureRollingRecommendationFromSnapshot(
   req: Request,
@@ -282,6 +239,7 @@ async function ensureRollingRecommendationFromSnapshot(
   const notToday = lastRec ? yyyyMmDd(lastRec.at as Date) !== today : true;
   const notInTop = lastRec?.ticker ? !topStocks.some(s => s.ticker === lastRec!.ticker) : true;
 
+  // Re-ask AI if it's a new day, stale, or ticker fell out of current top list
   if (tooOld || notToday || notInTop) {
     try {
       const base = getBaseUrl(req);
@@ -296,6 +254,7 @@ async function ensureRollingRecommendationFromSnapshot(
         const rJson = await rRes.json();
         const ticker = parseAIPick(rJson);
         if (ticker) {
+          // prefer snapshot price; fallback to live quote
           const snapPrice = topStocks.find((s) => s.ticker === ticker)?.price;
           const priceCandidate = snapPrice ?? (await getQuote(ticker));
           if (priceCandidate != null && Number.isFinite(Number(priceCandidate))) {
@@ -306,7 +265,7 @@ async function ensureRollingRecommendationFromSnapshot(
         }
       }
     } catch {
-      // ignore
+      // ignore network/AI errors; fall back to lastRec
     }
   }
 
@@ -375,7 +334,7 @@ async function handle(req: Request) {
 
         openPos = null;
         debug.lastMessage = `⏱️ Mandatory 15:55+ exit ${exitTicker}`;
-      } catch {
+      } catch (e: any) {
         debug.reasons.push("mandatory_exit_exception");
       }
     }
@@ -428,11 +387,13 @@ async function handle(req: Request) {
       debug.scan_top = candidates.map((s) => s.ticker);
       debug.scan_affordable_count = affordableTop.length;
 
+      // 🔁 Keep the AI pick fresh while scanning
       const rec = await ensureRollingRecommendationFromSnapshot(req, candidates);
       if (!rec?.ticker) {
         debug.reasons.push("scan_no_ai_pick_yet");
       } else {
         lastRec = rec;
+        // compute setups
         try {
           const candles = await fetchCandles1m(rec!.ticker, 240);
           const day = candles.filter((c) => isSameETDay(toET(c.date), today));
@@ -447,12 +408,14 @@ async function handle(req: Request) {
 
             const aboveVWAP = vwap != null && last ? last.close >= vwap : false;
             const brokeOR   = !!(orRange && last && last.close > orRange.high);
-            const nearOR    = !!(orRange && last && last.close >= orRange.high * (1 - NEAR_OR_PCT));
+            // risk-on looseners:
+            const nearOR    = !!(orRange && last && last.close >= orRange.high * (1 - NEAR_OR_PCT)); // within 0.3%
             const vwapRecl  = !!(vwap != null && last && last.close >= vwap && last.low >= vwap * (1 - VWAP_RECLAIM_BAND));
             const brokeDay  = (typeof dayHigh === "number" && last) ? last.close > dayHigh : brokeOR;
             const broke3    = brokeRecentHighs(candles, today, 3);
             const volOK     = (vol?.mult ?? 0) >= VOL_MULT_MIN;
 
+            // Removed strict "pullback after OR breakout" requirement for faster entries
             const trendOK   = brokeOR || nearOR || brokeDay || broke3 || vwapRecl;
             const armed     = aboveVWAP && volOK && trendOK;
 
@@ -462,6 +425,7 @@ async function handle(req: Request) {
             };
 
             if (armed) {
+              // claim lock
               const claim = await prisma.botState.updateMany({
                 where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
                 data: { lastRunDay: today },
@@ -470,10 +434,12 @@ async function handle(req: Request) {
               if (!claimed) {
                 debug.reasons.push("scan_day_lock_already_claimed");
               } else {
+                // re-check and place order
                 openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
                 if (openPos) {
                   debug.reasons.push("scan_pos_open_after_claim");
                 } else {
+                  // reference price for sizing / TP/SL
                   let ref: number | null =
                     Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
                   if (!Number.isFinite(Number(ref))) ref = Number(rec!.price);
@@ -557,10 +523,12 @@ async function handle(req: Request) {
       debug.force_top = candidates.map((s) => s.ticker);
       debug.force_affordable_count = affordableTop.length;
 
+      // small burst inside force window to ensure we place something
       const BURST_TRIES = 12;
       const BURST_DELAY_MS = 300;
 
       for (let i = 0; i < BURST_TRIES && !openPos; i++) {
+        // 🔁 keep pick fresh during the burst
         const rec = await ensureRollingRecommendationFromSnapshot(req, candidates, 10_000);
         if (!rec?.ticker) {
           debug.reasons.push(`force_no_ai_pick_iter_${i}`);
@@ -570,6 +538,7 @@ async function handle(req: Request) {
 
         lastRec = rec;
 
+        // claim lock
         const claim = await prisma.botState.updateMany({
           where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
           data: { lastRunDay: today },
@@ -583,9 +552,14 @@ async function handle(req: Request) {
           continue;
         }
 
+        // ensure no pos after claim
         openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-        if (openPos) break;
+        if (openPos) {
+          debug.reasons.push(`force_pos_open_after_claim_iter_${i}`);
+          break;
+        }
 
+        // ref price
         let ref: number | null =
           Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
         if (!Number.isFinite(Number(ref))) ref = Number(rec!.price);
@@ -657,141 +631,16 @@ async function handle(req: Request) {
       }
     }
 
-    /** ───────────────── Holding: refresh equity for UI + ratchet stop/TP ───────────────── */
+    /** ───────────────── Holding: refresh equity for UI ───────────────── */
     if (openPos) {
       const q = await getQuote(openPos.ticker);
       if (q != null && Number.isFinite(Number(q))) {
         const p = Number(q);
-        livePrice = p;
-
         const equityNow = Number(state.cash) + Number(openPos.shares) * p;
         if (Number(state.equity) !== equityNow) {
           state = await prisma.botState.update({ where: { id: 1 }, data: { equity: equityNow } });
         }
-
-        try {
-          const todayYMD = yyyyMmDdET();
-          const candles = await fetchCandles1m(openPos.ticker, 240);
-          const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
-
-          if (day.length >= 2) {
-            const prior = day.slice(0, -1);
-            const dayHigh = Math.max(...prior.map((c) => c.high));
-
-            const rat = computeRatchetTargets(Number(openPos.entryPrice), dayHigh);
-            if (rat) {
-              debug.ratchet = {
-                steps: rat.steps,
-                dayHigh: Math.round(dayHigh * 100) / 100,
-                dynSL: rat.dynSL,
-                dynTP: rat.dynTP
-              };
-
-              // ── Rate-limit guard: only lift when step increases & cooldown passed
-              if (RATCHET_LIFT_BROKER_CHILDREN) {
-                const key = openPos.ticker;
-                const memo = ratchetLiftMemo[key] || { lastStep: -1, lastLiftAt: 0 };
-                const nowTs = Date.now();
-
-                if (rat.steps > memo.lastStep && (nowTs - memo.lastLiftAt) >= LIFT_COOLDOWN_MS) {
-                  try {
-                    const replaced = await replaceTpSlIfBetter({
-                      symbol: key,
-                      newTp: rat.dynTP, // raise-only
-                      newSl: rat.dynSL, // raise-only
-                    });
-                    ratchetLiftMemo[key] = { lastStep: rat.steps, lastLiftAt: nowTs };
-
-                    // concise, human-friendly info for your UI
-                    debug.ratchet_replace = {
-                      step: rat.steps,
-                      message: replaced.message,  // e.g. "TP 5.50→5.78 (raised) | SL 4.75→4.99 (raised)"
-                      triedTp: replaced.triedTp,
-                      triedSl: replaced.triedSl,
-                      prevTp: replaced.prevTp,
-                      prevSl: replaced.prevSl,
-                      cooldownMs: LIFT_COOLDOWN_MS,
-                    };
-                  } catch (e: any) {
-                    debug.reasons.push(`ratchet_replace_children_exception:${e?.message || "unknown"}`);
-                  }
-                } else {
-                  debug.ratchet_replace_skipped = {
-                    reason: rat.steps <= memo.lastStep ? "no_new_step" : "cooldown",
-                    lastStep: memo.lastStep,
-                    lastLiftAgoMs: nowTs - memo.lastLiftAt,
-                    cooldownMs: LIFT_COOLDOWN_MS,
-                  };
-                }
-              }
-
-              if (RATCHET_VIRTUAL_EXITS) {
-                // 1) VIRTUAL RATCHETED TAKE-PROFIT
-                if (p >= rat.dynTP) {
-                  const exitTicker = openPos.ticker;
-                  try {
-                    await closePositionMarket(exitTicker);
-
-                    const shares   = Number(openPos.shares);
-                    const entry    = Number(openPos.entryPrice);
-                    const exitVal  = shares * p;
-                    const realized = exitVal - shares * entry;
-
-                    await prisma.trade.create({ data: { side: "SELL", ticker: exitTicker, price: p, shares } });
-                    await prisma.position.update({ where: { id: openPos.id }, data: { open: false, exitPrice: p, exitAt: nowET() } });
-
-                    state = await prisma.botState.update({
-                      where: { id: 1 },
-                      data: {
-                        cash:   Number(state.cash) + exitVal,
-                        pnl:    Number(state.pnl) + realized,
-                        equity: Number(state.cash) + exitVal,
-                      },
-                    });
-
-                    debug.lastMessage = `🏁 Ratchet TP hit ${exitTicker} @ ${p.toFixed(2)} (dynTP=${rat.dynTP.toFixed(2)})`;
-                    openPos = null;
-                  } catch (e: any) {
-                    debug.reasons.push(`ratchet_tp_close_exception:${e?.message || "unknown"}`);
-                  }
-                }
-                // 2) RATCHETED STOP
-                else if (p <= rat.dynSL) {
-                  const exitTicker = openPos.ticker;
-                  try {
-                    await closePositionMarket(exitTicker);
-
-                    const shares   = Number(openPos.shares);
-                    const entry    = Number(openPos.entryPrice);
-                    const exitVal  = shares * p;
-                    const realized = exitVal - shares * entry;
-
-                    await prisma.trade.create({ data: { side: "SELL", ticker: exitTicker, price: p, shares } });
-                    await prisma.position.update({ where: { id: openPos.id }, data: { open: false, exitPrice: p, exitAt: nowET() } });
-
-                    state = await prisma.botState.update({
-                      where: { id: 1 },
-                      data: {
-                        cash:   Number(state.cash) + exitVal,
-                        pnl:    Number(state.pnl) + realized,
-                        equity: Number(state.cash) + exitVal,
-                      },
-                    });
-
-                    debug.lastMessage = `🛡️ Ratchet SL hit ${exitTicker} @ ${p.toFixed(2)} (dynSL=${rat.dynSL.toFixed(2)})`;
-                    openPos = null;
-                  } catch (e: any) {
-                    debug.reasons.push(`ratchet_sl_close_exception:${e?.message || "unknown"}`);
-                  }
-                }
-              }
-
-              // We never lower child orders; only raise.
-            }
-          }
-        } catch (e: any) {
-          debug.reasons.push(`ratchet_calc_exception:${e?.message || "unknown"}`);
-        }
+        livePrice = p;
       }
     } else if (lastRec?.ticker) {
       const q = await getQuote(lastRec.ticker);

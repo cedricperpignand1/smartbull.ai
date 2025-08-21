@@ -158,11 +158,15 @@ export async function getOrder(id: string, nested = true) {
   return alpacaFetch(`/v2/orders/${encodeURIComponent(id)}${qs}`);
 }
 
+/** Narrowed order listing:
+ *  - Pass a single symbol to reduce payload/latency.
+ *  - `nested: true` pulls bracket legs in one shot.
+ */
 export async function listOrders(params: {
   status?: "open" | "closed" | "all";
-  symbols?: string[];
-  after?: string;   // ISO8601
-  until?: string;   // ISO8601
+  symbols?: string[];          // filter to active symbol to cut load
+  after?: string;              // ISO8601
+  until?: string;              // ISO8601
   limit?: number;
   nested?: boolean;
 } = {}) {
@@ -191,4 +195,111 @@ export async function getPosition(symbol: string) {
     if (e?.status === 404) return null;
     throw e;
   }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Raise broker-side TP/SL children if our ratchet computed higher.
+   - Raise-only (never lowers).
+   - Lists OPEN orders for the specific symbol only (less payload).
+   - Rounds to valid ticks (TP up, SL down).
+   - Best-effort and race-safe.
+────────────────────────────────────────────────────────────── */
+
+type ReplaceIfBetterParams = {
+  symbol: string;
+  newTp?: number | null;
+  newSl?: number | null;
+};
+
+export async function replaceTpSlIfBetter({ symbol, newTp, newSl }: ReplaceIfBetterParams): Promise<{
+  raisedTp: boolean;
+  raisedSl: boolean;
+  triedTp?: number;
+  triedSl?: number;
+  prevTp?: number;
+  prevSl?: number;
+  message?: string;         // helpful debug summary
+}> {
+  let raisedTp = false, raisedSl = false;
+  let prevTp: number | undefined, prevSl: number | undefined;
+  let triedTp: number | undefined, triedSl: number | undefined;
+
+  try {
+    if (!symbol) return { raisedTp, raisedSl, message: "no symbol" };
+
+    // 1) list only this symbol (less load / safer for rate limits)
+    const orders: any[] = await listOrders({ status: "open", nested: true, symbols: [symbol] });
+
+    // 2) collect SELL children (parents + legs)
+    const sellParents = orders.filter((o) => o?.symbol === symbol && o?.side === "sell");
+    const legsFromParents = sellParents.flatMap((o) => Array.isArray(o?.legs) ? o.legs : []);
+    const allSell = [...sellParents, ...legsFromParents].filter((o) => o?.side === "sell");
+
+    const openSell = allSell.filter((o) =>
+      ["new","accepted","partially_filled","open"].includes(String(o?.status || "").toLowerCase())
+    );
+
+    const tpChild = openSell
+      .filter((o) => String(o?.type || "").toLowerCase() === "limit" && o?.limit_price != null)
+      .sort((a, b) => Number(b.limit_price) - Number(a.limit_price))[0] || null;
+
+    const slChild = openSell
+      .filter((o) => {
+        const t = String(o?.type || "").toLowerCase();
+        return (t === "stop" || t === "stop_limit") && o?.stop_price != null;
+      })
+      .sort((a, b) => Number(b.stop_price) - Number(a.stop_price))[0] || null;
+
+    // 3) raise TP (never lower)
+    if (tpChild && newTp != null && Number.isFinite(newTp)) {
+      const currentTp = Number(tpChild.limit_price);
+      prevTp = Number.isFinite(currentTp) ? currentTp : undefined;
+
+      const tpTick = tickSizeFor(newTp);
+      const newTpRO = ceilToTick(newTp, tpTick);
+      const newTpStr = newTpRO.toFixed(decsForTick(tpTick));
+      const newTpNum = Number(newTpStr);
+      triedTp = newTpNum;
+
+      if (Number.isFinite(currentTp) && newTpNum > currentTp) {
+        try {
+          await alpacaFetch(`/v2/orders/${encodeURIComponent(tpChild.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({ limit_price: newTpStr }),
+          });
+          raisedTp = true;
+        } catch { /* ignore race or already-filled */ }
+      }
+    }
+
+    // 4) raise SL (never lower)
+    if (slChild && newSl != null && Number.isFinite(newSl)) {
+      const currentSl = Number(slChild.stop_price);
+      prevSl = Number.isFinite(currentSl) ? currentSl : undefined;
+
+      const slTick = tickSizeFor(newSl);
+      const newSlRO = floorToTick(newSl, slTick);
+      const newSlStr = newSlRO.toFixed(decsForTick(slTick));
+      const newSlNum = Number(newSlStr);
+      triedSl = newSlNum;
+
+      if (Number.isFinite(currentSl) && newSlNum > currentSl) {
+        try {
+          await alpacaFetch(`/v2/orders/${encodeURIComponent(slChild.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({ stop_price: newSlStr }),
+          });
+          raisedSl = true;
+        } catch { /* ignore race or already-filled */ }
+      }
+    }
+  } catch { /* best-effort, remain silent */ }
+
+  // Build a compact debug string for UI logs
+  const parts: string[] = [];
+  if (triedTp !== undefined) parts.push(`TP ${prevTp ?? "?"}→${triedTp}${raisedTp ? " (raised)" : " (skipped)"}`);
+  if (triedSl !== undefined) parts.push(`SL ${prevSl ?? "?"}→${triedSl}${raisedSl ? " (raised)" : " (skipped)"}`);
+  const message = parts.join(" | ") || "no changes";
+
+  return { raisedTp, raisedSl, triedTp, triedSl, prevTp, prevSl, message };
 }
