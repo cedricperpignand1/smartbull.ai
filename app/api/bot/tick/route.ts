@@ -22,6 +22,14 @@ const TARGET_PCT = 0.10;             // +10% take-profit
 const STOP_PCT   = -0.05;            // -5% stop-loss
 const TOP_CANDIDATES = 8;
 
+// Risk tuning (slightly spicier but still healthy)
+const VOL_MULT_MIN   = 1.00;         // was ~1.1; allow earlier momentum
+const NEAR_OR_PCT    = 0.003;        // within 0.3% of OR high = okay
+const VWAP_RECLAIM_BAND = 0.002;     // low must hold within 0.2% below VWAP
+
+// AI pick freshness (keeps scanning/updating pick)
+const FRESHNESS_MS = 30_000;         // re-ask AI at least every 30s during windows
+
 // Must the AI pick? (true = no fallback)
 const REQUIRE_AI_PICK = true;
 
@@ -35,7 +43,6 @@ function inScanWindow() {
   const d = nowET();
   const m = d.getHours() * 60 + d.getMinutes();
   const s = d.getSeconds();
-  // 9:34:00 (574) to 10:14:59 (614 with seconds<60)
   return m >= 9 * 60 + 34 && m <= 10 * 60 + 14 && s <= 59;
 }
 function inForceWindow() {
@@ -89,7 +96,6 @@ async function getSnapshot(baseUrl: string): Promise<{ stocks: SnapStock[]; upda
       stocks: Array.isArray(j?.stocks) ? j.stocks : [],
       updatedAt: j?.updatedAt || new Date().toISOString(),
     };
-    // update last-good cache if non-empty and same day
     if (snap.stocks.length) {
       const today = yyyyMmDdET();
       const snapDay = yyyyMmDdLocal(new Date(snap.updatedAt));
@@ -118,7 +124,6 @@ function yyyyMmDd(date: Date) {
 
 /** Robust AI recommendation parser */
 function parseAIPick(rJson: any): string | null {
-  // 1) Direct JSON fields
   const fields = [
     rJson?.ticker,
     rJson?.symbol,
@@ -132,12 +137,10 @@ function parseAIPick(rJson: any): string | null {
       return f.toUpperCase();
     }
   }
-  // 2) Context array: { context: { tickers: [ { ticker: "XYZ" } ] } }
   const ctxTicker = rJson?.context?.tickers?.[0]?.ticker;
   if (typeof ctxTicker === "string" && /^[A-Za-z][A-Za-z0-9.\-]*$/.test(ctxTicker)) {
     return ctxTicker.toUpperCase();
   }
-  // 3) Free text / markdown: "**Pick:** XYZ" or "Pick: XYZ" / "Pick - XYZ"
   let txt = String(rJson?.recommendation ?? rJson?.text ?? rJson?.message ?? "");
   txt = txt.replace(/[*_`~]/g, "").replace(/^-+\s*/gm, "");
   const m1 = /Pick\s*:?\s*([A-Z][A-Z0-9.\-]*)/i.exec(txt);
@@ -221,39 +224,52 @@ function brokeRecentHighs(candles: Candle[], todayYMD: string, n = 3) {
   return last.close > priorMax;
 }
 
-/** Ask AI for today's pick from top stocks; if already have today's pick, return it. */
-async function ensureTodayRecommendationFromSnapshot(req: Request, topStocks: SnapStock[]) {
-  const today = yyyyMmDd(nowET());
+/** Keep AI pick “rolling” during scan/force windows (updates every FRESHNESS_MS or if not in top-8) */
+async function ensureRollingRecommendationFromSnapshot(
+  req: Request,
+  topStocks: SnapStock[],
+  freshnessMs = FRESHNESS_MS
+) {
+  const now = nowET();
+  const today = yyyyMmDd(now);
   let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
 
-  const recDay = lastRec?.at instanceof Date ? yyyyMmDd(lastRec.at) : null;
-  if (lastRec && recDay === today) return lastRec;
+  const lastAt = lastRec?.at instanceof Date ? lastRec.at.getTime() : 0;
+  const tooOld = !lastAt || (now.getTime() - lastAt > freshnessMs);
+  const notToday = lastRec ? yyyyMmDd(lastRec.at as Date) !== today : true;
+  const notInTop = lastRec?.ticker ? !topStocks.some(s => s.ticker === lastRec!.ticker) : true;
 
-  try {
-    const base = getBaseUrl(req);
-    const rRes = await fetch(`${base}/api/recommendation`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ stocks: topStocks, forcePick: true, requirePick: true }),
-      cache: "no-store",
-    });
+  // Re-ask AI if it's a new day, stale, or ticker fell out of current top list
+  if (tooOld || notToday || notInTop) {
+    try {
+      const base = getBaseUrl(req);
+      const rRes = await fetch(`${base}/api/recommendation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stocks: topStocks, forcePick: true, requirePick: true }),
+        cache: "no-store",
+      });
 
-    if (!rRes.ok) return lastRec || null;
-
-    const rJson = await rRes.json();
-    const ticker = parseAIPick(rJson);
-    if (!ticker) return lastRec || null;
-
-    // prefer snapshot price; fallback to live quote
-    const snapPrice = topStocks.find((s) => s.ticker === ticker)?.price;
-    const priceCandidate = snapPrice ?? (await getQuote(ticker));
-    if (priceCandidate == null || !Number.isFinite(Number(priceCandidate))) return lastRec || null;
-
-    lastRec = await prisma.recommendation.create({ data: { ticker, price: Number(priceCandidate) } });
-    return lastRec;
-  } catch {
-    return lastRec || null;
+      if (rRes.ok) {
+        const rJson = await rRes.json();
+        const ticker = parseAIPick(rJson);
+        if (ticker) {
+          // prefer snapshot price; fallback to live quote
+          const snapPrice = topStocks.find((s) => s.ticker === ticker)?.price;
+          const priceCandidate = snapPrice ?? (await getQuote(ticker));
+          if (priceCandidate != null && Number.isFinite(Number(priceCandidate))) {
+            lastRec = await prisma.recommendation.create({
+              data: { ticker, price: Number(priceCandidate) },
+            });
+          }
+        }
+      }
+    } catch {
+      // ignore network/AI errors; fall back to lastRec
+    }
   }
+
+  return lastRec || null;
 }
 
 /** ───────────────── Route handlers ───────────────── */
@@ -346,7 +362,7 @@ async function handle(req: Request) {
       debug.prewarm_affordable_count = affordableTop.length;
 
       try {
-        const rec = await ensureTodayRecommendationFromSnapshot(req, candidates);
+        const rec = await ensureRollingRecommendationFromSnapshot(req, candidates);
         if (rec?.ticker) debug.prewarm_pick = rec.ticker;
         else debug.reasons.push("prewarm_no_pick_yet");
       } catch (e: any) {
@@ -371,7 +387,8 @@ async function handle(req: Request) {
       debug.scan_top = candidates.map((s) => s.ticker);
       debug.scan_affordable_count = affordableTop.length;
 
-      const rec = await ensureTodayRecommendationFromSnapshot(req, candidates);
+      // 🔁 Keep the AI pick fresh while scanning
+      const rec = await ensureRollingRecommendationFromSnapshot(req, candidates);
       if (!rec?.ticker) {
         debug.reasons.push("scan_no_ai_pick_yet");
       } else {
@@ -391,13 +408,21 @@ async function handle(req: Request) {
 
             const aboveVWAP = vwap != null && last ? last.close >= vwap : false;
             const brokeOR   = !!(orRange && last && last.close > orRange.high);
-            const pullback  = !!(orRange && last && last.low   >= orRange.high * 0.985);
+            // risk-on looseners:
+            const nearOR    = !!(orRange && last && last.close >= orRange.high * (1 - NEAR_OR_PCT)); // within 0.3%
+            const vwapRecl  = !!(vwap != null && last && last.close >= vwap && last.low >= vwap * (1 - VWAP_RECLAIM_BAND));
             const brokeDay  = (typeof dayHigh === "number" && last) ? last.close > dayHigh : brokeOR;
             const broke3    = brokeRecentHighs(candles, today, 3);
-            const volOK     = (vol?.mult ?? 0) >= 1.1;
+            const volOK     = (vol?.mult ?? 0) >= VOL_MULT_MIN;
 
-            const armed = aboveVWAP && volOK && ((brokeOR && pullback) || brokeDay || broke3);
-            debug.scan_signals = { aboveVWAP, brokeOR, pullback, brokeDay, broke3, volMult: vol?.mult ?? null };
+            // Removed strict "pullback after OR breakout" requirement for faster entries
+            const trendOK   = brokeOR || nearOR || brokeDay || broke3 || vwapRecl;
+            const armed     = aboveVWAP && volOK && trendOK;
+
+            debug.scan_signals = {
+              aboveVWAP, brokeOR, nearOR, vwapRecl, brokeDay, broke3,
+              volMult: vol?.mult ?? null, volMin: VOL_MULT_MIN
+            };
 
             if (armed) {
               // claim lock
@@ -460,7 +485,7 @@ async function handle(req: Request) {
                           data: { cash: cashNum - shares * ref, equity: cashNum - shares * ref + shares * ref },
                         });
 
-                        debug.lastMessage = `✅ 09:34–10:14 BUY (signals armed) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
+                        debug.lastMessage = `✅ 09:34–10:14 BUY (risk-on armed) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
                       } catch (e: any) {
                         const msg = e?.message || "unknown";
                         const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
@@ -503,7 +528,8 @@ async function handle(req: Request) {
       const BURST_DELAY_MS = 300;
 
       for (let i = 0; i < BURST_TRIES && !openPos; i++) {
-        const rec = await ensureTodayRecommendationFromSnapshot(req, candidates);
+        // 🔁 keep pick fresh during the burst
+        const rec = await ensureRollingRecommendationFromSnapshot(req, candidates, 10_000);
         if (!rec?.ticker) {
           debug.reasons.push(`force_no_ai_pick_iter_${i}`);
           await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
@@ -634,6 +660,7 @@ async function handle(req: Request) {
         requireAiPick: REQUIRE_AI_PICK,
         targetPct: TARGET_PCT,
         stopPct: STOP_PCT,
+        aiFreshnessMs: FRESHNESS_MS,
       },
       debug,
     };
