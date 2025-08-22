@@ -226,7 +226,9 @@ export async function POST(req: Request) {
       const p = s.price ?? 0;
       const passPrice = p >= 1 && p <= 50;
       const passVenue = !s.isEtf && !s.isOTC;
-      return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue;
+      // NEW: Exclude tiny floats (≤ 1,999,999)
+      const passFloat = (s.sharesOutstanding ?? 0) > 1_999_999;
+      return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
     // If everything filtered out, fall back to the best few by dollar volume so the model can still pick
@@ -280,16 +282,18 @@ Use ONLY the provided data (no outside facts).
 3) Dollar Volume today ≥ $10,000,000
 4) Price between $1 and $50
 5) Exclude ETFs/ETNs and OTC
+6) **Float (sharesOutstanding) > 1,999,999**
 
 ## Primary Signals
 - Momentum/Liquidity: higher **DollarVol**, **RelVol (live/avg)**, **RelVolFloat**, healthy **Change %**.
 - Spike Potential: prefer **smaller Float (≤ 50M)**; allow larger floats only with very high DollarVol.
-- Quality: prefer positive/higher **netProfitMarginTTM**; avoid obvious shells (extremely tiny employees) unless momentum is exceptional.
+- **Operational Scale / Stability:** prefer **higher Employee counts**; penalize extremely tiny employee counts unless momentum is exceptional.
+- Quality: prefer positive/higher **netProfitMarginTTM**.
 - Catalysts: today’s positive headlines (beats, upgrade, deal, FDA, strong guidance) support the long; many negatives warn.
 
 ## Output (concise & numeric)
 - **Pick:** <TICKER>
-- **Why (bullets):** 3–5 bullets citing **DollarVol**, **RelVol (live/avg)**, **RelVolFloat**, **Float**, **MktCap**, **ProfitMarginTTM**, **Headlines sentiment** (with the actual numbers you used).
+- **Why (bullets):** 3–5 bullets citing **DollarVol**, **RelVol (live/avg)**, **RelVolFloat**, **Float**, **MktCap**, **Employees**, **ProfitMarginTTM**, **Headlines sentiment** (with the actual numbers you used).
 - **Second choice (optional):** <TICKER> + 1 bullet.
 - **Risk note:** one short line (spread, whipsaw, headline risk).
 Do not invent numbers. If fields are missing, acknowledge and use available signals.
@@ -303,7 +307,7 @@ ${lines.join("\n")}
 Recent headlines (titles only):
 ${headlinesBlock}
 
-Pick the **single best** long candidate for a <1 day hold that can plausibly move ~10% with sufficient liquidity. Cite actual numbers.
+Pick the **single best** long candidate for a <1 day hold that can plausibly move ~10% with sufficient liquidity. Cite actual numbers, including Employees when available.
 `.trim();
 
     // ---------- OpenAI call ----------
