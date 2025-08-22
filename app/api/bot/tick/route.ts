@@ -7,7 +7,16 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getQuote } from "@/lib/quote";
 import { isWeekdayET, isMarketHoursET, yyyyMmDdET, nowET } from "@/lib/market";
-import { submitBracketBuy, closePositionMarket, replaceTpSlIfBetter } from "@/lib/alpaca";
+import {
+  submitBracketBuy,
+  closePositionMarket,
+  replaceTpSlIfBetter,
+  // FREE IEX data helpers from alpaca.ts:
+  getBars1m,
+  premarketRangeISO,
+  computePremarketLevelsFromBars,
+  spreadGuardOK,
+} from "@/lib/alpaca";
 
 /** ───────────────── Throttle / Coalesce ───────────────── */
 let lastTickAt = 0;
@@ -22,47 +31,65 @@ const TARGET_PCT = 0.10;             // +10% take-profit
 const STOP_PCT   = -0.05;            // -5% stop-loss
 const TOP_CANDIDATES = 8;
 
-// Ratchet config (NEW)
-const RATCHET_ENABLED = true;                 // master switch
-const RATCHET_STEP_PCT = 0.05;                // 5% steps off entry (tunable)
-const RATCHET_LIFT_BROKER_CHILDREN = true;    // raise Alpaca TP/SL legs
-const RATCHET_VIRTUAL_EXITS = true;           // app exits at market on dynTP/dynSL
+// Ratchet config (unchanged)
+const RATCHET_ENABLED = true;
+const RATCHET_STEP_PCT = 0.05;
+const RATCHET_LIFT_BROKER_CHILDREN = true;
+const RATCHET_VIRTUAL_EXITS = true;
 
-// ⛔ Alpaca safety: cooldown TP/SL lifts (per symbol)
-const LIFT_COOLDOWN_MS = 6000; // ~1 call per 6s per symbol (well under free-tier limits)
+// Alpaca TP/SL lift cooldown
+const LIFT_COOLDOWN_MS = 6000;
 const ratchetLiftMemo: Record<string, { lastStep: number; lastLiftAt: number }> = {};
 
-// Risk tuning (slightly spicier but still healthy)
-const VOL_MULT_MIN   = 1.00;         // was ~1.1; allow earlier momentum
-const NEAR_OR_PCT    = 0.003;        // within 0.3% of OR high = okay
-const VWAP_RECLAIM_BAND = 0.002;     // low must hold within 0.2% below VWAP
+// ── Balanced profile (time-decayed thresholds across 9:30–10:14) ──
+const DECAY_START_MIN = 0;    // at 9:30 (inclusive)
+const DECAY_END_MIN   = 44;   // at 10:14 (inclusive)
 
-// AI pick freshness (keeps scanning/updating pick)
-const FRESHNESS_MS = 30_000;         // re-ask AI at least every 30s during windows
+// Volume pulse: 1.20x → 1.10x
+const VOL_MULT_START = 1.20;
+const VOL_MULT_END   = 1.10;
 
-// Must the AI pick? (true = no fallback)
+// Near-OR tolerance: 0.30% → 0.45%
+const NEAR_OR_START  = 0.003;
+const NEAR_OR_END    = 0.0045;
+
+// VWAP reclaim band: 0.20% → 0.30%
+const VWAP_BAND_START = 0.002;
+const VWAP_BAND_END   = 0.003;
+
+// Execution guards (fixed)
+const SPREAD_MAX_PCT = 0.005;  // 0.50%
+const MIN_1M_VOL     = 30_000; // last bar
+const PRICE_MIN = 1;
+const PRICE_MAX = 70;
+
+// AI pick freshness
+const FRESHNESS_MS = 30_000;
+
+// Require AI pick (true = don't fallback to top-1, except in FORCE window)
 const REQUIRE_AI_PICK = true;
 
 /** ───────────────── Time Windows (ET) ─────────────────
- * Scan   : 09:34:00–10:14:59 (require setups)
- * Force  : 10:15:00–10:16:59 (buy AI pick, ignore setups)
- * Prewarm: 09:33:30–09:33:59 and 10:14:30–10:14:59
- * Exit   : 15:55+
+ * Pre-scan: 09:14:00–09:29:59 (premarket levels from Alpaca)
+ * Scan    : 09:30:00–10:14:59 (setup must arm to buy)
+ * Force   : 10:15:00–10:16:59 (buy AI pick regardless of setup, with guards)
+ * Exit    : 15:55+
  */
+function inPreScanWindow() {
+  const d = nowET();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  const s = d.getSeconds();
+  return mins >= 9 * 60 + 14 && mins <= 9 * 60 + 29 && s <= 59;
+}
 function inScanWindow() {
   const d = nowET();
   const m = d.getHours() * 60 + d.getMinutes();
   const s = d.getSeconds();
-  return m >= 9 * 60 + 34 && m <= 10 * 60 + 14 && s <= 59;
+  return m >= 9 * 60 + 30 && m <= 10 * 60 + 14 && s <= 59;
 }
 function inForceWindow() {
   const d = nowET();
   return d.getHours() === 10 && (d.getMinutes() === 15 || d.getMinutes() === 16);
-}
-function inPrewarmWindow() {
-  const d = nowET();
-  const h = d.getHours(), mi = d.getMinutes(), s = d.getSeconds();
-  return (h === 9 && mi === 33 && s >= 30) || (h === 10 && mi === 14 && s >= 30);
 }
 function inEndOfForceFailsafe() {
   const d = nowET();
@@ -71,7 +98,7 @@ function inEndOfForceFailsafe() {
 function isMandatoryExitET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
-  return mins >= (15 * 60 + 55); // 15:55+
+  return mins >= (15 * 60 + 55);
 }
 
 /** ───────────────── Types & Helpers ───────────────── */
@@ -93,7 +120,7 @@ function getBaseUrl(req: Request) {
   return `${proto}://${host}`;
 }
 
-// Last-good (same-day) snapshot cache to survive empty/late snapshots
+// Last-good (same-day) snapshot cache
 let lastGoodSnapshot: { stocks: SnapStock[]; updatedAt: string } | null = null;
 let lastGoodSnapshotDay: string | null = null;
 
@@ -159,7 +186,7 @@ function parseAIPick(rJson: any): string | null {
   return sym || null;
 }
 
-/** ───────────────── Intraday 1-min data helpers ───────────────── */
+/** Intraday 1-min data helpers (FMP session candles) */
 function toET(dateIso: string) {
   return new Date(new Date(dateIso).toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
@@ -184,11 +211,12 @@ async function fetchCandles1m(symbol: string, limit = 240): Promise<Candle[]> {
   }));
 }
 
-/** ───────────────── Intraday signals ───────────────── */
+/** Signals */
 function computeOpeningRange(candles: Candle[], todayYMD: string) {
+  // Balanced: tighter OR window 9:30–9:33
   const window = candles.filter((c) => {
     const d = toET(c.date);
-    return isSameETDay(d, todayYMD) && d.getHours() === 9 && d.getMinutes() >= 30 && d.getMinutes() <= 34;
+    return isSameETDay(d, todayYMD) && d.getHours() === 9 && d.getMinutes() >= 30 && d.getMinutes() <= 33;
   });
   if (!window.length) return null;
   const high = Math.max(...window.map((c) => c.high));
@@ -234,30 +262,19 @@ function brokeRecentHighs(candles: Candle[], todayYMD: string, n = 3) {
   return last.close > priorMax;
 }
 
-/** ───────────────── Ratcheting targets (configurable steps off entry) ─────────────────
- * Steps = number of +(RATCHET_STEP_PCT) “high-water” increments from entry.
- * initialSL = entry * (1 + STOP_PCT)
- * initialTP = entry * (1 + TARGET_PCT)
- * Ratchet factor = ((1 + RATCHET_STEP_PCT) ** steps) applied to BOTH.
- */
+/** Ratcheting targets */
 function computeRatchetTargets(entry: number, dayHighSinceOpen: number) {
   if (!RATCHET_ENABLED) return null;
-  if (!Number.isFinite(entry) || !Number.isFinite(dayHighSinceOpen) || entry <= 0) {
-    return null;
-  }
+  if (!Number.isFinite(entry) || !Number.isFinite(dayHighSinceOpen) || entry <= 0) return null;
   const upFromEntry = dayHighSinceOpen / entry - 1;
-  const step = Math.max(0.0001, RATCHET_STEP_PCT); // guard
+  const step = Math.max(0.0001, RATCHET_STEP_PCT);
   const steps = Math.max(0, Math.floor(upFromEntry / step));
   const factor = Math.pow(1 + step, steps);
-
   const initialSL = entry * (1 + STOP_PCT);
   const initialTP = entry * (1 + TARGET_PCT);
-
   const dynSL = initialSL * factor;
   const dynTP = initialTP * factor;
-
   const round2 = (n: number) => Math.round(n * 100) / 100;
-
   return {
     steps,
     dynSL: round2(dynSL),
@@ -267,7 +284,7 @@ function computeRatchetTargets(entry: number, dayHighSinceOpen: number) {
   };
 }
 
-/** Keep AI pick “rolling” during scan/force windows (updates every FRESHNESS_MS or if not in top-8) */
+/** Keep AI pick rolling */
 async function ensureRollingRecommendationFromSnapshot(
   req: Request,
   topStocks: SnapStock[],
@@ -311,6 +328,27 @@ async function ensureRollingRecommendationFromSnapshot(
   }
 
   return lastRec || null;
+}
+
+/** Premarket memo (from Alpaca) */
+type PreMemo = {
+  pmHigh: number;
+  pmLow: number;
+  pmVol: number;
+  fetchedAt: number;
+};
+const scanMemo: Record<string, PreMemo> = {};
+
+/** ── Balanced profile decay helpers ── */
+function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
+function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
+
+/** minutes since 9:30 (0..>=44) within scan window */
+function minutesSince930ET() {
+  const d = nowET();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  const t = mins - (9 * 60 + 30);
+  return Math.max(0, Math.min(44, t)); // cap at 44 (10:14)
 }
 
 /** ───────────────── Route handlers ───────────────── */
@@ -390,28 +428,42 @@ async function handle(req: Request) {
     }
     const marketOpen = isMarketHoursET();
 
-    /** ───────────────── Pre-warm AI pick ───────────────── */
-    if (!openPos && marketOpen && inPrewarmWindow()) {
+    /** ───────────────── Pre-SCAN 09:14–09:29 (premarket levels from Alpaca) ───────────────── */
+    if (!openPos && marketOpen && inPreScanWindow()) {
       const base = getBaseUrl(req);
       const snapshot = await getSnapshot(base);
       const top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
-
       const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
       const candidates = affordableTop.length ? affordableTop : top;
 
-      debug.prewarm_top = candidates.map((s) => s.ticker);
-      debug.prewarm_affordable_count = affordableTop.length;
+      debug.presc_top = candidates.map((s) => s.ticker);
 
       try {
         const rec = await ensureRollingRecommendationFromSnapshot(req, candidates);
-        if (rec?.ticker) debug.prewarm_pick = rec.ticker;
-        else debug.reasons.push("prewarm_no_pick_yet");
+        if (rec?.ticker) {
+          lastRec = rec;
+          const { startISO, endISO } = premarketRangeISO(nowET());
+          try {
+            const bars = await getBars1m(rec.ticker, startISO, endISO);
+            const pm = computePremarketLevelsFromBars(bars);
+            if (pm) {
+              scanMemo[rec.ticker] = { pmHigh: pm.pmHigh, pmLow: pm.pmLow, pmVol: pm.pmVol, fetchedAt: Date.now() };
+              debug.presc_pm = { ticker: rec.ticker, ...pm };
+            } else {
+              debug.reasons.push("presc_no_pm_bars");
+            }
+          } catch (e: any) {
+            debug.reasons.push(`presc_alpaca_data_error:${e?.message || "unknown"}`);
+          }
+        } else {
+          debug.reasons.push("presc_no_ai_pick_yet");
+        }
       } catch (e: any) {
-        debug.reasons.push(`prewarm_exception:${e?.message || "unknown"}`);
+        debug.reasons.push(`presc_exception:${e?.message || "unknown"}`);
       }
     }
 
-    /** ───────────────── 09:34–10:14 Scan Window (signals required) ───────────────── */
+    /** ───────────────── 09:30–10:14 Scan Window (Balanced profile) ───────────────── */
     if (!openPos && marketOpen && inScanWindow() && state.lastRunDay !== today) {
       const base = getBaseUrl(req);
       let snapshot = await getSnapshot(base);
@@ -439,29 +491,74 @@ async function handle(req: Request) {
           if (!day.length) {
             debug.reasons.push("scan_no_day_candles");
           } else {
+            const last = day[day.length - 1];
+
+            // Execution guards (fixed)
+            if (last.close < PRICE_MIN || last.close > PRICE_MAX) {
+              debug.reasons.push(`scan_price_band_fail_${last.close.toFixed(2)}`);
+              throw new Error("price_band_fail");
+            }
+            if ((last.volume ?? 0) < MIN_1M_VOL) {
+              debug.reasons.push(`scan_min_1m_vol_fail_${last.volume ?? 0}`);
+              throw new Error("min_vol_fail");
+            }
+
+            // Spread guard (FREE Alpaca IEX quote)
+            const spreadOK = await spreadGuardOK(rec.ticker, SPREAD_MAX_PCT);
+            debug.scan_spread_ok = spreadOK;
+            if (!spreadOK) {
+              debug.reasons.push("scan_spread_guard_fail");
+              throw new Error("spread_guard_fail");
+            }
+
+            // Time-decayed thresholds
+            const m = minutesSince930ET(); // 0..44
+            const t = clamp01((m - DECAY_START_MIN) / (DECAY_END_MIN - DECAY_START_MIN));
+            const VOL_MULT_MIN = lerp(VOL_MULT_START, VOL_MULT_END, t);
+            const NEAR_OR_PCT  = lerp(NEAR_OR_START,  NEAR_OR_END,  t);
+            const VWAP_RECLAIM_BAND = lerp(VWAP_BAND_START, VWAP_BAND_END, t);
+
             const orRange = computeOpeningRange(candles, today);
             const vwap    = computeSessionVWAP(candles, today);
             const vol     = computeVolumePulse(candles, today, 5);
-            const last    = day[day.length - 1];
             const dayHigh = computeDayHighSoFar(candles, today);
 
             const aboveVWAP = vwap != null && last ? last.close >= vwap : false;
-            const brokeOR   = !!(orRange && last && last.close > orRange.high);
+            const breakORH  = !!(orRange && last && last.close > orRange.high);
             const nearOR    = !!(orRange && last && last.close >= orRange.high * (1 - NEAR_OR_PCT));
             const vwapRecl  = !!(vwap != null && last && last.close >= vwap && last.low >= vwap * (1 - VWAP_RECLAIM_BAND));
-            const brokeDay  = (typeof dayHigh === "number" && last) ? last.close > dayHigh : brokeOR;
-            const broke3    = brokeRecentHighs(candles, today, 3);
             const volOK     = (vol?.mult ?? 0) >= VOL_MULT_MIN;
 
-            const trendOK   = brokeOR || nearOR || brokeDay || broke3 || vwapRecl;
-            const armed     = aboveVWAP && volOK && trendOK;
+            // Any-2-of-4 rule (plus aboveVWAP hard requirement)
+            const signals: Record<string, boolean> = {
+              volPulseOK: volOK,
+              breakORH: breakORH,
+              nearOR: nearOR,
+              vwapReclaim: vwapRecl,
+            };
+            const signalCount = Object.values(signals).filter(Boolean).length;
+            const armed = !!(aboveVWAP && signalCount >= 2);
 
+            // Optional extra info for UI
+            const memo = scanMemo[rec.ticker];
+            if (memo) {
+              debug.scan_pm_ctx = { pmHigh: memo.pmHigh, pmLow: memo.pmLow, pmVol: memo.pmVol };
+            }
             debug.scan_signals = {
-              aboveVWAP, brokeOR, nearOR, vwapRecl, brokeDay, broke3,
-              volMult: vol?.mult ?? null, volMin: VOL_MULT_MIN
+              aboveVWAP,
+              volPulse: vol?.mult ?? null,
+              VOL_MULT_MIN,
+              breakORH,
+              nearOR,
+              NEAR_OR_PCT,
+              vwapRecl,
+              VWAP_RECLAIM_BAND,
+              signalCount,
+              mSince930: m
             };
 
             if (armed) {
+              // Claim day lock right before placing the order
               const claim = await prisma.botState.updateMany({
                 where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
                 data: { lastRunDay: today },
@@ -470,10 +567,12 @@ async function handle(req: Request) {
               if (!claimed) {
                 debug.reasons.push("scan_day_lock_already_claimed");
               } else {
+                // Re-check no position
                 openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
                 if (openPos) {
                   debug.reasons.push("scan_pos_open_after_claim");
                 } else {
+                  // Reference price
                   let ref: number | null =
                     Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
                   if (!Number.isFinite(Number(ref))) ref = Number(rec!.price);
@@ -519,7 +618,7 @@ async function handle(req: Request) {
                           data: { cash: cashNum - shares * ref, equity: cashNum - shares * ref + shares * ref },
                         });
 
-                        debug.lastMessage = `✅ 09:34–10:14 BUY (risk-on armed) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
+                        debug.lastMessage = `✅ BUY (Balanced setup) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
                       } catch (e: any) {
                         const msg = e?.message || "unknown";
                         const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
@@ -535,12 +634,16 @@ async function handle(req: Request) {
             }
           }
         } catch (e: any) {
-          debug.reasons.push(`scan_signal_exception:${e?.message || "unknown"}`);
+          if (!String(e?.message || "").includes("price_band_fail") &&
+              !String(e?.message || "").includes("min_vol_fail") &&
+              !String(e?.message || "").includes("spread_guard_fail")) {
+            debug.reasons.push(`scan_signal_exception:${e?.message || "unknown"}`);
+          }
         }
       }
     }
 
-    /** ───────────────── 10:15–10:16 Force Window (signals ignored) ───────────────── */
+    /** ───────────────── 10:15–10:16 Force Window (signals ignored, guards enforced) ───────────────── */
     if (!openPos && marketOpen && inForceWindow() && state.lastRunDay !== today) {
       const base = getBaseUrl(req);
       let snapshot = await getSnapshot(base);
@@ -570,6 +673,34 @@ async function handle(req: Request) {
 
         lastRec = rec;
 
+        // Spread + price band guards even for force-buy
+        const spreadOK = await spreadGuardOK(rec.ticker, SPREAD_MAX_PCT);
+        debug[`force_iter_${i}_spread_ok`] = spreadOK;
+        if (!spreadOK) {
+          debug.reasons.push(`force_spread_guard_fail_iter_${i}`);
+          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          continue;
+        }
+
+        // Resolve a reference price for band check & sizing
+        let ref: number | null =
+          Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
+        if (!Number.isFinite(Number(ref))) ref = Number(rec!.price);
+        if (!Number.isFinite(Number(ref))) {
+          const q = await getQuote(rec!.ticker);
+          if (q != null && Number.isFinite(Number(q))) ref = Number(q);
+        }
+        if (ref == null || !Number.isFinite(Number(ref))) {
+          debug.reasons.push(`force_no_price_for_entry_iter_${i}`);
+          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          continue;
+        }
+        if (ref < PRICE_MIN || ref > PRICE_MAX) {
+          debug.reasons.push(`force_price_band_fail_${ref.toFixed(2)}_iter_${i}`);
+          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          continue;
+        }
+
         const claim = await prisma.botState.updateMany({
           where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
           data: { lastRunDay: today },
@@ -586,24 +717,10 @@ async function handle(req: Request) {
         openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
         if (openPos) break;
 
-        let ref: number | null =
-          Number(snapshot?.stocks?.find((s) => s.ticker === rec!.ticker)?.price ?? NaN);
-        if (!Number.isFinite(Number(ref))) ref = Number(rec!.price);
-        if (!Number.isFinite(Number(ref))) {
-          const q = await getQuote(rec!.ticker);
-          if (q != null && Number.isFinite(Number(q))) ref = Number(q);
-        }
-        if (ref == null || !Number.isFinite(Number(ref))) {
-          debug.reasons.push(`force_no_price_for_entry_iter_${i}`);
-          await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
-          continue;
-        }
-
         const cashNum = Number(state.cash);
         const shares = Math.floor(Math.min(cashNum, INVEST_BUDGET) / ref);
         if (shares <= 0) {
-          debug.reasons.push(`force_insufficient_cash_for_one_share_ref_${ref.toFixed(2)}`);
+          debug.reasons.push(`force_insufficient_cash_for_one_share_ref_${ref.toFixed(2)}_iter_${i}`);
           await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
           await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
           continue;
@@ -636,7 +753,7 @@ async function handle(req: Request) {
             data: { cash: cashNum - shares * ref, equity: cashNum - shares * ref + shares * ref },
           });
 
-          debug.lastMessage = `✅ 10:15 FORCE BUY (market bracket) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
+          debug.lastMessage = `✅ 10:15 FORCE BUY (guards ok) ${rec!.ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
           break;
         } catch (e: any) {
           const msg = e?.message || "unknown";
@@ -687,7 +804,6 @@ async function handle(req: Request) {
                 dynTP: rat.dynTP
               };
 
-              // ── Rate-limit guard: only lift when step increases & cooldown passed
               if (RATCHET_LIFT_BROKER_CHILDREN) {
                 const key = openPos.ticker;
                 const memo = ratchetLiftMemo[key] || { lastStep: -1, lastLiftAt: 0 };
@@ -697,15 +813,14 @@ async function handle(req: Request) {
                   try {
                     const replaced = await replaceTpSlIfBetter({
                       symbol: key,
-                      newTp: rat.dynTP, // raise-only
-                      newSl: rat.dynSL, // raise-only
+                      newTp: rat.dynTP,
+                      newSl: rat.dynSL,
                     });
                     ratchetLiftMemo[key] = { lastStep: rat.steps, lastLiftAt: nowTs };
 
-                    // concise, human-friendly info for your UI
                     debug.ratchet_replace = {
                       step: rat.steps,
-                      message: replaced.message,  // e.g. "TP 5.50→5.78 (raised) | SL 4.75→4.99 (raised)"
+                      message: replaced.message,
                       triedTp: replaced.triedTp,
                       triedSl: replaced.triedSl,
                       prevTp: replaced.prevTp,
@@ -726,7 +841,7 @@ async function handle(req: Request) {
               }
 
               if (RATCHET_VIRTUAL_EXITS) {
-                // 1) VIRTUAL RATCHETED TAKE-PROFIT
+                // Virtual TP
                 if (p >= rat.dynTP) {
                   const exitTicker = openPos.ticker;
                   try {
@@ -755,7 +870,7 @@ async function handle(req: Request) {
                     debug.reasons.push(`ratchet_tp_close_exception:${e?.message || "unknown"}`);
                   }
                 }
-                // 2) RATCHETED STOP
+                // Virtual SL
                 else if (p <= rat.dynSL) {
                   const exitTicker = openPos.ticker;
                   try {
@@ -785,8 +900,6 @@ async function handle(req: Request) {
                   }
                 }
               }
-
-              // We never lower child orders; only raise.
             }
           }
         } catch (e: any) {
@@ -805,9 +918,9 @@ async function handle(req: Request) {
       live: { ticker: openPos?.ticker ?? lastRec?.ticker ?? null, price: livePrice },
       serverTimeET: nowET().toISOString(),
       info: {
-        scan_0934_1014: inScanWindow(),
+        prescan_0914_0929: inPreScanWindow(),
+        scan_0930_1014: inScanWindow(),
         force_1015_1016: inForceWindow(),
-        prewarm: inPrewarmWindow(),
         requireAiPick: REQUIRE_AI_PICK,
         targetPct: TARGET_PCT,
         stopPct: STOP_PCT,

@@ -1,22 +1,41 @@
 // app/lib/alpaca.ts
 
-// ---- Base & Keys (robust) ----
+// ─────────────────────────────────────────────────────────────
+//  Alpaca Trading (paper) + Data API (IEX/free) client
+//  - Trading base: https://paper-api.alpaca.markets  (free paper trading)
+//  - Data base   : https://data.alpaca.markets/v2    (free IEX feed)
+//  Environment vars supported:
+//    ALPACA_BASE_URL                (default paper base)
+//    ALPACA_API_KEY_ID | ALPACA_API_KEY | NEXT_PUBLIC_ALPACA_API_KEY_ID
+//    ALPACA_API_SECRET_KEY | ALPACA_SECRET_KEY | NEXT_PUBLIC_ALPACA_API_SECRET_KEY
+//    ALPACA_DATA_URL                (default https://data.alpaca.markets/v2)
+//    ALPACA_DATA_FEED               ("iex" for free; set to "sip" only if paid)
+// ─────────────────────────────────────────────────────────────
+
+// ---- Trading Base & Keys (robust) ----
 const RAW_BASE =
   (process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets").trim();
 // remove trailing slashes and a trailing "/v2" if present
 const BASE = RAW_BASE.replace(/\/+$/, "").replace(/\/v2$/, "");
+
 const KEY =
   process.env.ALPACA_API_KEY_ID ||
   process.env.ALPACA_API_KEY ||
   process.env.NEXT_PUBLIC_ALPACA_API_KEY_ID ||
   "";
+
 const SEC =
   process.env.ALPACA_API_SECRET_KEY ||
   process.env.ALPACA_SECRET_KEY ||
   process.env.NEXT_PUBLIC_ALPACA_API_SECRET_KEY ||
   "";
 
-// ---- helpers ----
+// ---- Data API (FREE on IEX feed) ----
+const DATA_BASE = (process.env.ALPACA_DATA_URL || "https://data.alpaca.markets/v2").trim();
+/** Use "iex" for the free plan. If you later pay for SIP, set ALPACA_DATA_FEED="sip". */
+const DATA_FEED = (process.env.ALPACA_DATA_FEED || "iex").toLowerCase();
+
+// ---- shared headers helper ----
 function headers() {
   return {
     "APCA-API-KEY-ID": KEY,
@@ -25,6 +44,7 @@ function headers() {
   };
 }
 
+// ---- Trading fetch ----
 async function alpacaFetch(path: string, opts: RequestInit = {}) {
   const url = `${BASE}${path.startsWith("/") ? "" : "/"}${path}`;
   const res = await fetch(url, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
@@ -35,6 +55,24 @@ async function alpacaFetch(path: string, opts: RequestInit = {}) {
   if (!res.ok) {
     const msg = json?.message || json?.error || text || `HTTP ${res.status}`;
     const err = new Error(`Alpaca error: ${msg}`);
+    (err as any).status = res.status;
+    (err as any).body = json ?? text;
+    throw err;
+  }
+  return json;
+}
+
+// ---- Data fetch (free IEX) ----
+async function alpacaDataFetch(path: string, params: Record<string, string> = {}) {
+  const url = new URL(`${DATA_BASE}${path.startsWith("/") ? "" : "/"}${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), { headers: headers(), cache: "no-store" });
+  const text = await res.text();
+  let json: any = null;
+  try { json = text ? JSON.parse(text) : null; } catch {}
+  if (!res.ok) {
+    const msg = json?.message || json?.error || text || `HTTP ${res.status}`;
+    const err = new Error(`Alpaca DATA error: ${msg}`);
     (err as any).status = res.status;
     (err as any).body = json ?? text;
     throw err;
@@ -77,7 +115,10 @@ export type AlpacaOrder = {
   filled_at?: string;
 };
 
-// ---- Orders ----
+// ─────────────────────────────────────────────────────────────
+// Trading: Orders / Positions
+// ─────────────────────────────────────────────────────────────
+
 // entryType: "market" (recommended) or "limit" (provide limit)
 export async function submitBracketBuy(params: {
   symbol: string;
@@ -302,4 +343,85 @@ export async function replaceTpSlIfBetter({ symbol, newTp, newSl }: ReplaceIfBet
   const message = parts.join(" | ") || "no changes";
 
   return { raisedTp, raisedSl, triedTp, triedSl, prevTp, prevSl, message };
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FREE Market Data helpers (IEX feed)
+// ─────────────────────────────────────────────────────────────
+
+export type ABar = { t: string; o: number; h: number; l: number; c: number; v: number };
+
+/** 1-min bars between start/end ISO (works for premarket if you pass 04:00–09:29:59 ET). */
+export async function getBars1m(
+  symbol: string,
+  startISO: string,
+  endISO: string,
+  limit = 10000
+): Promise<ABar[]> {
+  const j = await alpacaDataFetch(`/stocks/${encodeURIComponent(symbol)}/bars`, {
+    timeframe: "1Min",
+    start: startISO,
+    end: endISO,
+    limit: String(limit),
+    feed: DATA_FEED,        // "iex" = free
+    adjustment: "raw",
+  });
+  return Array.isArray(j?.bars) ? j.bars : [];
+}
+
+/** Latest quote for spread guard. */
+export async function getLatestQuote(symbol: string): Promise<{
+  bid: number; ask: number; bidSize: number; askSize: number; ts: string;
+} | null> {
+  const j = await alpacaDataFetch(`/stocks/${encodeURIComponent(symbol)}/quotes/latest`, {
+    feed: DATA_FEED,        // "iex" = free
+  });
+  const q = j?.quote;
+  if (!q) return null;
+  return {
+    bid: Number(q.bp),
+    ask: Number(q.ap),
+    bidSize: Number(q.bs ?? 0),
+    askSize: Number(q.as ?? 0),
+    ts: q.t,
+  };
+}
+
+/** Simple spread guard using the latest quote. */
+export async function spreadGuardOK(symbol: string, maxSpreadPct = 0.005) {
+  const q = await getLatestQuote(symbol);
+  if (!q || !q.bid || !q.ask || q.ask <= q.bid) return false;
+  const mid = (q.bid + q.ask) / 2;
+  const spreadPct = (q.ask - q.bid) / mid;
+  return spreadPct <= maxSpreadPct;
+}
+
+/** Premarket window (ET) → ISO strings for Data API. */
+export function premarketRangeISO(etNow: Date) {
+  // build exact ET timestamps for today 04:00:00 → 09:29:59
+  const y = etNow.getFullYear();
+  const m = etNow.getMonth();
+  const d = etNow.getDate();
+  const toET = (h: number, mi: number, s: number) =>
+    new Date(
+      new Date(
+        `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}T${String(h).padStart(2, "0")}:${String(mi).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+      ).toLocaleString("en-US", { timeZone: "America/New_York" })
+    );
+  const start = toET(4, 0, 0);
+  const end = toET(9, 29, 59);
+  return { startISO: start.toISOString(), endISO: end.toISOString() };
+}
+
+/** Compute premarket high/low/volume from bars. */
+export function computePremarketLevelsFromBars(bars: ABar[]) {
+  if (!bars?.length) return null;
+  let pmHigh = -Infinity, pmLow = Infinity, pmVol = 0;
+  for (const b of bars) {
+    if (b.h > pmHigh) pmHigh = b.h;
+    if (b.l < pmLow) pmLow = b.l;
+    pmVol += Number(b.v || 0);
+  }
+  if (!Number.isFinite(pmHigh) || !Number.isFinite(pmLow)) return null;
+  return { pmHigh, pmLow, pmVol };
 }
