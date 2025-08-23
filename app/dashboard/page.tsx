@@ -171,18 +171,50 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
+  // ---- UPDATED: ask AI for Top 1 & Top 2 picks (new API shape) ----
   const askAIRecommendation = async () => {
     try {
       setAnalyzing(true);
       setRecommendation(null);
+
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks: stocks.slice(0, 20) }),
+        body: JSON.stringify({ stocks: stocks.slice(0, 20), topN: 2 }),
       });
+
       const data = await res.json();
-      if (data.errorMessage) setRecommendation(`Error: ${data.errorMessage}`);
-      else setRecommendation(data.recommendation || "No recommendation.");
+
+      if (!res.ok || data?.errorMessage) {
+        setRecommendation(`Error: ${data?.errorMessage || res.statusText}`);
+        return;
+      }
+
+      // New API: { picks: ["TOP1","TOP2?"], reasons: {TICK:[...]}, risk: "..." }
+      const picks: string[] = Array.isArray(data?.picks) ? data.picks : [];
+      const reasons: Record<string, string[]> = data?.reasons || {};
+      const risk: string = data?.risk || "";
+
+      const lines: string[] = [];
+      if (picks[0]) {
+        lines.push(`Top 1: ${picks[0]}`);
+        if (Array.isArray(reasons[picks[0]]) && reasons[picks[0]].length) {
+          lines.push(`  • ${reasons[picks[0]].join("\n  • ")}`);
+        }
+      }
+      if (picks[1]) {
+        lines.push("");
+        lines.push(`Top 2: ${picks[1]}`);
+        if (Array.isArray(reasons[picks[1]]) && reasons[picks[1]].length) {
+          lines.push(`  • ${reasons[picks[1]].join("\n  • ")}`);
+        }
+      }
+      if (risk) {
+        lines.push("");
+        lines.push(`Risk: ${risk}`);
+      }
+
+      setRecommendation(lines.join("\n") || "No recommendation.");
     } catch {
       setRecommendation("Failed to analyze stocks. Check server logs.");
     } finally {
@@ -395,7 +427,7 @@ export default function Home() {
               onClick={askAIRecommendation}
               disabled={analyzing || stocks.length === 0}
               className="mt-3 px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
-              title={stocks.length === 0 ? "No stocks loaded yet" : "Send current 7 to AI"}
+              title={stocks.length === 0 ? "No stocks loaded yet" : "Send current list to AI (returns Top 1 & Top 2)"}
             >
               {analyzing ? "Analyzing..." : "Ask AI"}
             </Button>
@@ -436,6 +468,7 @@ export default function Home() {
                   onClick={askAIRecommendation}
                   disabled={analyzing || stocks.length === 0}
                   className="px-3 py-1 bg-gray-900 text-white hover:bg-gray-800 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={stocks.length === 0 ? "No stocks loaded yet" : "Send current list to AI (returns Top 1 & Top 2)"}
                 >
                   {analyzing ? "Analyzing..." : "Ask AI"}
                 </Button>
