@@ -41,9 +41,9 @@ const RATCHET_VIRTUAL_EXITS = true;
 const LIFT_COOLDOWN_MS = 6000;
 const ratchetLiftMemo: Record<string, { lastStep: number; lastLiftAt: number }> = {};
 
-// ── Balanced profile (time-decayed thresholds across 9:30–10:14) ──
+// ── Balanced profile (time-decayed thresholds across 9:30–9:44) ──
 const DECAY_START_MIN = 0;    // at 9:30 (inclusive)
-const DECAY_END_MIN   = 44;   // at 10:14 (inclusive)
+const DECAY_END_MIN   = 14;   // at 9:44 (inclusive)
 
 // Volume pulse: 1.20x → 1.10x
 const VOL_MULT_START = 1.20;
@@ -71,8 +71,8 @@ const REQUIRE_AI_PICK = true;
 
 /** ───────────────── Time Windows (ET) ─────────────────
  * Pre-scan: 09:14:00–09:29:59 (premarket levels from Alpaca)
- * Scan    : 09:30:00–10:14:59 (setup must arm to buy)
- * Force   : 10:15:00–10:16:59 (buy AI pick regardless of setup, with guards)
+ * Scan    : 09:30:00–09:44:59 (setup must arm to buy)
+ * Force   : 09:45:00–09:46:59 (buy AI pick regardless of setup, with guards)
  * Exit    : 15:55+
  */
 function inPreScanWindow() {
@@ -85,15 +85,15 @@ function inScanWindow() {
   const d = nowET();
   const m = d.getHours() * 60 + d.getMinutes();
   const s = d.getSeconds();
-  return m >= 9 * 60 + 30 && m <= 10 * 60 + 14 && s <= 59;
+  return m >= 9 * 60 + 30 && m <= 9 * 60 + 44 && s <= 59;
 }
 function inForceWindow() {
   const d = nowET();
-  return d.getHours() === 10 && (d.getMinutes() === 15 || d.getMinutes() === 16);
+  return d.getHours() === 9 && (d.getMinutes() === 45 || d.getMinutes() === 46);
 }
 function inEndOfForceFailsafe() {
   const d = nowET();
-  return d.getHours() === 10 && d.getMinutes() === 16 && d.getSeconds() >= 30;
+  return d.getHours() === 9 && d.getMinutes() === 46 && d.getSeconds() >= 30;
 }
 function isMandatoryExitET() {
   const d = nowET();
@@ -407,7 +407,8 @@ function minutesSince930ET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
   const t = mins - (9 * 60 + 30);
-  return Math.max(0, Math.min(44, t));
+  // Use DECAY_END_MIN (now 14 for 9:44)
+  return Math.max(0, Math.min(DECAY_END_MIN, t));
 }
 
 /** ───────────────── Route handlers ───────────────── */
@@ -673,7 +674,7 @@ async function handle(req: Request) {
       }
     };
 
-    /** ───────────────── 09:30–10:14 Scan Window (Balanced profile) ───────────────── */
+    /** ───────────────── 09:30–09:44 Scan Window (Balanced profile) ───────────────── */
     if (!openPos && marketOpen && inScanWindow() && state!.lastRunDay !== today) {
       const base = getBaseUrl(req);
       let snapshot = await getSnapshot(base);
@@ -764,7 +765,7 @@ async function handle(req: Request) {
           tif: "day",
         });
 
-        const pos = await prisma.position.create({
+        await prisma.position.create({
           data: { ticker, entryPrice: ref, shares, open: true, brokerOrderId: order.id },
         });
 
@@ -777,7 +778,7 @@ async function handle(req: Request) {
           data: { cash: cashNum - shares * ref, equity: cashNum - shares * ref + shares * ref },
         });
 
-        debug.lastMessage = `✅ 10:15 FORCE BUY (guards ok) ${ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
+        debug.lastMessage = `✅ 09:45 FORCE BUY (guards ok) ${ticker} @ ~${ref.toFixed(2)} (shares=${shares})`;
         return true; // <<< STOP after first force entry
       } catch (e: any) {
         const msg = e?.message || "unknown";
@@ -788,7 +789,7 @@ async function handle(req: Request) {
       }
     };
 
-    /** ───────────────── 10:15–10:16 Force Window ───────────────── */
+    /** ───────────────── 09:45–09:46 Force Window ───────────────── */
     if (!openPos && marketOpen && inForceWindow() && state!.lastRunDay !== today) {
       const base = getBaseUrl(req);
       let snapshot = await getSnapshot(base);
@@ -805,7 +806,7 @@ async function handle(req: Request) {
       debug.force_top = candidates.map((s) => s.ticker);
       debug.force_affordable_count = affordableTop.length;
 
-      // burst loop unchanged, but we’ll try BOTH picks per iteration and stop after the first that enters
+      // burst loop: try quickly within the 2-min window; up to 12 attempts x 300ms
       const BURST_TRIES = 12;
       const BURST_DELAY_MS = 300;
 
@@ -978,8 +979,8 @@ async function handle(req: Request) {
       serverTimeET: nowET().toISOString(),
       info: {
         prescan_0914_0929: inPreScanWindow(),
-        scan_0930_1014: inScanWindow(),
-        force_1015_1016: inForceWindow(),
+        scan_0930_0944: inScanWindow(),
+        force_0945_0946: inForceWindow(),
         requireAiPick: REQUIRE_AI_PICK,
         targetPct: TARGET_PCT,
         stopPct: STOP_PCT,
