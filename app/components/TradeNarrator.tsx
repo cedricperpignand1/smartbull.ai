@@ -1,3 +1,4 @@
+// components/TradeNarrator.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -17,15 +18,30 @@ type Props = {
   className?: string;
 };
 
+type Status = "idle" | "loading" | "ready" | "speaking" | "paused";
+
 export default function TradeNarrator({ input, autoRunKey, className }: Props) {
   const [text, setText] = useState("");
-  const [status, setStatus] = useState<"idle" | "loading" | "ready" | "speaking" | "paused">(
-    "idle"
-  );
+  const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
+
+  // Auto think-aloud between 09:30–09:45 ET
+  const [autoActive, setAutoActive] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const speakUtterance = useRef<SpeechSynthesisUtterance | null>(null);
+
+  // ET helpers
+  function nowET() {
+    return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  }
+  function in0930to0945() {
+    const d = nowET(); const m = d.getHours() * 60 + d.getMinutes();
+    return m >= 9 * 60 + 30 && m < 9 * 60 + 45; // [09:30, 09:45)
+  }
+  function nextDelayMs() {
+    return 25_000 + Math.floor(Math.random() * 15_000); // ~25–40s cadence
+  }
 
   // Cleanup on unmount
   useEffect(() => {
@@ -34,12 +50,46 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
     };
   }, []);
 
-  // Auto-run when key changes
+  // Auto-run when key changes (your original behavior)
   useEffect(() => {
     if (autoRunKey == null) return;
-    generate(true); // true => also speak
+    generate(true); // also speak
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoRunKey]);
+
+  // Auto narration loop (fires every ~25–40s during the 09:30–09:45 window)
+  useEffect(() => {
+    if (!autoActive) return;
+
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const loop = async () => {
+      if (!in0930to0945()) {
+        setAutoActive(false);
+        return;
+      }
+      await generate(true);
+      if (!cancelled) timer = window.setTimeout(loop, nextDelayMs());
+    };
+
+    // Start immediately if already in window, else arm for 09:30
+    if (in0930to0945()) {
+      loop();
+    } else {
+      const d = nowET();
+      const t = new Date(d);
+      t.setHours(9, 30, 0, 0);
+      const ms = Math.max(0, t.getTime() - d.getTime());
+      timer = window.setTimeout(loop, ms);
+    }
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoActive]);
 
   async function generate(andSpeak = false) {
     setError(null);
@@ -50,7 +100,7 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
       const res = await fetch("/api/trade-narrate/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
+        body: JSON.stringify(input), // symbol, thesis, etc.
       });
       if (!res.ok || !res.body) throw new Error(`API ${res.status}`);
 
@@ -65,7 +115,6 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
         full += chunk;
         setText((prev) => {
           const next = prev + chunk;
-          // keep view scrolled
           queueMicrotask(() =>
             scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
           );
@@ -84,9 +133,10 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
   function speak(content?: string) {
     const toSpeak = (content ?? text).trim();
     if (!toSpeak) return;
+    // Cancel any ongoing speech before starting
     window.speechSynthesis?.cancel();
     const u = new SpeechSynthesisUtterance(toSpeak);
-    u.rate = 1.02;
+    u.rate = 0.95; // calmer, more natural
     u.onend = () => setStatus("ready");
     speakUtterance.current = u;
     window.speechSynthesis?.speak(u);
@@ -121,6 +171,13 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
         </div>
         <div className="flex items-center gap-2">
           <button
+            onClick={() => setAutoActive(v => !v)}
+            className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
+            title="Auto think-aloud between 09:30–09:45 ET"
+          >
+            {autoActive ? "Stop Auto" : "Start Auto"}
+          </button>
+          <button
             onClick={playClick}
             className="rounded-xl bg-black text-white px-3 py-1.5 text-sm hover:opacity-90"
           >
@@ -152,7 +209,7 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
         {!text && status === "loading" && (
           <div className="text-gray-600">
             <span className="animate-pulse">
-              AI thinking… scanning float, rel vol, VWAP, and key levels.
+              AI thinking… scanning float, rel vol, VWAP, premarket levels, and OR.
             </span>
           </div>
         )}
@@ -160,7 +217,7 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
         {error && <div className="text-red-600">{error}</div>}
         {!text && status === "idle" && !error && (
           <div className="text-gray-500">
-            Press <b>Play</b> to hear the AI explain entries, exits, and risk.
+            Press <b>Play</b> or enable <b>Start Auto</b> for a think-aloud between 09:30–09:45 ET.
           </div>
         )}
       </div>
