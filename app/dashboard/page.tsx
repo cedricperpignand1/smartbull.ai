@@ -303,19 +303,23 @@ export default function Home() {
     topLeft: true,
   };
 
-  // narrator inputs
+  // ===== Narrator inputs (UPDATED: no "TBD", prefer open position first) =====
   const narratorSymbol =
-    selectedStock || botData?.lastRec?.ticker || (tradeData?.openPos?.ticker ?? "");
+    tradeData?.openPos?.ticker ??
+    selectedStock ??
+    botData?.lastRec?.ticker ??
+    null;
+
   const narratorPrice =
-    selectedStock
-      ? stocks.find((s) => s.ticker === selectedStock)?.price
-      : botData?.lastRec?.price ?? tradeData?.openPos?.entryPrice;
+    (narratorSymbol && stocks.find((s) => s.ticker === narratorSymbol)?.price) ??
+    tradeData?.openPos?.entryPrice ??
+    (typeof botData?.lastRec?.price === "number" ? botData.lastRec.price : undefined);
 
   const autoKey =
     tradeData?.openPos
       ? `open:${tradeData.openPos.ticker}@${tradeData.openPos.entryPrice}@${tradeData.openPos.shares}`
-      : botData?.lastRec
-      ? `pick:${botData.lastRec.ticker}@${botData.lastRec.price}`
+      : narratorSymbol
+      ? `sym:${narratorSymbol}`
       : undefined;
 
   /* ===== Reset (admin) helpers ===== */
@@ -372,13 +376,13 @@ export default function Home() {
                   <b>AI Pick:</b> {botData.lastRec.ticker}
                 </div>
                 <div>
-                  <b>Price:</b> ${Number(botData.lastRec.price).toFixed(2)}
+                  <b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
                 </div>
                 <div>
                   <b>Time:</b>{" "}
-                  {new Date(botData.lastRec.at).toLocaleTimeString("en-US", {
-                    timeZone: "America/New_York",
-                  })}{" "}
+                  {botData.lastRec.at
+                    ? new Date(botData.lastRec.at).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+                    : "—"}{" "}
                   ET
                 </div>
               </div>
@@ -742,21 +746,26 @@ export default function Home() {
           className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
         >
           <Panel title="Trade Narrator" color="rose">
-            <TradeNarrator
-              className="mt-1"
-              autoRunKey={autoKey}
-              input={{
-                symbol: narratorSymbol || "TBD",
-                price: typeof narratorPrice === "number" ? narratorPrice : undefined,
-                thesis: selectedStock
-                  ? "Explaining selected chart context."
-                  : tradeData?.openPos
-                  ? "Explaining live open position."
-                  : botData?.lastRec
-                  ? "Explaining latest AI pick context."
-                  : "No symbol selected; click a stock to get a focused narration.",
-              }}
-            />
+            {narratorSymbol ? (
+              <TradeNarrator
+                key={narratorSymbol}
+                className="mt-1"
+                autoRunKey={autoKey}
+                input={{
+                  symbol: narratorSymbol,
+                  price: typeof narratorPrice === "number" ? narratorPrice : undefined,
+                  thesis: selectedStock
+                    ? "Explaining selected chart context."
+                    : tradeData?.openPos
+                    ? "Explaining live open position."
+                    : "Explaining latest AI pick context.",
+                }}
+              />
+            ) : (
+              <div className="mt-1 text-sm text-gray-500">
+                Pick a symbol or wait for an AI pick to start narration.
+              </div>
+            )}
           </Panel>
         </Rnd>
       </div>
