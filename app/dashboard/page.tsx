@@ -7,19 +7,22 @@ import Navbar from "../components/Navbar";
 import { Button } from "../components/ui/button";
 import { useBotPoll } from "../components/useBotPoll";
 
-/* ------------------------------
-   Tiny title-chip Panel wrapper
-   ------------------------------ */
+/* =========================================================
+   Reusable Panel — thicker border & clearer outline
+   ========================================================= */
 function Panel({
   title,
   color = "blue",
   right,
   children,
+  dense = false,
 }: {
   title: string;
   color?: "blue" | "purple" | "green" | "orange" | "rose" | "slate" | "amber" | "cyan";
   right?: React.ReactNode;
   children: React.ReactNode;
+  /** smaller inner padding (helps reduce empty white space) */
+  dense?: boolean;
 }) {
   const chip = {
     blue: "bg-blue-600",
@@ -33,20 +36,21 @@ function Panel({
   }[color];
 
   return (
-    <div className="h-full flex flex-col bg-white rounded-2xl border border-zinc-200/70 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
-      <div className="px-4 py-3 flex items-center justify-between">
+    <div className="h-full flex flex-col bg-white rounded-2xl border-[0.5px] border-gray-200 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
+      <div className="px-4 py-2.5 flex items-center justify-between border-b border-gray-200/80 bg-white">
         <span className={`inline-flex items-center px-3 py-1 rounded-md text-xs font-semibold text-white ${chip}`}>
           {title}
         </span>
         {right}
       </div>
-      <div className="px-4 pb-4 pt-0 flex-1 overflow-auto">{children}</div>
+      <div className={`flex-1 overflow-auto ${dense ? "p-3" : "px-4 pb-4 pt-3"}`}>{children}</div>
     </div>
   );
 }
 
-/* ------------------------------ */
-/* Simple in-page AI Chat */
+/* =========================================================
+   Simple in-page AI Chat
+   ========================================================= */
 function ChatBox() {
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
   const [input, setInput] = useState("");
@@ -82,7 +86,7 @@ function ChatBox() {
 
   return (
     <div className="h-full flex flex-col">
-      <div id={scrollId} className="flex-1 overflow-auto rounded-xl border bg-gray-50 p-3 space-y-2">
+      <div id={scrollId} className="flex-1 overflow-auto rounded-xl border border-gray-300 bg-gray-50 p-3 space-y-2">
         {!messages.length && (
           <div className="text-sm text-gray-600">
             Ask me things like:
@@ -96,7 +100,7 @@ function ChatBox() {
           <div
             key={i}
             className={`max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-2 text-sm ${
-              m.role === "user" ? "bg-black text-white ml-auto" : "bg-white text-gray-900 border"
+              m.role === "user" ? "bg-black text-white ml-auto" : "bg-white text-gray-900 border border-gray-200"
             }`}
           >
             {m.content}
@@ -106,7 +110,7 @@ function ChatBox() {
 
       <div className="mt-3 flex items-center gap-2">
         <input
-          className="flex-1 rounded-xl border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+          className="flex-1 rounded-xl border border-gray-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
           placeholder="Type your question…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -125,7 +129,9 @@ function ChatBox() {
   );
 }
 
-/* ------------------------------ */
+/* =========================================================
+   Types
+   ========================================================= */
 interface Stock {
   ticker: string;
   price: number;
@@ -154,7 +160,9 @@ interface TradePayload {
   openPos: { ticker: string; entryPrice: number; shares: number } | null;
 }
 
-/* ------------ time helpers ------------- */
+/* =========================================================
+   Time helpers
+   ========================================================= */
 function pickMs(v: unknown): number | null {
   if (v == null) return null;
   if (typeof v === "number" && Number.isFinite(v)) return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
@@ -187,7 +195,9 @@ function ymdET(d: Date) {
   return `${y}-${m}-${day}`;
 }
 
-/* ---------- layout helpers (draggable) ---------- */
+/* =========================================================
+   Draggable layout helpers
+   ========================================================= */
 type Rect = { x: number; y: number; width: number; height: number };
 type Layout = {
   chat: Rect;
@@ -197,36 +207,42 @@ type Layout = {
   botstatus: Rect;
 };
 
-const LAYOUT_KEY = "dash_layout_v4";
+const LAYOUT_KEY = "dash_layout_v5";
 
-/** Compute a starting layout that matches your screenshot */
+/** Defaults tuned to your last screenshot:
+ *  - Chat wider (460px)
+ *  - Gainers large center
+ *  - Trade Log top-right wide
+ *  - AI Rec + Bot Status bottom-right halves, shorter (less white space)
+ */
 function computeDefaultLayout(w: number, h: number): Layout {
-  const gap = 20;
-  const left = 360;
-  const rightHalf = 420;
-  const rightTotal = rightHalf * 2 + gap;
-  const center = Math.max(680, w - (left + gap + rightTotal + gap)); // left + gap + center + gap + rightTotal
+  const gap = 22;          // spacing between boxes
+  const left = 460;        // AI Chat width (wider)
+  const halfRight = 480;   // width of each bottom-right half
+  const rightTotal = halfRight * 2 + gap;
 
-  // Right stack: Trade Log (top, full width), bottom row split into two halves
-  const tradeH = Math.max(260, Math.floor(h * 0.55));
-  const bottomH = Math.max(220, h - (tradeH + gap));
+  // Trade Log takes ~40–45% height; bottom row uses rest (less blank space)
+  const tradeH = Math.max(300, Math.min(420, Math.round(h * 0.44)));
+  const bottomH = Math.max(240, h - (tradeH + gap));
 
   const xLeft = 0;
   const xCenter = left + gap;
+  const center = Math.max(720, w - (left + gap + rightTotal + gap));
   const xRight = xCenter + center + gap;
-  const xRight2 = xRight + rightHalf + gap;
+  const xRight2 = xRight + halfRight + gap;
 
   return {
     chat: { x: xLeft, y: 0, width: left, height: h },
     gainers: { x: xCenter, y: 0, width: center, height: h },
     tradelog: { x: xRight, y: 0, width: rightTotal, height: tradeH },
-    airec: { x: xRight, y: tradeH + gap, width: rightHalf, height: bottomH },
-    botstatus: { x: xRight2, y: tradeH + gap, width: rightHalf, height: bottomH },
+    airec: { x: xRight, y: tradeH + gap, width: halfRight, height: bottomH },
+    botstatus: { x: xRight2, y: tradeH + gap, width: halfRight, height: bottomH },
   };
 }
 
-/* ====================================== */
-
+/* =========================================================
+   Page
+   ========================================================= */
 export default function Home() {
   const { data: session, status } = useSession();
   if (status === "loading") return <div className="flex items-center justify-center h-screen">Loading...</div>;
@@ -237,7 +253,7 @@ export default function Home() {
       </div>
     );
 
-  // ---- Stocks & AI analysis ----
+  // Stocks & AI analysis
   const [stocks, setStocks] = useState<Stock[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -252,13 +268,12 @@ export default function Home() {
   const [agentBuyPrice, setAgentBuyPrice] = useState<string | null>(null);
   const [agentSellPrice, setAgentSellPrice] = useState<string | null>(null);
 
-  // ---- Bot/trades state ----
+  // Bot / trades
   const [botData, setBotData] = useState<any>(null);
   const [tradeData, setTradeData] = useState<TradePayload | null>(null);
-
   const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
 
-  // Live stocks via SSE
+  // SSE: stocks
   useEffect(() => {
     const es = new EventSource("/api/stocks/stream");
     es.onmessage = (evt) => {
@@ -304,7 +319,7 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // ---- Ask AI for Top 1 & Top 2 picks ----
+  // Ask AI recs
   const askAIRecommendation = async () => {
     try {
       setAnalyzing(true);
@@ -315,8 +330,8 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ stocks: stocks.slice(0, 20), topN: 2 }),
       });
-
       const data = await res.json();
+
       if (!res.ok || data?.errorMessage) {
         setRecommendation(`Error: ${data?.errorMessage || res.statusText}`);
         return;
@@ -348,7 +363,7 @@ export default function Home() {
     }
   };
 
-  /* ---- chart helpers ---- */
+  // Chart helpers
   const handleStockClick = (ticker: string) => {
     setSelectedStock(ticker);
     setChartVisible(true);
@@ -422,15 +437,12 @@ export default function Home() {
     alert(`Added ${selectedStock} to your P&L with Buy: ${agentBuyPrice}, Sell: ${agentSellPrice}`);
   };
 
-  // ===== Reset (admin) modal =====
+  // Reset (admin)
   const [showReset, setShowReset] = useState(false);
   const [resetPassword, setResetPassword] = useState("");
   const [resetBusy, setResetBusy] = useState(false);
   const [resetMsg, setResetMsg] = useState<string | null>(null);
-
-  const closeReset = () => {
-    if (!resetBusy) setShowReset(false);
-  };
+  const closeReset = () => !resetBusy && setShowReset(false);
   const confirmReset = async () => {
     setResetBusy(true);
     setResetMsg(null);
@@ -463,7 +475,7 @@ export default function Home() {
     }
   };
 
-  // ======= today's trade count (fallback) =======
+  // today's trades count (fallback)
   const todayTradeCount = useMemo(() => {
     if (Array.isArray(statusTradesToday)) return statusTradesToday.length;
     const all = tradeData?.trades || [];
@@ -484,7 +496,6 @@ export default function Home() {
   const [container, setContainer] = useState<{ w: number; h: number } | null>(null);
   const [layout, setLayout] = useState<Layout | null>(null);
 
-  // measure container + restore/save layout
   useEffect(() => {
     const el = contentRef.current;
     if (!el) return;
@@ -498,7 +509,6 @@ export default function Home() {
     const ro = new ResizeObserver(measure);
     ro.observe(el);
 
-    // restore layout
     try {
       const raw = localStorage.getItem(LAYOUT_KEY);
       if (raw) setLayout(JSON.parse(raw));
@@ -540,35 +550,42 @@ export default function Home() {
   return (
     <main className="min-h-screen w-full bg-gray-100 flex flex-col">
       <Navbar />
-      {/* Content area is the bounds for all Rnd panels */}
       <div
         id="content-area"
         ref={contentRef}
         className="relative flex-1 px-4 pt-20 overflow-hidden"
-        style={{ height: "calc(100vh - 112px)" /* adjust if Navbar height differs */ }}
+        style={{ height: "calc(100vh - 112px)" }}
       >
         {layout && (
           <>
-            {/* Chat (left tall) */}
+            {/* AI Chat — wider left column */}
             <Rnd
               bounds="#content-area"
               default={{ x: layout.chat.x, y: layout.chat.y, width: layout.chat.width, height: layout.chat.height }}
+              minWidth={380}
+              minHeight={260}
+              dragGrid={[10, 10]}
+              resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, chat: { ...layout.chat, x: d.x, y: d.y } })}
               onResizeStop={(_, __, ref, _delta, pos) =>
                 saveLayout({ ...layout, chat: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } })
               }
-              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
             >
-              <Panel title="AI Chat" color="cyan">
+              <Panel title="AI Chat" color="cyan" dense>
                 <ChatBox />
               </Panel>
             </Rnd>
 
-            {/* Top Gainers (center tall) */}
+            {/* Top Gainers — big center */}
             <Rnd
               bounds="#content-area"
               default={{ x: layout.gainers.x, y: layout.gainers.y, width: layout.gainers.width, height: layout.gainers.height }}
+              minWidth={720}
+              minHeight={420}
+              dragGrid={[10, 10]}
+              resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, gainers: { ...layout.gainers, x: d.x, y: d.y } })}
               onResizeStop={(_, __, ref, _delta, pos) =>
@@ -577,11 +594,12 @@ export default function Home() {
                   gainers: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
                 })
               }
-              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
             >
               <Panel
                 title="Top Gainers"
                 color="purple"
+                dense
                 right={
                   <div className="flex items-center gap-2">
                     <span className="px-2 py-1 rounded-md text-xs font-semibold bg-gray-900 text-white/90">
@@ -661,10 +679,14 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* Trade Log (top-right, spans both right halves) */}
+            {/* Trade Log — top-right (wide) */}
             <Rnd
               bounds="#content-area"
               default={{ x: layout.tradelog.x, y: layout.tradelog.y, width: layout.tradelog.width, height: layout.tradelog.height }}
+              minWidth={940}
+              minHeight={260}
+              dragGrid={[10, 10]}
+              resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, tradelog: { ...layout.tradelog, x: d.x, y: d.y } })}
               onResizeStop={(_, __, ref, _delta, pos) =>
@@ -673,11 +695,12 @@ export default function Home() {
                   tradelog: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
                 })
               }
-              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+              className="rounded-2xl 1 border-gray-300 shadow-none z-40 bg-transparent"
             >
               <Panel
                 title="Trade Log"
                 color="orange"
+                dense
                 right={
                   <div className="flex items-center gap-2">
                     {tradeData?.openPos && (
@@ -740,10 +763,14 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* AI Recommendation (bottom-right / left half) */}
+            {/* AI Recommendation — bottom-right left (short to remove blank) */}
             <Rnd
               bounds="#content-area"
               default={{ x: layout.airec.x, y: layout.airec.y, width: layout.airec.width, height: layout.airec.height }}
+              minWidth={420}
+              minHeight={220}
+              dragGrid={[10, 10]}
+              resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, airec: { ...layout.airec, x: d.x, y: d.y } })}
               onResizeStop={(_, __, ref, _delta, pos) =>
@@ -752,11 +779,11 @@ export default function Home() {
                   airec: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
                 })
               }
-              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
             >
-              <Panel title="AI Recommendation" color="blue">
+              <Panel title="AI Recommendation" color="blue" dense>
                 {botData?.lastRec ? (
-                  <div className="mb-3 text-sm border rounded p-2 bg-gray-50">
+                  <div className="mb-3 text-sm border border-gray-200 rounded p-2 bg-gray-50">
                     <div><b>AI Pick:</b> {botData.lastRec.ticker}</div>
                     <div><b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}</div>
                     <div>
@@ -768,13 +795,13 @@ export default function Home() {
                     </div>
                   </div>
                 ) : (
-                  <div className="text-gray-500 text-sm mb-3">
+                  <div className="text-gray-600 text-sm mb-3">
                     {botData?.skipped === "market_closed" ? "Market closed. Waiting for next session." : "No recommendation yet today."}
                   </div>
                 )}
 
                 {botData?.state && (
-                  <div className="mb-3 text-sm border rounded p-2">
+                  <div className="mb-3 text-sm border border-gray-200 rounded p-2">
                     <div>Money I Have: <b>${Number(botData.state.cash).toFixed(2)}</b></div>
                     <div>Equity: <b>${Number(botData.state.equity).toFixed(2)}</b></div>
                     <div>
@@ -794,27 +821,27 @@ export default function Home() {
                 <Button
                   onClick={askAIRecommendation}
                   disabled={analyzing || stocks.length === 0}
-                  className="mt-3 px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
+                  className="px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
                   title={stocks.length === 0 ? "No stocks loaded yet" : "Send list to AI (Top 1 & Top 2)"}
                 >
                   {analyzing ? "Analyzing..." : "Ask AI"}
                 </Button>
 
-                {recommendation && <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>}
-
-                <div className="mt-auto text-xs text-gray-500">
-                  Server ET:{" "}
-                  {botData?.serverTimeET
-                    ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                    : "…"}
+                {recommendation && <div className="mt-3 text-sm whitespace-pre-wrap">{recommendation}</div>}
+                <div className="mt-2 text-xs text-gray-500">
+                  Server ET: {botData?.serverTimeET ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "…"}
                 </div>
               </Panel>
             </Rnd>
 
-            {/* Bot Status (bottom-right / right half) */}
+            {/* Bot Status — bottom-right right (short to remove blank) */}
             <Rnd
               bounds="#content-area"
               default={{ x: layout.botstatus.x, y: layout.botstatus.y, width: layout.botstatus.width, height: layout.botstatus.height }}
+              minWidth={420}
+              minHeight={220}
+              dragGrid={[10, 10]}
+              resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, botstatus: { ...layout.botstatus, x: d.x, y: d.y } })}
               onResizeStop={(_, __, ref, _delta, pos) =>
@@ -823,12 +850,12 @@ export default function Home() {
                   botstatus: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
                 })
               }
-              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
             >
-              <Panel title="Bot Status" color="green">
+              <Panel title="Bot Status" color="green" dense>
                 {statusError && <p className="text-red-600 text-sm">Error: {statusError}</p>}
 
-                <div className="rounded-lg px-3 py-2 text-sm mb-3 bg-gray-50 border">
+                <div className="rounded-lg px-3 py-2 text-sm mb-2 bg-gray-50 border border-gray-200">
                   {(statusTick as any)?.debug?.lastMessage ?? "Waiting for next update…"}
                   <div className="mt-1 text-[11px] text-gray-500 space-x-3">
                     {typeof statusTick?.info?.snapshotAgeMs === "number" && (
@@ -840,7 +867,7 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="text-sm bg-gray-50 border rounded p-2 mb-2">
+                <div className="text-sm bg-gray-50 border border-gray-200 rounded p-2 mb-2">
                   <div>Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}</div>
                   <div>
                     Server (ET):{" "}
@@ -852,7 +879,7 @@ export default function Home() {
 
                 <div className="text-xs">
                   <div className="font-semibold mb-1">Last Recommendation</div>
-                  <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
+                  <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
                     {statusTick?.lastRec
                       ? `Pick: ${statusTick.lastRec.ticker} @ ${
                           typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
@@ -861,9 +888,9 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="text-xs mt-3">
+                <div className="text-xs mt-2">
                   <div className="font-semibold mb-1">Open Position</div>
-                  <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
+                  <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
                     {statusTick?.position
                       ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(
                           statusTick.position.entryPrice
@@ -872,9 +899,9 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="text-xs mt-3">
+                <div className="text-xs mt-2">
                   <div className="font-semibold mb-1">Recent Trades</div>
-                  <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
+                  <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
                     {todayTradeCount
                       ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).`
                       : "No trades executed yet today."}
@@ -885,15 +912,17 @@ export default function Home() {
           </>
         )}
 
-        {/* ===== TradingView Chart — draggable overlay with × ===== */}
+        {/* Chart overlay */}
         {chartVisible && selectedStock && (
           <Rnd
             bounds="#content-area"
             default={{ x: (container?.w || 1200) - 880, y: (container?.h || 800) - 580, width: 860, height: 560 }}
             minWidth={420}
             minHeight={260}
+            dragGrid={[10, 10]}
+            resizeGrid={[10, 10]}
             enableResizing={resizingConfig}
-            className="rounded-2xl border border-zinc-200/60 shadow-lg z-50 bg-transparent"
+            className="rounded-2xl border-[0.5px] border-gray-200 shadow-xl z-50 bg-transparent"
           >
             <Panel
               title={`${selectedStock} Chart`}
@@ -908,6 +937,7 @@ export default function Home() {
                   ×
                 </button>
               }
+              dense
             >
               <div className="overflow-hidden" style={{ height: 420 }}>
                 <iframe
@@ -917,7 +947,7 @@ export default function Home() {
                   scrolling="no"
                 />
               </div>
-              <div className="flex gap-3 mt-4">
+              <div className="flex gap-3 mt-3">
                 <Button onClick={handleAgent} className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition">
                   AI Agent
                 </Button>
@@ -926,14 +956,16 @@ export default function Home() {
                 </Button>
               </div>
               {agentResult && (
-                <div className="mt-4 p-3 bg-gray-100 rounded text-sm whitespace-pre-wrap overflow-y-auto">{agentResult}</div>
+                <div className="mt-3 p-3 bg-gray-100 border border-gray-200 rounded text-sm whitespace-pre-wrap overflow-y-auto">
+                  {agentResult}
+                </div>
               )}
             </Panel>
           </Rnd>
         )}
       </div>
 
-      {/* ===== Password Modal (Reset admin) ===== */}
+      {/* Reset admin modal */}
       {showReset && (
         <div
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
@@ -941,7 +973,7 @@ export default function Home() {
             if (e.target === e.currentTarget) closeReset();
           }}
         >
-          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl border-1 border-gray-300">
             <div className="text-lg font-semibold text-slate-800">Confirm Reset</div>
             <p className="mt-1 text-sm text-slate-600">
               This wipes all trades, positions, and AI picks, and resets the bot balance.
