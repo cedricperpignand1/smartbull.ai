@@ -46,7 +46,7 @@ function Panel({
 }
 
 /* ------------------------------ */
-/* Simple in-page AI Chat component */
+/* Simple in-page AI Chat */
 function ChatBox() {
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
   const [input, setInput] = useState("");
@@ -72,8 +72,7 @@ function ChatBox() {
         body: JSON.stringify({ message: q }),
       });
       const j = await r.json();
-      const reply = j?.reply ?? "Hmm, I couldn't parse that.";
-      setMessages((m) => [...m, { role: "assistant", content: reply }]);
+      setMessages((m) => [...m, { role: "assistant", content: j?.reply ?? "Hmm, I couldn't parse that." }]);
     } catch {
       setMessages((m) => [...m, { role: "assistant", content: "Error reaching chat API." }]);
     } finally {
@@ -137,7 +136,6 @@ interface Stock {
   avgVolume?: number | null;
   employees?: number | null;
 }
-
 interface Trade {
   id: number | string;
   side: "BUY" | "SELL";
@@ -195,31 +193,35 @@ type Layout = {
   chat: Rect;
   gainers: Rect;
   tradelog: Rect;
-  botstatus: Rect;
   airec: Rect;
+  botstatus: Rect;
 };
-const LAYOUT_KEY = "dash_layout_v3";
 
-/** Compute a nice starting layout from container width/height */
+const LAYOUT_KEY = "dash_layout_v4";
+
+/** Compute a starting layout that matches your screenshot */
 function computeDefaultLayout(w: number, h: number): Layout {
-  const gap = 20; // ~gap-5 look
+  const gap = 20;
   const left = 360;
-  const right1 = 420;
-  const right2 = 420;
-  const center = Math.max(640, w - (left + right1 + right2 + gap * 3));
-  const rowH = Math.floor((h - gap) / 2);
+  const rightHalf = 420;
+  const rightTotal = rightHalf * 2 + gap;
+  const center = Math.max(680, w - (left + gap + rightTotal + gap)); // left + gap + center + gap + rightTotal
 
-  const x1 = 0; // left
-  const x2 = left + gap; // center
-  const x3 = x2 + center + gap; // right col A
-  const x4 = x3 + right1 + gap; // right col B
+  // Right stack: Trade Log (top, full width), bottom row split into two halves
+  const tradeH = Math.max(260, Math.floor(h * 0.55));
+  const bottomH = Math.max(220, h - (tradeH + gap));
+
+  const xLeft = 0;
+  const xCenter = left + gap;
+  const xRight = xCenter + center + gap;
+  const xRight2 = xRight + rightHalf + gap;
 
   return {
-    chat: { x: x1, y: 0, width: left, height: h },
-    gainers: { x: x2, y: 0, width: center, height: h },
-    tradelog: { x: x3, y: 0, width: right1, height: rowH },
-    botstatus: { x: x3, y: rowH + gap, width: right1, height: rowH },
-    airec: { x: x4, y: 0, width: right2, height: h },
+    chat: { x: xLeft, y: 0, width: left, height: h },
+    gainers: { x: xCenter, y: 0, width: center, height: h },
+    tradelog: { x: xRight, y: 0, width: rightTotal, height: tradeH },
+    airec: { x: xRight, y: tradeH + gap, width: rightHalf, height: bottomH },
+    botstatus: { x: xRight2, y: tradeH + gap, width: rightHalf, height: bottomH },
   };
 }
 
@@ -254,7 +256,6 @@ export default function Home() {
   const [botData, setBotData] = useState<any>(null);
   const [tradeData, setTradeData] = useState<TradePayload | null>(null);
 
-  // Pull tradesToday from hook (with local fallback)
   const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
 
   // Live stocks via SSE
@@ -462,7 +463,7 @@ export default function Home() {
     }
   };
 
-  // ======= compute today's trade count (fallback) =======
+  // ======= today's trade count (fallback) =======
   const todayTradeCount = useMemo(() => {
     if (Array.isArray(statusTradesToday)) return statusTradesToday.length;
     const all = tradeData?.trades || [];
@@ -488,22 +489,22 @@ export default function Home() {
     const el = contentRef.current;
     if (!el) return;
 
-    const read = () => {
+    const measure = () => {
       const r = el.getBoundingClientRect();
       setContainer({ w: Math.round(r.width), h: Math.round(r.height) });
     };
-    read();
+    measure();
 
-    const ro = new ResizeObserver(read);
+    const ro = new ResizeObserver(measure);
     ro.observe(el);
 
-    // try restore
+    // restore layout
     try {
       const raw = localStorage.getItem(LAYOUT_KEY);
       if (raw) setLayout(JSON.parse(raw));
     } catch {}
 
-    const onResize = () => read();
+    const onResize = () => measure();
     window.addEventListener("resize", onResize);
     return () => {
       ro.disconnect();
@@ -511,12 +512,9 @@ export default function Home() {
     };
   }, []);
 
-  // whenever container measured and no saved layout, create defaults
   useEffect(() => {
     if (!container) return;
-    if (!layout) {
-      setLayout(computeDefaultLayout(container.w, container.h));
-    }
+    if (!layout) setLayout(computeDefaultLayout(container.w, container.h));
   }, [container, layout]);
 
   const saveLayout = (next: Layout) => {
@@ -542,16 +540,13 @@ export default function Home() {
   return (
     <main className="min-h-screen w-full bg-gray-100 flex flex-col">
       <Navbar />
-
       {/* Content area is the bounds for all Rnd panels */}
       <div
         id="content-area"
         ref={contentRef}
         className="relative flex-1 px-4 pt-20 overflow-hidden"
-        // 112px ~= navbar+padding; adjust if your Navbar is different
-        style={{ height: "calc(100vh - 112px)" }}
+        style={{ height: "calc(100vh - 112px)" /* adjust if Navbar height differs */ }}
       >
-        {/* Guard: wait until we have layout computed */}
         {layout && (
           <>
             {/* Chat (left tall) */}
@@ -560,11 +555,8 @@ export default function Home() {
               default={{ x: layout.chat.x, y: layout.chat.y, width: layout.chat.width, height: layout.chat.height }}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, chat: { ...layout.chat, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, delta, pos) =>
-                saveLayout({
-                  ...layout,
-                  chat: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
-                })
+              onResizeStop={(_, __, ref, _delta, pos) =>
+                saveLayout({ ...layout, chat: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } })
               }
               className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
             >
@@ -576,15 +568,10 @@ export default function Home() {
             {/* Top Gainers (center tall) */}
             <Rnd
               bounds="#content-area"
-              default={{
-                x: layout.gainers.x,
-                y: layout.gainers.y,
-                width: layout.gainers.width,
-                height: layout.gainers.height,
-              }}
+              default={{ x: layout.gainers.x, y: layout.gainers.y, width: layout.gainers.width, height: layout.gainers.height }}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, gainers: { ...layout.gainers, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, delta, pos) =>
+              onResizeStop={(_, __, ref, _delta, pos) =>
                 saveLayout({
                   ...layout,
                   gainers: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
@@ -604,7 +591,7 @@ export default function Home() {
                       onClick={askAIRecommendation}
                       disabled={analyzing || stocks.length === 0}
                       className="px-3 py-1 bg-gray-900 text-white hover:bg-gray-800 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                      title={stocks.length === 0 ? "No stocks loaded yet" : "Send current list to AI (returns Top 1 & Top 2)"}
+                      title={stocks.length === 0 ? "No stocks loaded yet" : "Send list to AI (Top 1 & Top 2)"}
                     >
                       {analyzing ? "Analyzing..." : "Ask AI"}
                     </Button>
@@ -674,18 +661,13 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* Trade Log (top-right) */}
+            {/* Trade Log (top-right, spans both right halves) */}
             <Rnd
               bounds="#content-area"
-              default={{
-                x: layout.tradelog.x,
-                y: layout.tradelog.y,
-                width: layout.tradelog.width,
-                height: layout.tradelog.height,
-              }}
+              default={{ x: layout.tradelog.x, y: layout.tradelog.y, width: layout.tradelog.width, height: layout.tradelog.height }}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, tradelog: { ...layout.tradelog, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, delta, pos) =>
+              onResizeStop={(_, __, ref, _delta, pos) =>
                 saveLayout({
                   ...layout,
                   tradelog: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
@@ -758,18 +740,84 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* Bot Status (bottom-right) */}
+            {/* AI Recommendation (bottom-right / left half) */}
             <Rnd
               bounds="#content-area"
-              default={{
-                x: layout.botstatus.x,
-                y: layout.botstatus.y,
-                width: layout.botstatus.width,
-                height: layout.botstatus.height,
-              }}
+              default={{ x: layout.airec.x, y: layout.airec.y, width: layout.airec.width, height: layout.airec.height }}
+              enableResizing={resizingConfig}
+              onDragStop={(_, d) => saveLayout({ ...layout, airec: { ...layout.airec, x: d.x, y: d.y } })}
+              onResizeStop={(_, __, ref, _delta, pos) =>
+                saveLayout({
+                  ...layout,
+                  airec: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
+                })
+              }
+              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+            >
+              <Panel title="AI Recommendation" color="blue">
+                {botData?.lastRec ? (
+                  <div className="mb-3 text-sm border rounded p-2 bg-gray-50">
+                    <div><b>AI Pick:</b> {botData.lastRec.ticker}</div>
+                    <div><b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}</div>
+                    <div>
+                      <b>Time:</b>{" "}
+                      {botData.lastRec.at
+                        ? new Date(botData.lastRec.at).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+                        : "—"}{" "}
+                      ET
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-gray-500 text-sm mb-3">
+                    {botData?.skipped === "market_closed" ? "Market closed. Waiting for next session." : "No recommendation yet today."}
+                  </div>
+                )}
+
+                {botData?.state && (
+                  <div className="mb-3 text-sm border rounded p-2">
+                    <div>Money I Have: <b>${Number(botData.state.cash).toFixed(2)}</b></div>
+                    <div>Equity: <b>${Number(botData.state.equity).toFixed(2)}</b></div>
+                    <div>
+                      PNL:{" "}
+                      <b className={Number(botData.state.pnl) >= 0 ? "text-green-600" : "text-red-600"}>
+                        {Number(botData.state.pnl) >= 0 ? "+" : ""}${Number(botData.state.pnl).toFixed(2)}
+                      </b>
+                    </div>
+                    {botData?.live?.ticker && (
+                      <div className="mt-1 text-xs text-gray-600">
+                        Live: {botData.live.ticker} {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <Button
+                  onClick={askAIRecommendation}
+                  disabled={analyzing || stocks.length === 0}
+                  className="mt-3 px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={stocks.length === 0 ? "No stocks loaded yet" : "Send list to AI (Top 1 & Top 2)"}
+                >
+                  {analyzing ? "Analyzing..." : "Ask AI"}
+                </Button>
+
+                {recommendation && <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>}
+
+                <div className="mt-auto text-xs text-gray-500">
+                  Server ET:{" "}
+                  {botData?.serverTimeET
+                    ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+                    : "…"}
+                </div>
+              </Panel>
+            </Rnd>
+
+            {/* Bot Status (bottom-right / right half) */}
+            <Rnd
+              bounds="#content-area"
+              default={{ x: layout.botstatus.x, y: layout.botstatus.y, width: layout.botstatus.width, height: layout.botstatus.height }}
               enableResizing={resizingConfig}
               onDragStop={(_, d) => saveLayout({ ...layout, botstatus: { ...layout.botstatus, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, delta, pos) =>
+              onResizeStop={(_, __, ref, _delta, pos) =>
                 saveLayout({
                   ...layout,
                   botstatus: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
@@ -834,86 +882,10 @@ export default function Home() {
                 </div>
               </Panel>
             </Rnd>
-
-            {/* AI Recommendation (rightmost tall) */}
-            <Rnd
-              bounds="#content-area"
-              default={{
-                x: layout.airec.x,
-                y: layout.airec.y,
-                width: layout.airec.width,
-                height: layout.airec.height,
-              }}
-              enableResizing={resizingConfig}
-              onDragStop={(_, d) => saveLayout({ ...layout, airec: { ...layout.airec, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, delta, pos) =>
-                saveLayout({
-                  ...layout,
-                  airec: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
-                })
-              }
-              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
-            >
-              <Panel title="AI Recommendation" color="blue">
-                {botData?.lastRec ? (
-                  <div className="mb-3 text-sm border rounded p-2 bg-gray-50">
-                    <div><b>AI Pick:</b> {botData.lastRec.ticker}</div>
-                    <div><b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}</div>
-                    <div>
-                      <b>Time:</b>{" "}
-                      {botData.lastRec.at
-                        ? new Date(botData.lastRec.at).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                        : "—"}{" "}
-                      ET
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-gray-500 text-sm mb-3">
-                    {botData?.skipped === "market_closed" ? "Market closed. Waiting for next session." : "No recommendation yet today."}
-                  </div>
-                )}
-
-                {botData?.state && (
-                  <div className="mb-3 text-sm border rounded p-2">
-                    <div>Money I Have: <b>${Number(botData.state.cash).toFixed(2)}</b></div>
-                    <div>Equity: <b>${Number(botData.state.equity).toFixed(2)}</b></div>
-                    <div>
-                      PNL:{" "}
-                      <b className={Number(botData.state.pnl) >= 0 ? "text-green-600" : "text-red-600"}>
-                        {Number(botData.state.pnl) >= 0 ? "+" : ""}${Number(botData.state.pnl).toFixed(2)}
-                      </b>
-                    </div>
-                    {botData?.live?.ticker && (
-                      <div className="mt-1 text-xs text-gray-600">
-                        Live: {botData.live.ticker} {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                <Button
-                  onClick={askAIRecommendation}
-                  disabled={analyzing || stocks.length === 0}
-                  className="mt-3 px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
-                  title={stocks.length === 0 ? "No stocks loaded yet" : "Send current list to AI (returns Top 1 & Top 2)"}
-                >
-                  {analyzing ? "Analyzing..." : "Ask AI"}
-                </Button>
-
-                {recommendation && <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>}
-
-                <div className="mt-auto text-xs text-gray-500">
-                  Server ET:{" "}
-                  {botData?.serverTimeET
-                    ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                    : "…"}
-                </div>
-              </Panel>
-            </Rnd>
           </>
         )}
 
-        {/* ===== TradingView Chart — draggable overlay ===== */}
+        {/* ===== TradingView Chart — draggable overlay with × ===== */}
         {chartVisible && selectedStock && (
           <Rnd
             bounds="#content-area"
