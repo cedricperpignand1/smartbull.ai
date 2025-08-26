@@ -7,7 +7,6 @@ import { NextRequest } from "next/server";
 import { spreadGuardOK } from "@/lib/alpaca";
 
 /** ─────────────────── Mirrors your bot’s settings ─────────────────── */
-// Price/spread guards (scan + force)
 const PRICE_MIN = 1;
 const PRICE_MAX = 70;
 const SPREAD_MAX_PCT = 0.005; // 0.50%
@@ -16,20 +15,18 @@ const SPREAD_MAX_PCT = 0.005; // 0.50%
 const DECAY_START_MIN = 0;
 const DECAY_END_MIN = 14;
 
-// Decaying thresholds (same as bot)
 const VOL_MULT_START = 1.20;
 const VOL_MULT_END   = 1.10;
-const NEAR_OR_START  = 0.003;   // 0.30%
-const NEAR_OR_END    = 0.0045;  // 0.45%
-const VWAP_BAND_START = 0.002;  // 0.20%
-const VWAP_BAND_END   = 0.003;  // 0.30%
+const NEAR_OR_START  = 0.003;
+const NEAR_OR_END    = 0.0045;
+const VWAP_BAND_START = 0.002;
+const VWAP_BAND_END   = 0.003;
 
 // Balanced liquidity guard (SCAN ONLY — not used in force)
 const MIN_SHARES_ABS = 8_000;
 const FLOAT_MIN_PCT_PER_MIN = 0.0025; // 0.25%
 const MIN_DOLLAR_VOL = 200_000;
 
-// Risk plan (for narration)
 const TARGET_PCT = 0.10;
 const STOP_PCT   = -0.05;
 
@@ -125,7 +122,7 @@ function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
   return { mult: latest.volume / avgPrior, latestVol: latest.volume, avgPrior };
 }
 
-/** Float lookups (same fallbacks as bot) */
+/** Float lookups (safe fallbacks) */
 async function fetchFloatShares(symbol: string, lastPrice: number | null): Promise<number | null> {
   try {
     const r = await fetch(`/api/fmp/float?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
@@ -135,7 +132,6 @@ async function fetchFloatShares(symbol: string, lastPrice: number | null): Promi
       if (Number.isFinite(f) && f > 0) return f;
     }
   } catch {}
-
   try {
     const r2 = await fetch(`/api/fmp/profile?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
     if (r2.ok) {
@@ -148,7 +144,6 @@ async function fetchFloatShares(symbol: string, lastPrice: number | null): Promi
       if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
     }
   } catch {}
-
   try {
     const r3 = await fetch(`/api/fmp/quote?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
     if (r3.ok) {
@@ -162,7 +157,6 @@ async function fetchFloatShares(symbol: string, lastPrice: number | null): Promi
       }
     }
   } catch {}
-
   return null;
 }
 
@@ -179,6 +173,16 @@ function passesBalancedLiquidityGuard(lastClose: number, lastVolume: number, flo
   const sharesOK  = lastVolume >= minSharesReq;
   const dollarsOK = dollarVol >= MIN_DOLLAR_VOL;
   return { ok: sharesOK && dollarsOK, minSharesReq, dollarVol };
+}
+
+/** Safe spread check (never throws) */
+async function safeSpreadCheck(symbol: string) {
+  try {
+    const ok = await spreadGuardOK(symbol, SPREAD_MAX_PCT);
+    return { pass: ok, note: "" };
+  } catch {
+    return { pass: false, note: " (couldn’t verify spread)" };
+  }
 }
 
 /** Streaming helper */
@@ -201,11 +205,9 @@ export async function POST(req: NextRequest) {
           const tNow = hhmmssET();
           await say(controller, `(${tNow} ET) ${symbol}. Taking a breath. Looking for a clean long.\n`);
 
-          // Windows
-          const scanPhase   = inScanWindowET();
-          const forcePhase  = inForceWindowET();
+          const scanPhase  = inScanWindowET();
+          const forcePhase = inForceWindowET();
 
-          // Pull candles once; used in both branches when relevant
           const candles = await fetchCandles1m(symbol, 240);
           const today = yyyyMmDdET();
           const day = candles.filter((c) => isSameETDay(toET(c.date), today));
@@ -215,30 +217,24 @@ export async function POST(req: NextRequest) {
             controller.close();
             return;
           }
-          const last = day[day.length - 1];
 
-          // Always check price + spread (both phases)
+          const last = day[day.length - 1];
           const priceOK = last.close >= PRICE_MIN && last.close <= PRICE_MAX;
-          const spreadOK = await spreadGuardOK(symbol, SPREAD_MAX_PCT);
 
           if (scanPhase) {
-            // ───────────── Scan window tone (09:30–09:44) ─────────────
+            // -------- Scan (09:30–09:44) --------
             await say(controller, `Scan window (09:30–09:44). I want quality flow, not noise.\n`);
+
+            // SAFE spread check (and only in-scan)
+            const { pass: spreadOK, note: spreadNote } = await safeSpreadCheck(symbol);
 
             // Liquidity (scan only)
             const floatShares = await fetchFloatShares(symbol, last.close);
             const liq = passesBalancedLiquidityGuard(last.close, last.volume ?? 0, floatShares);
 
-            await say(
-              controller,
-              `Quick checks → Price $${last.close.toFixed(2)} in [$${PRICE_MIN}–$${PRICE_MAX}]: ${priceOK ? "yes" : "no"}. Spread ≤ ${(SPREAD_MAX_PCT*100).toFixed(2)}%: ${spreadOK ? "yes" : "no"}.\n`
-            );
-            await say(
-              controller,
-              `Liquidity → last bar ${Number(last.volume ?? 0).toLocaleString()} sh, ≈ $${Math.round((last.close)*(last.volume || 0)).toLocaleString()}/min. Need ≥ ${liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min: ${liq.ok ? "good" : "light"}.\n`
-            );
+            await say(controller, `Quick checks → Price $${last.close.toFixed(2)} in [$${PRICE_MIN}–$${PRICE_MAX}]: ${priceOK ? "yes" : "no"}. Spread ≤ ${(SPREAD_MAX_PCT*100).toFixed(2)}%: ${spreadOK ? "yes" : "no"}${spreadNote}.\n`);
+            await say(controller, `Liquidity → last bar ${Number(last.volume ?? 0).toLocaleString()} sh, ≈ $${Math.round((last.close)*(last.volume || 0)).toLocaleString()}/min. Need ≥ ${liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min: ${liq.ok ? "good" : "light"}.\n`);
 
-            // Signals
             const orRange = computeOpeningRange(candles, today);
             const vwap    = computeSessionVWAP(candles, today);
             const vol     = computeVolumePulse(candles, today, 5);
@@ -269,7 +265,7 @@ export async function POST(req: NextRequest) {
             } else {
               const gaps: string[] = [];
               if (!priceOK) gaps.push("price band");
-              if (!spreadOK) gaps.push("spread");
+              if (!spreadOK) gaps.push("spread check");
               if (!liq.ok) gaps.push("liquidity");
               if (!(vwap != null && last.close >= vwap)) gaps.push("back above VWAP");
               if (signalCount < 2) gaps.push("get 2 signals (OR break/near, VWAP reclaim, volume)");
@@ -282,18 +278,16 @@ export async function POST(req: NextRequest) {
             if (toForce > 0) {
               await say(controller, `About ${toForce} min to 09:45. I’ll stay patient and keep reading the next bars.\n`);
             }
-            if (thesis) {
-              await say(controller, `Note: “${String(thesis).trim()}”. I’ll respect it only if it fits the setup.\n`);
-            }
+            if (thesis) await say(controller, `Note: “${String(thesis).trim()}”. I’ll respect it only if it fits the setup.\n`);
+
           } else if (forcePhase) {
-            // ───────────── Force window tone (09:45–09:46) ─────────────
+            // -------- Force (09:45–09:46) --------
             await say(controller, `Force window (09:45–09:46). No setup required. I’ll lean on the AI pick.\n`);
             await say(controller, `Here I only care about basic safety: price band and spread. No liquidity rule.\n`);
 
-            await say(
-              controller,
-              `Price $${last.close.toFixed(2)} in [$${PRICE_MIN}–$${PRICE_MAX}]: ${priceOK ? "yes" : "no"}. Spread ≤ ${(SPREAD_MAX_PCT*100).toFixed(2)}%: ${spreadOK ? "yes" : "no"}.\n`
-            );
+            const { pass: spreadOK, note: spreadNote } = await safeSpreadCheck(symbol);
+
+            await say(controller, `Price $${last.close.toFixed(2)} in [$${PRICE_MIN}–$${PRICE_MAX}]: ${priceOK ? "yes" : "no"}. Spread ≤ ${(SPREAD_MAX_PCT*100).toFixed(2)}%: ${spreadOK ? "yes" : "no"}${spreadNote}.\n`);
 
             if (priceOK && spreadOK) {
               const tp = last.close * (1 + TARGET_PCT);
@@ -301,27 +295,19 @@ export async function POST(req: NextRequest) {
               await say(controller, `If the AI pick is ${symbol} and we’re still flat, I’m ready to buy with a bracket.\n`);
               await say(controller, `Plan: target +10% ≈ $${tp.toFixed(2)}. Stop −5% ≈ $${sl.toFixed(2)}.\n`);
             } else {
-              await say(controller, `Even in force mode I’ll skip if spread is too wide or price is out of band. Safety first.\n`);
+              await say(controller, `Even in force mode I’ll skip if spread is too wide or price is out of band.\n`);
             }
 
-            if (thesis) {
-              await say(controller, `Note: “${String(thesis).trim()}”. Good to know, but the AI pick and guards lead here.\n`);
-            }
+            if (thesis) await say(controller, `Note: “${String(thesis).trim()}”. Good to know, but the AI pick and guards lead here.\n`);
+
           } else {
-            // ───────────── Outside both windows ─────────────
-            const d = nowET();
-            const mins = d.getHours() * 60 + d.getMinutes();
-            if (mins < 9 * 60 + 30) {
-              await say(controller, `Pre-open/early. I’ll start talking more at 09:30.\n`);
-            } else if (mins > 9 * 60 + 46) {
-              await say(controller, `Past the early window. I’ll defer to the main bot for exits, ratchets, and late rules.\n`);
-            } else {
-              await say(controller, `Transitioning window. I’m following the main bot’s timing.\n`);
-            }
+            // -------- Outside early windows --------
+            await say(controller, `Outside the early window. I’ll talk more during 09:30–09:46 ET.\n`);
           }
 
           controller.close();
         } catch {
+          // Fail-safe: never leak stack traces to the client
           controller.enqueue(td.encode("Narration error.\n"));
           controller.close();
         }
