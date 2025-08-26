@@ -74,38 +74,41 @@ model BotState {
 }
 
 model Recommendation {
-  id     Int      @id @default(autoincrement())
-  ticker String
-  price  Decimal // Price at recommendation time
-  at     DateTime @default(now())
+  id          Int      @id @default(autoincrement())
+  ticker      String
+  price       Decimal   // Price at recommendation time
+  at          DateTime  @default(now())
+  explanation String?   // <-- NEW: optional text explaining why the AI picked it
+
+  @@index([ticker, at])
 }
 
 model Position {
-  id         Int       @id @default(autoincrement())
-  ticker     String
-  entryPrice Decimal
-  shares     Int
-  entryAt    DateTime  @default(now())
-  open       Boolean   @default(true)
-  exitPrice  Decimal?
-  exitAt     DateTime?
+  id            Int       @id @default(autoincrement())
+  ticker        String
+  entryPrice    Decimal
+  shares        Int
+  entryAt       DateTime  @default(now())
+  open          Boolean   @default(true)
+  exitPrice     Decimal?
+  exitAt        DateTime?
 
   // Alpaca parent BUY order id
-  brokerOrderId String? @unique
+  brokerOrderId String?   @unique
 }
 
 model Trade {
-  id     Int      @id @default(autoincrement())
-  side   String // "BUY" | "SELL"
-  ticker String
-  price  Decimal
-  shares Int
-  at     DateTime @default(now())
+  id           Int      @id @default(autoincrement())
+  side         String   // "BUY" | "SELL"
+  ticker       String
+  price        Decimal
+  shares       Int
+  at           DateTime @default(now())
 
   // Alpaca order id for this trade (parent for BUY, leg for SELL, or market close)
-  brokerOrderId String? @unique
+  brokerOrderId String?  @unique
 
   // Actual fill info (from Alpaca)
-  filledAt    DateTime?
-  filledPrice Decimal?
+  filledAt     DateTime?
+  filledPrice  Decimal?
 }
