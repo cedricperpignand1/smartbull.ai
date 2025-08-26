@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSession } from "next-auth/react";
 import { Rnd } from "react-rnd";
 import Navbar from "../components/Navbar";
@@ -199,6 +199,20 @@ function formatETFromTrade(t: Trade): string {
   return new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York" });
 }
 
+// ET YYYY-MM-DD for a JS Date
+function ymdET(d: Date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const y = parts.find(p => p.type === "year")!.value;
+  const m = parts.find(p => p.type === "month")!.value;
+  const day = parts.find(p => p.type === "day")!.value;
+  return `${y}-${m}-${day}`;
+}
+
 export default function Home() {
   const { data: session, status } = useSession();
 
@@ -231,7 +245,13 @@ export default function Home() {
   // ---- Bot/trades state ----
   const [botData, setBotData] = useState<any>(null);
   const [tradeData, setTradeData] = useState<TradePayload | null>(null);
-  const { tick: statusTick, trades: statusTrades, error: statusError } = useBotPoll(5000);
+
+  // Pull tradesToday from hook (and use local fallback if needed)
+  const {
+    tick: statusTick,
+    tradesToday: statusTradesToday,
+    error: statusError,
+  } = useBotPoll(5000);
 
   // ---- Reset (admin) modal state ----
   const [showReset, setShowReset] = useState(false);
@@ -347,6 +367,12 @@ export default function Home() {
     setAgentSellPrice(null);
   };
 
+  const closeChart = () => {
+    setChartVisible(false);
+    setSelectedStock(null);
+    setAgentResult(null);
+  };
+
   const handleAgent = async () => {
     try {
       const res = await fetch("/api/chart-analyze", {
@@ -459,6 +485,28 @@ export default function Home() {
       setResetBusy(false);
     }
   };
+
+  // Fallback: compute today's trades from /api/trades if hook's tradesToday is missing/wrong
+  const todayTradeCount = useMemo(() => {
+    if (Array.isArray(statusTradesToday)) return statusTradesToday.length;
+    const all = tradeData?.trades || [];
+    if (!all.length) return 0;
+    const todayKey = ymdET(new Date());
+    let n = 0;
+    for (const t of all) {
+      const ms =
+        pickMs(t.createdAt) ??
+        pickMs(t.time) ??
+        pickMs(t.ts) ??
+        pickMs(t.at) ??
+        pickMs(t.filledAt) ??
+        pickMs(t.executedAt);
+      if (!ms) continue;
+      const k = ymdET(new Date(ms));
+      if (k === todayKey) n++;
+    }
+    return n;
+  }, [statusTradesToday, tradeData]);
 
   return (
     <main className="min-h-screen w-full bg-gray-100 flex flex-col">
@@ -709,15 +757,15 @@ export default function Home() {
             <div className="text-xs mt-3">
               <div className="font-semibold mb-1">Recent Trades</div>
               <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
-                {Array.isArray(statusTrades) && statusTrades.length
-                  ? `${statusTrades.length} trade${statusTrades.length === 1 ? "" : "s"} today.`
+                {todayTradeCount
+                  ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).`
                   : "No trades executed yet today."}
               </div>
             </div>
           </Panel>
         </Rnd>
 
-        {/* Trade Log */}
+        {/* Trade Log — modernized like Top Gainers */}
         <Rnd
           bounds="#content-area"
           default={{ x: 460, y: 940, width: 760, height: 280 }}
@@ -737,7 +785,6 @@ export default function Home() {
                     {tradeData.openPos.shares} sh
                   </div>
                 )}
-                {/* RESET (admin) button — top-right header */}
                 <Button
                   onClick={openReset}
                   className="bg-rose-600 hover:bg-rose-700 text-white text-sm px-3 py-1 rounded-md"
@@ -751,36 +798,45 @@ export default function Home() {
             {!tradeData?.trades?.length ? (
               <p className="text-gray-500 text-sm">No trades yet.</p>
             ) : (
-              <table className="min-w-full text-xs sm:text-sm">
-                <thead>
-                  <tr className="bg-gray-900 text-white">
-                    <th className="p-2">Time (ET)</th>
-                    <th className="p-2">Side</th>
-                    <th className="p-2">Ticker</th>
-                    <th className="p-2">Price</th>
-                    <th className="p-2">Shares</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {tradeData.trades.map((t) => (
-                    <tr key={String(t.id)} className="border-b">
-                      <td className="p-2">{formatETFromTrade(t)}</td>
-                      <td className="p-2">
-                        <span
-                          className={`px-2 py-0.5 rounded text-xs ${
-                            t.side === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
-                          }`}
+              <div className="flex-1 overflow-auto">
+                <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
+                  <thead>
+                    <tr className="bg-black text-white">
+                      {["Time (ET)", "Side", "Ticker", "Price", "Shares"].map((h, idx, arr) => (
+                        <th
+                          key={h}
+                          className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}
                         >
-                          {t.side}
-                        </span>
-                      </td>
-                      <td className="p-2">{t.ticker}</td>
-                      <td className="p-2">${Number(t.price).toFixed(2)}</td>
-                      <td className="p-2">{t.shares}</td>
+                          {h}
+                        </th>
+                      ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {tradeData.trades.map((t) => (
+                      <tr key={String(t.id)} className="group">
+                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
+                          {formatETFromTrade(t)}
+                        </td>
+                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                          <span
+                            className={`px-2 py-0.5 rounded text-xs font-semibold ${
+                              t.side === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                            }`}
+                          >
+                            {t.side}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">{t.ticker}</td>
+                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                          ${Number(t.price).toFixed(2)}
+                        </td>
+                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">{t.shares}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </Panel>
         </Rnd>
@@ -795,7 +851,20 @@ export default function Home() {
             enableResizing={resizingConfig}
             className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
           >
-            <Panel title={`${selectedStock} Chart`} color="slate">
+            <Panel
+              title={`${selectedStock} Chart`}
+              color="slate"
+              right={
+                <button
+                  onClick={closeChart}
+                  className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-slate-300 text-slate-600 hover:bg-slate-100"
+                  aria-label="Close chart"
+                  title="Close chart"
+                >
+                  ×
+                </button>
+              }
+            >
               <div className="overflow-hidden" style={{ height: 420 }}>
                 <iframe
                   src={`https://s.tradingview.com/widgetembed/?symbol=${selectedStock}&interval=30&hidesidetoolbar=1`}
