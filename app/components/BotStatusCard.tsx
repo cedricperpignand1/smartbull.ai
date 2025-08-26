@@ -4,8 +4,7 @@ import { useMemo } from "react";
 import { useBotPoll } from "@/app/components/useBotPoll";
 
 export default function BotStatusCard() {
-  // ✅ useBotPoll returns { tick, trades, error } — no `stocks`
-  const { tick, trades, error } = useBotPoll(5000);
+  const { tick, tradesToday, error } = useBotPoll(5000);
 
   // ----- Status banner (color + text) -----
   const status = useMemo(() => {
@@ -47,11 +46,10 @@ export default function BotStatusCard() {
       : "No open position — bot will enter only if conditions are met during the entry window.";
 
   const friendlyTrades =
-    Array.isArray(trades) && trades.length
-      ? `${trades.length} trade${trades.length === 1 ? "" : "s"} today.`
+    Array.isArray(tradesToday) && tradesToday.length
+      ? `${tradesToday.length} trade${tradesToday.length === 1 ? "" : "s"} today (ET).`
       : "No trades executed yet today.";
 
-  // Use server-provided top-8 (from tick.debug.top8) instead of a `stocks` prop
   const top8 = ((tick as any)?.debug?.top8 as string[] | undefined) ?? [];
   const friendlyWatchlist =
     top8.length > 0
