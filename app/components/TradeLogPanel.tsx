@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-/** ===== Normalized Types ===== */
+/** ===== Types ===== */
 type Trade = {
   id: string;
   ts: number; // epoch ms
@@ -22,25 +22,40 @@ type Position = {
   unrealized?: number;
 };
 
-type Range = "ALL" | "TODAY" | "7D" | "30D";
-
 const LS_KEY = "tradeLog_allTime_v2_fifo";
 
 /** ===== Helpers ===== */
-function normalize(input: any): Trade[] {
-  const toTs = (v: any) => (typeof v === "number" ? v : new Date(v).getTime());
-  return (Array.isArray(input) ? input : [])
+function parseTs(input: any): number | null {
+  if (input == null) return null;
+  if (typeof input === "number") {
+    // accept seconds or ms
+    return input < 1e12 ? Math.round(input * 1000) : Math.round(input);
+  }
+  const t = new Date(input).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+function normalizeRows(input: any): Trade[] {
+  const arr = Array.isArray(input) ? input : [];
+  return arr
     .map((t: any) => {
-      const ts = toTs(t.time ?? t.createdAt ?? Date.now());
-      const ticker = (t.ticker ?? t.symbol ?? "").toUpperCase();
+      const ts =
+        parseTs(t.ts) ??
+        parseTs(t.time) ??
+        parseTs(t.createdAt) ??
+        Date.now();
+
+      const ticker = String(t.ticker ?? t.symbol ?? "").toUpperCase();
       const side: "BUY" | "SELL" =
-        (t.side || "").toUpperCase() === "SELL" ? "SELL" : "BUY";
+        String(t.side ?? "").toUpperCase() === "SELL" ? "SELL" : "BUY";
       const price = Number(t.price ?? t.fillPrice ?? 0);
       const qty = Number(t.qty ?? t.shares ?? 0);
       const rawId = t.id ?? `${ts}-${ticker}-${side}-${price}-${qty}`;
+
       return { id: String(rawId), ts, ticker, side, price, qty };
     })
-    .filter((t) => t.ticker && t.price > 0 && t.qty !== 0 && Number.isFinite(t.ts));
+    .filter((t) => t.ticker && t.price > 0 && t.qty !== 0 && Number.isFinite(t.ts))
+    .sort((a, b) => a.ts - b.ts);
 }
 
 function mergeTrades(existing: Trade[], incoming: Trade[]): Trade[] {
@@ -51,17 +66,22 @@ function mergeTrades(existing: Trade[], incoming: Trade[]): Trade[] {
 }
 
 function saveToLS(trades: Trade[]) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(trades)); } catch {}
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(trades));
+  } catch {}
 }
 function loadFromLS(): Trade[] {
   try {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return [];
-    return JSON.parse(raw) as Trade[];
-  } catch { return []; }
+    const parsed = JSON.parse(raw);
+    return normalizeRows(parsed);
+  } catch {
+    return [];
+  }
 }
 
-/** FIFO + Positions calculation */
+/** ===== FIFO P&L ===== */
 type Lot = { qty: number; cost: number };
 
 function applyFIFO(inv: Map<string, Lot[]>, trade: Trade): number {
@@ -125,13 +145,17 @@ function computePnLandPositions(tradesAsc: Trade[]): {
   return { annotated, positions };
 }
 
-/** ====== UI Component ====== */
+function fmtET(ms?: number) {
+  if (!Number.isFinite(ms as number)) return "—";
+  const d = new Date(ms!);
+  if (!Number.isFinite(d.getTime())) return "—";
+  return d.toLocaleTimeString("en-US", { timeZone: "America/New_York" });
+}
+
+/** ===== Component ===== */
 export default function TradeLogPanel() {
   const [history, setHistory] = useState<Trade[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
-  const [range, setRange] = useState<Range>("ALL");
-
-  // Reset UI state
   const [showReset, setShowReset] = useState(false);
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -139,39 +163,57 @@ export default function TradeLogPanel() {
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // load LS
-  useEffect(() => { setHistory(loadFromLS()); }, []);
+  // Load from localStorage (migrated via normalize)
+  useEffect(() => {
+    setHistory(loadFromLS());
+  }, []);
 
-  // poll server
+  // Poll server: /api/trades (object with {trades, openPos}); fallback to /api/bot/trades if needed
   useEffect(() => {
     const fetchTrades = async () => {
       try {
-        const res = await fetch("/api/bot/trades", { cache: "no-store" });
+        let res = await fetch("/api/trades?limit=200", { cache: "no-store" });
+        if (!res.ok) {
+          res = await fetch("/api/bot/trades?limit=200", { cache: "no-store" });
+        }
         if (!res.ok) throw new Error();
         const data = await res.json();
-        const incoming = normalize(data);
+
+        // The API returns an object -> feed only the array to normalizer
+        const serverRows = Array.isArray(data) ? data : (data?.trades ?? []);
+        const incoming = normalizeRows(serverRows);
+
         setHistory((prev) => {
           const merged = mergeTrades(prev, incoming);
           saveToLS(merged);
           return merged;
         });
-      } catch {}
+      } catch {
+        /* ignore network hiccups */
+      }
     };
+
     fetchTrades();
     pollRef.current = setInterval(fetchTrades, 5000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, []);
 
-  // recompute PnL + positions
+  // PnL + positions
   const { annotated, positions: computedPos } = useMemo(
     () => computePnLandPositions(history),
     [history]
   );
+  const rows = useMemo(() => annotated.slice().reverse(), [annotated]);
 
-  // fetch last prices for unrealized PnL
+  // Fetch last prices for unrealized P&L
   useEffect(() => {
     const loadPrices = async () => {
-      if (computedPos.length === 0) { setPositions([]); return; }
+      if (computedPos.length === 0) {
+        setPositions([]);
+        return;
+      }
       const tickers = computedPos.map((p) => p.ticker).join(",");
       const res = await fetch(
         `https://financialmodelingprep.com/api/v3/quote/${tickers}?apikey=M0MLRDp8dLak6yJOfdv7joKaKGSje8pp`
@@ -191,11 +233,18 @@ export default function TradeLogPanel() {
     loadPrices();
   }, [computedPos]);
 
-  /** ===== Reset flow (password: 9340) ===== */
-  const openReset = () => { setMsg(null); setPassword(""); setShowReset(true); };
-  const closeReset = () => { if (!busy) setShowReset(false); };
+  /** ===== Reset flow (uses /api/bot/reset expecting { key }) ===== */
+  const openReset = () => {
+    setMsg(null);
+    setPassword("");
+    setShowReset(true);
+  };
+  const closeReset = () => {
+    if (!busy) setShowReset(false);
+  };
   const confirmReset = async () => {
-    setBusy(true); setMsg(null);
+    setBusy(true);
+    setMsg(null);
     try {
       const res = await fetch("/api/bot/reset", {
         method: "POST",
@@ -206,14 +255,22 @@ export default function TradeLogPanel() {
       if (!res.ok || !data?.ok) {
         setMsg("Incorrect password or reset failed.");
       } else {
-        try { localStorage.removeItem(LS_KEY); } catch {}
-        setHistory([]); setPositions([]);
+        try {
+          localStorage.removeItem(LS_KEY);
+        } catch {}
+        setHistory([]);
+        setPositions([]);
         setMsg("✅ Reset complete.");
-        setTimeout(() => { setShowReset(false); window.location.reload(); }, 600);
+        setTimeout(() => {
+          setShowReset(false);
+          window.location.reload();
+        }, 600);
       }
     } catch {
       setMsg("Reset error. Check server logs.");
-    } finally { setBusy(false); }
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -259,9 +316,8 @@ export default function TradeLogPanel() {
         </table>
       )}
 
-      {/* TRADE LOG + ABSOLUTE RESET BUTTON */}
+      {/* TRADE LOG + RESET BUTTON */}
       <div className="relative">
-        {/* absolutely pinned button over the top-right of the table header */}
         <button
           onClick={openReset}
           className="absolute top-2 right-3 z-50 rounded-lg px-3 py-1.5 text-sm font-medium bg-rose-600 text-white hover:bg-rose-700 active:scale-[.99] shadow"
@@ -272,7 +328,7 @@ export default function TradeLogPanel() {
 
         <h2 className="font-bold text-lg mb-2 pr-28">Trade Log</h2>
 
-        {history.length === 0 ? (
+        {rows.length === 0 ? (
           <p className="text-gray-500">No trades yet.</p>
         ) : (
           <table className="min-w-full text-sm border">
@@ -288,13 +344,9 @@ export default function TradeLogPanel() {
               </tr>
             </thead>
             <tbody>
-              {useMemo(() => annotated.slice().reverse(), [annotated]).map((t) => (
+              {rows.map((t) => (
                 <tr key={t.id} className="odd:bg-white even:bg-slate-50">
-                  <td className="p-2 border">
-                    {new Date(t.ts).toLocaleTimeString("en-US", {
-                      timeZone: "America/New_York",
-                    }) || "-"}
-                  </td>
+                  <td className="p-2 border">{fmtET(t.ts)}</td>
                   <td className="p-2 border">
                     <span
                       className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold ${
@@ -340,10 +392,14 @@ export default function TradeLogPanel() {
       {showReset && (
         <div
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
-          onClick={(e) => { if (e.target === e.currentTarget) closeReset(); }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeReset();
+          }}
         >
           <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
-            <div className="text-lg font-semibold text-slate-800">Confirm Reset</div>
+            <div className="text-lg font-semibold text-slate-800">
+              Confirm Reset
+            </div>
             <p className="mt-1 text-sm text-slate-600">
               This wipes all trades, positions, and AI picks, and resets the bot balance.
             </p>

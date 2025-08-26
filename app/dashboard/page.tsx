@@ -5,7 +5,6 @@ import { useSession } from "next-auth/react";
 import { Rnd } from "react-rnd";
 import Navbar from "../components/Navbar";
 import { Button } from "../components/ui/button";
-import TradeNarrator from "../components/TradeNarrator";
 import { useBotPoll } from "../components/useBotPoll";
 
 /* ------------------------------
@@ -55,6 +54,89 @@ function Panel({
 }
 
 /* ------------------------------ */
+/* Simple in-page AI Chat component */
+function ChatBox() {
+  const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const scrollId = "ai-chat-scroll";
+
+  useEffect(() => {
+    const el = document.getElementById(scrollId);
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  async function send() {
+    const q = input.trim();
+    if (!q || busy) return;
+    setBusy(true);
+    setMessages((m) => [...m, { role: "user", content: q }]);
+    setInput("");
+
+    try {
+      const r = await fetch("/api/ai-chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: q }),
+      });
+      const j = await r.json();
+      const reply = j?.reply ?? "Hmm, I couldn't parse that.";
+      setMessages((m) => [...m, { role: "assistant", content: reply }]);
+    } catch {
+      setMessages((m) => [...m, { role: "assistant", content: "Error reaching chat API." }]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      <div id={scrollId} className="flex-1 overflow-auto rounded-xl border bg-gray-50 p-3 space-y-2">
+        {!messages.length && (
+          <div className="text-sm text-gray-600">
+            Ask me things like:
+            <br />• what did you trade today?
+            <br />• did you make money today?
+            <br />• are you in a position?
+            <br />• what ticker did you trade today?
+          </div>
+        )}
+        {messages.map((m, i) => (
+          <div
+            key={i}
+            className={`max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-2 text-sm ${
+              m.role === "user" ? "bg-black text-white ml-auto" : "bg-white text-gray-900 border"
+            }`}
+          >
+            {m.content}
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 flex items-center gap-2">
+        <input
+          className="flex-1 rounded-xl border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+          placeholder="Type your question…"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") send();
+          }}
+          disabled={busy}
+        />
+        <button
+          onClick={send}
+          disabled={busy || !input.trim()}
+          className="rounded-xl bg-blue-600 text-white px-4 py-2 text-sm disabled:opacity-60"
+        >
+          {busy ? "Sending…" : "Send"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------ */
 
 interface Stock {
   ticker: string;
@@ -67,18 +149,54 @@ interface Stock {
   employees?: number | null;
 }
 
+/** NOTE: widen the Trade type to allow multiple time field names */
 interface Trade {
-  id: number;
+  id: number | string;
   side: "BUY" | "SELL";
   ticker: string;
   price: number;
   shares: number;
-  createdAt?: string;
+
+  // any of these may exist depending on your API/db
+  createdAt?: string | number | null;
+  time?: string | number | null;
+  ts?: number | null;
+  at?: string | number | null;
+  filledAt?: string | number | null;
+  executedAt?: string | number | null;
 }
 
 interface TradePayload {
   trades: Trade[];
   openPos: { ticker: string; entryPrice: number; shares: number } | null;
+}
+
+/** ---- robust timestamp picker ---- */
+function pickMs(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === "number" && Number.isFinite(v)) {
+    // seconds or ms
+    return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
+  }
+  const n = Number(v);
+  if (Number.isFinite(n)) {
+    return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
+  }
+  const t = new Date(String(v)).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+function formatETFromTrade(t: Trade): string {
+  const ms =
+    pickMs(t.createdAt) ??
+    pickMs(t.time) ??
+    pickMs(t.ts) ??
+    pickMs(t.at) ??
+    pickMs(t.filledAt) ??
+    pickMs(t.executedAt);
+
+  if (!ms) return "-";
+  return new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York" });
 }
 
 export default function Home() {
@@ -171,7 +289,7 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // ---- UPDATED: ask AI for Top 1 & Top 2 picks (new API shape) ----
+  // ---- Ask AI for Top 1 & Top 2 picks ----
   const askAIRecommendation = async () => {
     try {
       setAnalyzing(true);
@@ -190,7 +308,6 @@ export default function Home() {
         return;
       }
 
-      // New API: { picks: ["TOP1","TOP2?"], reasons: {TICK:[...]}, risk: "..." }
       const picks: string[] = Array.isArray(data?.picks) ? data.picks : [];
       const reasons: Record<string, string[]> = data?.reasons || {};
       const risk: string = data?.risk || "";
@@ -303,30 +420,18 @@ export default function Home() {
     topLeft: true,
   };
 
-  // ===== Narrator inputs (UPDATED: no "TBD", prefer open position first) =====
-  const narratorSymbol =
-    tradeData?.openPos?.ticker ??
-    selectedStock ??
-    botData?.lastRec?.ticker ??
-    null;
-
-  const narratorPrice =
-    (narratorSymbol && stocks.find((s) => s.ticker === narratorSymbol)?.price) ??
-    tradeData?.openPos?.entryPrice ??
-    (typeof botData?.lastRec?.price === "number" ? botData.lastRec.price : undefined);
-
-  const autoKey =
-    tradeData?.openPos
-      ? `open:${tradeData.openPos.ticker}@${tradeData.openPos.entryPrice}@${tradeData.openPos.shares}`
-      : narratorSymbol
-      ? `sym:${narratorSymbol}`
-      : undefined;
-
   /* ===== Reset (admin) helpers ===== */
-  const openReset = () => { setResetMsg(null); setResetPassword(""); setShowReset(true); };
-  const closeReset = () => { if (!resetBusy) setShowReset(false); };
+  const openReset = () => {
+    setResetMsg(null);
+    setResetPassword("");
+    setShowReset(true);
+  };
+  const closeReset = () => {
+    if (!resetBusy) setShowReset(false);
+  };
   const confirmReset = async () => {
-    setResetBusy(true); setResetMsg(null);
+    setResetBusy(true);
+    setResetMsg(null);
     try {
       const res = await fetch("/api/bot/reset", {
         method: "POST",
@@ -343,7 +448,10 @@ export default function Home() {
         } catch {}
         setTradeData({ trades: [], openPos: null });
         setResetMsg("✅ Reset complete.");
-        setTimeout(() => { setShowReset(false); window.location.reload(); }, 600);
+        setTimeout(() => {
+          setShowReset(false);
+          window.location.reload();
+        }, 600);
       }
     } catch {
       setResetMsg("Reset error. Check server logs.");
@@ -376,7 +484,8 @@ export default function Home() {
                   <b>AI Pick:</b> {botData.lastRec.ticker}
                 </div>
                 <div>
-                  <b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
+                  <b>Price:</b>{" "}
+                  {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
                 </div>
                 <div>
                   <b>Time:</b>{" "}
@@ -410,8 +519,7 @@ export default function Home() {
                 </div>
                 {botData?.live?.ticker && (
                   <div className="mt-1 text-xs text-gray-600">
-                    Live: {botData.live.ticker}{" "}
-                    {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
+                    Live: {botData.live.ticker} {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
                   </div>
                 )}
               </div>
@@ -436,9 +544,7 @@ export default function Home() {
               {analyzing ? "Analyzing..." : "Ask AI"}
             </Button>
 
-            {recommendation && (
-              <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>
-            )}
+            {recommendation && <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>}
 
             <div className="mt-auto text-xs text-gray-500">
               Server ET:{" "}
@@ -482,7 +588,7 @@ export default function Home() {
             {loading ? (
               <p>Loading live data…</p>
             ) : errorMessage ? (
-              <p className="text-red-600">{errorMessage}</p>
+              <p className="text-red-600"> {errorMessage}</p>
             ) : (
               <div className="flex-1 overflow-auto">
                 <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
@@ -568,17 +674,12 @@ export default function Home() {
 
             <div className="text-sm bg-gray-50 border rounded p-2 mb-2">
               <div>
-                Live:{" "}
-                {statusTick?.live?.ticker
-                  ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}`
-                  : "—"}
+                Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}
               </div>
               <div>
                 Server (ET):{" "}
                 {statusTick?.serverTimeET
-                  ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", {
-                      timeZone: "America/New_York",
-                    })
+                  ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
                   : "—"}
               </div>
             </div>
@@ -588,9 +689,7 @@ export default function Home() {
               <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
                 {statusTick?.lastRec
                   ? `Pick: ${statusTick.lastRec.ticker} @ ${
-                      typeof statusTick.lastRec.price === "number"
-                        ? `$${statusTick.lastRec.price.toFixed(2)}`
-                        : "—"
+                      typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
                     }`
                   : "No recommendation yet — bot is waiting for a valid pick."}
               </div>
@@ -634,8 +733,8 @@ export default function Home() {
               <div className="flex items-center gap-2">
                 {tradeData?.openPos && (
                   <div className="text-sm bg-gray-900 text-white/90 px-2 py-1 rounded-md">
-                    Open: <b>{tradeData.openPos.ticker}</b> @ $
-                    {Number(tradeData.openPos.entryPrice).toFixed(2)} • {tradeData.openPos.shares} sh
+                    Open: <b>{tradeData.openPos.ticker}</b> @ ${Number(tradeData.openPos.entryPrice).toFixed(2)} •{" "}
+                    {tradeData.openPos.shares} sh
                   </div>
                 )}
                 {/* RESET (admin) button — top-right header */}
@@ -664,20 +763,12 @@ export default function Home() {
                 </thead>
                 <tbody>
                   {tradeData.trades.map((t) => (
-                    <tr key={t.id} className="border-b">
-                      <td className="p-2">
-                        {t.createdAt
-                          ? new Date(t.createdAt).toLocaleString("en-US", {
-                              timeZone: "America/New_York",
-                            })
-                          : "-"}
-                      </td>
+                    <tr key={String(t.id)} className="border-b">
+                      <td className="p-2">{formatETFromTrade(t)}</td>
                       <td className="p-2">
                         <span
                           className={`px-2 py-0.5 rounded text-xs ${
-                            t.side === "BUY"
-                              ? "bg-green-100 text-green-700"
-                              : "bg-red-100 text-red-700"
+                            t.side === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
                           }`}
                         >
                           {t.side}
@@ -714,58 +805,31 @@ export default function Home() {
                 />
               </div>
               <div className="flex gap-3 mt-4">
-                <Button
-                  onClick={handleAgent}
-                  className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition"
-                >
+                <Button onClick={handleAgent} className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition">
                   AI Agent
                 </Button>
-                <Button
-                  onClick={handlePickFromChart}
-                  className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition"
-                >
+                <Button onClick={handlePickFromChart} className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition">
                   Pick
                 </Button>
               </div>
               {agentResult && (
-                <div className="mt-4 p-3 bg-gray-100 rounded text-sm whitespace-pre-wrap overflow-y-auto">
-                  {agentResult}
-                </div>
+                <div className="mt-4 p-3 bg-gray-100 rounded text-sm whitespace-pre-wrap overflow-y-auto">{agentResult}</div>
               )}
             </Panel>
           </Rnd>
         )}
 
-        {/* Trade Narrator */}
+        {/* AI Chat panel */}
         <Rnd
           bounds="#content-area"
-          default={{ x: 1460, y: 940, width: 800, height: 320 }}
+          default={{ x: 1460, y: 940, width: 400, height: 480 }}
           minWidth={360}
           minHeight={220}
           enableResizing={resizingConfig}
           className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
         >
-          <Panel title="Trade Narrator" color="rose">
-            {narratorSymbol ? (
-              <TradeNarrator
-                key={narratorSymbol}
-                className="mt-1"
-                autoRunKey={autoKey}
-                input={{
-                  symbol: narratorSymbol,
-                  price: typeof narratorPrice === "number" ? narratorPrice : undefined,
-                  thesis: selectedStock
-                    ? "Explaining selected chart context."
-                    : tradeData?.openPos
-                    ? "Explaining live open position."
-                    : "Explaining latest AI pick context.",
-                }}
-              />
-            ) : (
-              <div className="mt-1 text-sm text-gray-500">
-                Pick a symbol or wait for an AI pick to start narration.
-              </div>
-            )}
+          <Panel title="AI Chat" color="cyan">
+            <ChatBox />
           </Panel>
         </Rnd>
       </div>
@@ -774,7 +838,9 @@ export default function Home() {
       {showReset && (
         <div
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
-          onClick={(e) => { if (e.target === e.currentTarget) closeReset(); }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeReset();
+          }}
         >
           <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
             <div className="text-lg font-semibold text-slate-800">Confirm Reset</div>
@@ -799,11 +865,7 @@ export default function Home() {
             {resetMsg && <div className="mt-3 text-sm">{resetMsg}</div>}
 
             <div className="mt-5 flex items-center justify-end gap-2">
-              <Button
-                disabled={resetBusy}
-                onClick={closeReset}
-                className="border border-slate-300 text-slate-700 bg-white hover:bg-slate-50"
-              >
+              <Button disabled={resetBusy} onClick={closeReset} className="border border-slate-300 text-slate-700 bg-white hover:bg-slate-50">
                 Cancel
               </Button>
               <Button
