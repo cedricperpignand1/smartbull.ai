@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import { Rnd } from "react-rnd";
 import Navbar from "../components/Navbar";
@@ -17,15 +17,7 @@ function Panel({
   children,
 }: {
   title: string;
-  color?:
-    | "blue"
-    | "purple"
-    | "green"
-    | "orange"
-    | "rose"
-    | "slate"
-    | "amber"
-    | "cyan";
+  color?: "blue" | "purple" | "green" | "orange" | "rose" | "slate" | "amber" | "cyan";
   right?: React.ReactNode;
   children: React.ReactNode;
 }) {
@@ -119,9 +111,7 @@ function ChatBox() {
           placeholder="Type your question…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") send();
-          }}
+          onKeyDown={(e) => e.key === "Enter" && send()}
           disabled={busy}
         />
         <button
@@ -137,7 +127,6 @@ function ChatBox() {
 }
 
 /* ------------------------------ */
-
 interface Stock {
   ticker: string;
   price: number;
@@ -149,15 +138,12 @@ interface Stock {
   employees?: number | null;
 }
 
-/** NOTE: widen the Trade type to allow multiple time field names */
 interface Trade {
   id: number | string;
   side: "BUY" | "SELL";
   ticker: string;
   price: number;
   shares: number;
-
-  // any of these may exist depending on your API/db
   createdAt?: string | number | null;
   time?: string | number | null;
   ts?: number | null;
@@ -165,27 +151,20 @@ interface Trade {
   filledAt?: string | number | null;
   executedAt?: string | number | null;
 }
-
 interface TradePayload {
   trades: Trade[];
   openPos: { ticker: string; entryPrice: number; shares: number } | null;
 }
 
-/** ---- robust timestamp picker ---- */
+/* ------------ time helpers ------------- */
 function pickMs(v: unknown): number | null {
   if (v == null) return null;
-  if (typeof v === "number" && Number.isFinite(v)) {
-    // seconds or ms
-    return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
-  }
+  if (typeof v === "number" && Number.isFinite(v)) return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
   const n = Number(v);
-  if (Number.isFinite(n)) {
-    return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
-  }
+  if (Number.isFinite(n)) return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
   const t = new Date(String(v)).getTime();
   return Number.isFinite(t) ? t : null;
 }
-
 function formatETFromTrade(t: Trade): string {
   const ms =
     pickMs(t.createdAt) ??
@@ -194,12 +173,9 @@ function formatETFromTrade(t: Trade): string {
     pickMs(t.at) ??
     pickMs(t.filledAt) ??
     pickMs(t.executedAt);
-
   if (!ms) return "-";
   return new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York" });
 }
-
-// ET YYYY-MM-DD for a JS Date
 function ymdET(d: Date) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
@@ -207,25 +183,57 @@ function ymdET(d: Date) {
     month: "2-digit",
     day: "2-digit",
   }).formatToParts(d);
-  const y = parts.find(p => p.type === "year")!.value;
-  const m = parts.find(p => p.type === "month")!.value;
-  const day = parts.find(p => p.type === "day")!.value;
+  const y = parts.find((p) => p.type === "year")!.value;
+  const m = parts.find((p) => p.type === "month")!.value;
+  const day = parts.find((p) => p.type === "day")!.value;
   return `${y}-${m}-${day}`;
 }
 
+/* ---------- layout helpers (draggable) ---------- */
+type Rect = { x: number; y: number; width: number; height: number };
+type Layout = {
+  chat: Rect;
+  gainers: Rect;
+  tradelog: Rect;
+  botstatus: Rect;
+  airec: Rect;
+};
+const LAYOUT_KEY = "dash_layout_v3";
+
+/** Compute a nice starting layout from container width/height */
+function computeDefaultLayout(w: number, h: number): Layout {
+  const gap = 20; // ~gap-5 look
+  const left = 360;
+  const right1 = 420;
+  const right2 = 420;
+  const center = Math.max(640, w - (left + right1 + right2 + gap * 3));
+  const rowH = Math.floor((h - gap) / 2);
+
+  const x1 = 0; // left
+  const x2 = left + gap; // center
+  const x3 = x2 + center + gap; // right col A
+  const x4 = x3 + right1 + gap; // right col B
+
+  return {
+    chat: { x: x1, y: 0, width: left, height: h },
+    gainers: { x: x2, y: 0, width: center, height: h },
+    tradelog: { x: x3, y: 0, width: right1, height: rowH },
+    botstatus: { x: x3, y: rowH + gap, width: right1, height: rowH },
+    airec: { x: x4, y: 0, width: right2, height: h },
+  };
+}
+
+/* ====================================== */
+
 export default function Home() {
   const { data: session, status } = useSession();
-
-  if (status === "loading") {
-    return <div className="flex items-center justify-center h-screen">Loading...</div>;
-  }
-  if (!session) {
+  if (status === "loading") return <div className="flex items-center justify-center h-screen">Loading...</div>;
+  if (!session)
     return (
       <div className="flex items-center justify-center h-screen">
         <p className="text-lg font-bold">You need to log in to access this page.</p>
       </div>
     );
-  }
 
   // ---- Stocks & AI analysis ----
   const [stocks, setStocks] = useState<Stock[]>([]);
@@ -246,20 +254,8 @@ export default function Home() {
   const [botData, setBotData] = useState<any>(null);
   const [tradeData, setTradeData] = useState<TradePayload | null>(null);
 
-  // Pull tradesToday from hook (and use local fallback if needed)
-  const {
-    tick: statusTick,
-    tradesToday: statusTradesToday,
-    error: statusError,
-  } = useBotPoll(5000);
-
-  // ---- Reset (admin) modal state ----
-  const [showReset, setShowReset] = useState(false);
-  const [resetPassword, setResetPassword] = useState("");
-  const [resetBusy, setResetBusy] = useState(false);
-  const [resetMsg, setResetMsg] = useState<string | null>(null);
-
-  const HEADERS = ["Symbol", "Price", "Change %", "Market Cap", "Float", "Volume", "Avg Vol", "Employees"];
+  // Pull tradesToday from hook (with local fallback)
+  const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
 
   // Live stocks via SSE
   useEffect(() => {
@@ -273,9 +269,7 @@ export default function Home() {
         setLoading(false);
       } catch {}
     };
-    es.onerror = () => {
-      setErrorMessage("Live stream error. Retrying...");
-    };
+    es.onerror = () => setErrorMessage("Live stream error. Retrying...");
     return () => es.close();
   }, []);
 
@@ -322,7 +316,6 @@ export default function Home() {
       });
 
       const data = await res.json();
-
       if (!res.ok || data?.errorMessage) {
         setRecommendation(`Error: ${data?.errorMessage || res.statusText}`);
         return;
@@ -335,22 +328,17 @@ export default function Home() {
       const lines: string[] = [];
       if (picks[0]) {
         lines.push(`Top 1: ${picks[0]}`);
-        if (Array.isArray(reasons[picks[0]]) && reasons[picks[0]].length) {
-          lines.push(`  • ${reasons[picks[0]].join("\n  • ")}`);
-        }
+        if (Array.isArray(reasons[picks[0]]) && reasons[picks[0]].length) lines.push(`  • ${reasons[picks[0]].join("\n  • ")}`);
       }
       if (picks[1]) {
         lines.push("");
         lines.push(`Top 2: ${picks[1]}`);
-        if (Array.isArray(reasons[picks[1]]) && reasons[picks[1]].length) {
-          lines.push(`  • ${reasons[picks[1]].join("\n  • ")}`);
-        }
+        if (Array.isArray(reasons[picks[1]]) && reasons[picks[1]].length) lines.push(`  • ${reasons[picks[1]].join("\n  • ")}`);
       }
       if (risk) {
         lines.push("");
         lines.push(`Risk: ${risk}`);
       }
-
       setRecommendation(lines.join("\n") || "No recommendation.");
     } catch {
       setRecommendation("Failed to analyze stocks. Check server logs.");
@@ -359,6 +347,7 @@ export default function Home() {
     }
   };
 
+  /* ---- chart helpers ---- */
   const handleStockClick = (ticker: string) => {
     setSelectedStock(ticker);
     setChartVisible(true);
@@ -366,13 +355,11 @@ export default function Home() {
     setAgentBuyPrice(null);
     setAgentSellPrice(null);
   };
-
   const closeChart = () => {
     setChartVisible(false);
     setSelectedStock(null);
     setAgentResult(null);
   };
-
   const handleAgent = async () => {
     try {
       const res = await fetch("/api/chart-analyze", {
@@ -393,7 +380,6 @@ export default function Home() {
       alert("Error analyzing the chart.");
     }
   };
-
   const handlePickFromChart = () => {
     if (!selectedStock) return;
     const saved = localStorage.getItem("pnlRows");
@@ -435,23 +421,12 @@ export default function Home() {
     alert(`Added ${selectedStock} to your P&L with Buy: ${agentBuyPrice}, Sell: ${agentSellPrice}`);
   };
 
-  const resizingConfig = {
-    top: true,
-    right: true,
-    bottom: true,
-    left: true,
-    topRight: true,
-    bottomRight: true,
-    bottomLeft: true,
-    topLeft: true,
-  };
+  // ===== Reset (admin) modal =====
+  const [showReset, setShowReset] = useState(false);
+  const [resetPassword, setResetPassword] = useState("");
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetMsg, setResetMsg] = useState<string | null>(null);
 
-  /* ===== Reset (admin) helpers ===== */
-  const openReset = () => {
-    setResetMsg(null);
-    setResetPassword("");
-    setShowReset(true);
-  };
   const closeReset = () => {
     if (!resetBusy) setShowReset(false);
   };
@@ -471,6 +446,7 @@ export default function Home() {
         try {
           localStorage.removeItem("tradeLog_allTime_v2_fifo");
           localStorage.removeItem("pnlRows");
+          localStorage.removeItem(LAYOUT_KEY);
         } catch {}
         setTradeData({ trades: [], openPos: null });
         setResetMsg("✅ Reset complete.");
@@ -486,7 +462,7 @@ export default function Home() {
     }
   };
 
-  // Fallback: compute today's trades from /api/trades if hook's tradesToday is missing/wrong
+  // ======= compute today's trade count (fallback) =======
   const todayTradeCount = useMemo(() => {
     if (Array.isArray(statusTradesToday)) return statusTradesToday.length;
     const all = tradeData?.trades || [];
@@ -495,361 +471,457 @@ export default function Home() {
     let n = 0;
     for (const t of all) {
       const ms =
-        pickMs(t.createdAt) ??
-        pickMs(t.time) ??
-        pickMs(t.ts) ??
-        pickMs(t.at) ??
-        pickMs(t.filledAt) ??
-        pickMs(t.executedAt);
+        pickMs(t.createdAt) ?? pickMs(t.time) ?? pickMs(t.ts) ?? pickMs(t.at) ?? pickMs(t.filledAt) ?? pickMs(t.executedAt);
       if (!ms) continue;
-      const k = ymdET(new Date(ms));
-      if (k === todayKey) n++;
+      if (ymdET(new Date(ms)) === todayKey) n++;
     }
     return n;
   }, [statusTradesToday, tradeData]);
 
+  /* ====== draggable dashboard state ====== */
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [container, setContainer] = useState<{ w: number; h: number } | null>(null);
+  const [layout, setLayout] = useState<Layout | null>(null);
+
+  // measure container + restore/save layout
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+
+    const read = () => {
+      const r = el.getBoundingClientRect();
+      setContainer({ w: Math.round(r.width), h: Math.round(r.height) });
+    };
+    read();
+
+    const ro = new ResizeObserver(read);
+    ro.observe(el);
+
+    // try restore
+    try {
+      const raw = localStorage.getItem(LAYOUT_KEY);
+      if (raw) setLayout(JSON.parse(raw));
+    } catch {}
+
+    const onResize = () => read();
+    window.addEventListener("resize", onResize);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", onResize);
+    };
+  }, []);
+
+  // whenever container measured and no saved layout, create defaults
+  useEffect(() => {
+    if (!container) return;
+    if (!layout) {
+      setLayout(computeDefaultLayout(container.w, container.h));
+    }
+  }, [container, layout]);
+
+  const saveLayout = (next: Layout) => {
+    setLayout(next);
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(next));
+    } catch {}
+  };
+
+  const resizingConfig = {
+    top: true,
+    right: true,
+    bottom: true,
+    left: true,
+    topRight: true,
+    bottomRight: true,
+    bottomLeft: true,
+    topLeft: true,
+  };
+
+  const HEADERS = ["Symbol", "Price", "Change %", "Market Cap", "Float", "Volume", "Avg Vol", "Employees"];
+
   return (
     <main className="min-h-screen w-full bg-gray-100 flex flex-col">
       <Navbar />
+
+      {/* Content area is the bounds for all Rnd panels */}
       <div
         id="content-area"
-        className="flex-1 relative pt-20 px-4 overflow-auto"
-        style={{ minWidth: 1800, minHeight: 1300 }}
+        ref={contentRef}
+        className="relative flex-1 px-4 pt-20 overflow-hidden"
+        // 112px ~= navbar+padding; adjust if your Navbar is different
+        style={{ height: "calc(100vh - 112px)" }}
       >
-        {/* AI Recommendation */}
-        <Rnd
-          bounds="#content-area"
-          default={{ x: 16, y: 0, width: 420, height: 650 }}
-          minWidth={340}
-          minHeight={260}
-          enableResizing={resizingConfig}
-          className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
-        >
-          <Panel title="AI Recommendation" color="blue">
-            {botData?.lastRec ? (
-              <div className="mb-3 text-sm border rounded p-2 bg-gray-50">
-                <div>
-                  <b>AI Pick:</b> {botData.lastRec.ticker}
-                </div>
-                <div>
-                  <b>Price:</b>{" "}
-                  {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
-                </div>
-                <div>
-                  <b>Time:</b>{" "}
-                  {botData.lastRec.at
-                    ? new Date(botData.lastRec.at).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                    : "—"}{" "}
-                  ET
-                </div>
-              </div>
-            ) : (
-              <div className="text-gray-500 text-sm mb-3">
-                {botData?.skipped === "market_closed"
-                  ? "Market closed. Waiting for next session."
-                  : "No recommendation yet today."}
-              </div>
-            )}
+        {/* Guard: wait until we have layout computed */}
+        {layout && (
+          <>
+            {/* Chat (left tall) */}
+            <Rnd
+              bounds="#content-area"
+              default={{ x: layout.chat.x, y: layout.chat.y, width: layout.chat.width, height: layout.chat.height }}
+              enableResizing={resizingConfig}
+              onDragStop={(_, d) => saveLayout({ ...layout, chat: { ...layout.chat, x: d.x, y: d.y } })}
+              onResizeStop={(_, __, ref, delta, pos) =>
+                saveLayout({
+                  ...layout,
+                  chat: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
+                })
+              }
+              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+            >
+              <Panel title="AI Chat" color="cyan">
+                <ChatBox />
+              </Panel>
+            </Rnd>
 
-            {botData?.state && (
-              <div className="mb-3 text-sm border rounded p-2">
-                <div>
-                  Money I Have: <b>${Number(botData.state.cash).toFixed(2)}</b>
-                </div>
-                <div>
-                  Equity: <b>${Number(botData.state.equity).toFixed(2)}</b>
-                </div>
-                <div>
-                  PNL:{" "}
-                  <b className={Number(botData.state.pnl) >= 0 ? "text-green-600" : "text-red-600"}>
-                    {Number(botData.state.pnl) >= 0 ? "+" : ""}${Number(botData.state.pnl).toFixed(2)}
-                  </b>
-                </div>
-                {botData?.live?.ticker && (
-                  <div className="mt-1 text-xs text-gray-600">
-                    Live: {botData.live.ticker} {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
+            {/* Top Gainers (center tall) */}
+            <Rnd
+              bounds="#content-area"
+              default={{
+                x: layout.gainers.x,
+                y: layout.gainers.y,
+                width: layout.gainers.width,
+                height: layout.gainers.height,
+              }}
+              enableResizing={resizingConfig}
+              onDragStop={(_, d) => saveLayout({ ...layout, gainers: { ...layout.gainers, x: d.x, y: d.y } })}
+              onResizeStop={(_, __, ref, delta, pos) =>
+                saveLayout({
+                  ...layout,
+                  gainers: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
+                })
+              }
+              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+            >
+              <Panel
+                title="Top Gainers"
+                color="purple"
+                right={
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-1 rounded-md text-xs font-semibold bg-gray-900 text-white/90">
+                      {dataSource || "FMP (stream)"}
+                    </span>
+                    <Button
+                      onClick={askAIRecommendation}
+                      disabled={analyzing || stocks.length === 0}
+                      className="px-3 py-1 bg-gray-900 text-white hover:bg-gray-800 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                      title={stocks.length === 0 ? "No stocks loaded yet" : "Send current list to AI (returns Top 1 & Top 2)"}
+                    >
+                      {analyzing ? "Analyzing..." : "Ask AI"}
+                    </Button>
+                  </div>
+                }
+              >
+                {loading ? (
+                  <p>Loading live data…</p>
+                ) : errorMessage ? (
+                  <p className="text-red-600">{errorMessage}</p>
+                ) : (
+                  <div className="h-full overflow-auto">
+                    <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
+                      <thead>
+                        <tr className="bg-black text-white">
+                          {HEADERS.map((h, idx) => (
+                            <th
+                              key={h}
+                              className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === HEADERS.length - 1 ? "rounded-r-xl" : ""}`}
+                            >
+                              {h}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {stocks.map((stock) => (
+                          <tr
+                            key={stock.ticker}
+                            className="group cursor-pointer"
+                            onClick={() => handleStockClick(stock.ticker)}
+                          >
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
+                              {stock.ticker}
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                              {stock.price != null ? `$${Number(stock.price).toFixed(2)}` : "-"}
+                            </td>
+                            <td
+                              className={`px-3 py-2 bg-white ring-1 ring-gray-200 font-medium ${
+                                stock.changesPercentage >= 0 ? "text-green-600" : "text-red-600"
+                              }`}
+                            >
+                              {stock.changesPercentage?.toFixed?.(2) ?? "-"}%
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                              {stock.marketCap != null ? Number(stock.marketCap).toLocaleString() : "-"}
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                              {stock.sharesOutstanding != null ? Number(stock.sharesOutstanding).toLocaleString() : "-"}
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                              {stock.volume != null ? Number(stock.volume).toLocaleString() : "-"}
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                              {stock.avgVolume != null ? Number(stock.avgVolume).toLocaleString() : "-"}
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">
+                              {stock.employees != null ? Number(stock.employees).toLocaleString() : "-"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 )}
-              </div>
-            )}
+              </Panel>
+            </Rnd>
 
-            {botData?.signals && (
-              <div className="mt-2 text-xs bg-gray-50 border rounded p-2">
-                <div className="font-semibold">Signals</div>
-                <div>Armed: {String(botData.signals.armed)}</div>
-                <div>OR High: {botData.signals.orHigh ?? "-"}</div>
-                <div>VWAP: {botData.signals.vwap ? Number(botData.signals.vwap).toFixed(2) : "-"}</div>
-                <div>VolPulse: {botData.signals.volPulse ? Number(botData.signals.volPulse).toFixed(2) : "-"}</div>
-              </div>
-            )}
-
-            <Button
-              onClick={askAIRecommendation}
-              disabled={analyzing || stocks.length === 0}
-              className="mt-3 px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
-              title={stocks.length === 0 ? "No stocks loaded yet" : "Send current list to AI (returns Top 1 & Top 2)"}
+            {/* Trade Log (top-right) */}
+            <Rnd
+              bounds="#content-area"
+              default={{
+                x: layout.tradelog.x,
+                y: layout.tradelog.y,
+                width: layout.tradelog.width,
+                height: layout.tradelog.height,
+              }}
+              enableResizing={resizingConfig}
+              onDragStop={(_, d) => saveLayout({ ...layout, tradelog: { ...layout.tradelog, x: d.x, y: d.y } })}
+              onResizeStop={(_, __, ref, delta, pos) =>
+                saveLayout({
+                  ...layout,
+                  tradelog: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
+                })
+              }
+              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
             >
-              {analyzing ? "Analyzing..." : "Ask AI"}
-            </Button>
+              <Panel
+                title="Trade Log"
+                color="orange"
+                right={
+                  <div className="flex items-center gap-2">
+                    {tradeData?.openPos && (
+                      <div className="text-sm bg-gray-900 text-white/90 px-2 py-1 rounded-md">
+                        Open: <b>{tradeData.openPos.ticker}</b> @ ${Number(tradeData.openPos.entryPrice).toFixed(2)} •{" "}
+                        {tradeData.openPos.shares} sh
+                      </div>
+                    )}
+                    <Button
+                      onClick={() => setShowReset(true)}
+                      className="bg-rose-600 hover:bg-rose-700 text-white text-sm px-3 py-1 rounded-md"
+                      title="Reset trades/positions/recs (admin)"
+                    >
+                      Reset (admin)
+                    </Button>
+                  </div>
+                }
+              >
+                {!tradeData?.trades?.length ? (
+                  <p className="text-gray-500 text-sm">No trades yet.</p>
+                ) : (
+                  <div className="h-full overflow-auto">
+                    <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
+                      <thead>
+                        <tr className="bg-black text-white">
+                          {["Time (ET)", "Side", "Ticker", "Price", "Shares"].map((h, idx, arr) => (
+                            <th
+                              key={h}
+                              className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}
+                            >
+                              {h}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {tradeData.trades.map((t) => (
+                          <tr key={String(t.id)} className="group">
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
+                              {formatETFromTrade(t)}
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                              <span
+                                className={`px-2 py-0.5 rounded text-xs font-semibold ${
+                                  t.side === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                                }`}
+                              >
+                                {t.side}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">{t.ticker}</td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">${Number(t.price).toFixed(2)}</td>
+                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">{t.shares}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </Panel>
+            </Rnd>
 
-            {recommendation && <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>}
+            {/* Bot Status (bottom-right) */}
+            <Rnd
+              bounds="#content-area"
+              default={{
+                x: layout.botstatus.x,
+                y: layout.botstatus.y,
+                width: layout.botstatus.width,
+                height: layout.botstatus.height,
+              }}
+              enableResizing={resizingConfig}
+              onDragStop={(_, d) => saveLayout({ ...layout, botstatus: { ...layout.botstatus, x: d.x, y: d.y } })}
+              onResizeStop={(_, __, ref, delta, pos) =>
+                saveLayout({
+                  ...layout,
+                  botstatus: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
+                })
+              }
+              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+            >
+              <Panel title="Bot Status" color="green">
+                {statusError && <p className="text-red-600 text-sm">Error: {statusError}</p>}
 
-            <div className="mt-auto text-xs text-gray-500">
-              Server ET:{" "}
-              {botData?.serverTimeET
-                ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", {
-                    timeZone: "America/New_York",
-                  })
-                : "…"}
-            </div>
-          </Panel>
-        </Rnd>
+                <div className="rounded-lg px-3 py-2 text-sm mb-3 bg-gray-50 border">
+                  {(statusTick as any)?.debug?.lastMessage ?? "Waiting for next update…"}
+                  <div className="mt-1 text-[11px] text-gray-500 space-x-3">
+                    {typeof statusTick?.info?.snapshotAgeMs === "number" && (
+                      <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>
+                    )}
+                    {typeof statusTick?.info?.inEntryWindow === "boolean" && (
+                      <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>
+                    )}
+                  </div>
+                </div>
 
-        {/* Top Gainers (SSE) */}
-        <Rnd
-          bounds="#content-area"
-          default={{ x: 460, y: 0, width: 980, height: 900 }}
-          minWidth={700}
-          minHeight={520}
-          enableResizing={resizingConfig}
-          className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
-        >
-          <Panel
-            title="Top Gainers"
-            color="purple"
-            right={
-              <div className="flex items-center gap-2">
-                <span className="px-2 py-1 rounded-md text-xs font-semibold bg-gray-900 text-white/90">
-                  {dataSource || "FMP (stream)"}
-                </span>
+                <div className="text-sm bg-gray-50 border rounded p-2 mb-2">
+                  <div>Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}</div>
+                  <div>
+                    Server (ET):{" "}
+                    {statusTick?.serverTimeET
+                      ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+                      : "—"}
+                  </div>
+                </div>
+
+                <div className="text-xs">
+                  <div className="font-semibold mb-1">Last Recommendation</div>
+                  <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
+                    {statusTick?.lastRec
+                      ? `Pick: ${statusTick.lastRec.ticker} @ ${
+                          typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
+                        }`
+                      : "No recommendation yet — bot is waiting for a valid pick."}
+                  </div>
+                </div>
+
+                <div className="text-xs mt-3">
+                  <div className="font-semibold mb-1">Open Position</div>
+                  <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
+                    {statusTick?.position
+                      ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(
+                          statusTick.position.entryPrice
+                        ).toFixed(2)}`
+                      : "No open position — bot will enter only if conditions are met during the entry window."}
+                  </div>
+                </div>
+
+                <div className="text-xs mt-3">
+                  <div className="font-semibold mb-1">Recent Trades</div>
+                  <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
+                    {todayTradeCount
+                      ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).`
+                      : "No trades executed yet today."}
+                  </div>
+                </div>
+              </Panel>
+            </Rnd>
+
+            {/* AI Recommendation (rightmost tall) */}
+            <Rnd
+              bounds="#content-area"
+              default={{
+                x: layout.airec.x,
+                y: layout.airec.y,
+                width: layout.airec.width,
+                height: layout.airec.height,
+              }}
+              enableResizing={resizingConfig}
+              onDragStop={(_, d) => saveLayout({ ...layout, airec: { ...layout.airec, x: d.x, y: d.y } })}
+              onResizeStop={(_, __, ref, delta, pos) =>
+                saveLayout({
+                  ...layout,
+                  airec: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
+                })
+              }
+              className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+            >
+              <Panel title="AI Recommendation" color="blue">
+                {botData?.lastRec ? (
+                  <div className="mb-3 text-sm border rounded p-2 bg-gray-50">
+                    <div><b>AI Pick:</b> {botData.lastRec.ticker}</div>
+                    <div><b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}</div>
+                    <div>
+                      <b>Time:</b>{" "}
+                      {botData.lastRec.at
+                        ? new Date(botData.lastRec.at).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+                        : "—"}{" "}
+                      ET
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-gray-500 text-sm mb-3">
+                    {botData?.skipped === "market_closed" ? "Market closed. Waiting for next session." : "No recommendation yet today."}
+                  </div>
+                )}
+
+                {botData?.state && (
+                  <div className="mb-3 text-sm border rounded p-2">
+                    <div>Money I Have: <b>${Number(botData.state.cash).toFixed(2)}</b></div>
+                    <div>Equity: <b>${Number(botData.state.equity).toFixed(2)}</b></div>
+                    <div>
+                      PNL:{" "}
+                      <b className={Number(botData.state.pnl) >= 0 ? "text-green-600" : "text-red-600"}>
+                        {Number(botData.state.pnl) >= 0 ? "+" : ""}${Number(botData.state.pnl).toFixed(2)}
+                      </b>
+                    </div>
+                    {botData?.live?.ticker && (
+                      <div className="mt-1 text-xs text-gray-600">
+                        Live: {botData.live.ticker} {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <Button
                   onClick={askAIRecommendation}
                   disabled={analyzing || stocks.length === 0}
-                  className="px-3 py-1 bg-gray-900 text-white hover:bg-gray-800 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="mt-3 px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
                   title={stocks.length === 0 ? "No stocks loaded yet" : "Send current list to AI (returns Top 1 & Top 2)"}
                 >
                   {analyzing ? "Analyzing..." : "Ask AI"}
                 </Button>
-              </div>
-            }
-          >
-            {loading ? (
-              <p>Loading live data…</p>
-            ) : errorMessage ? (
-              <p className="text-red-600"> {errorMessage}</p>
-            ) : (
-              <div className="flex-1 overflow-auto">
-                <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
-                  <thead>
-                    <tr className="bg-black text-white">
-                      {HEADERS.map((h, idx) => (
-                        <th
-                          key={h}
-                          className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === HEADERS.length - 1 ? "rounded-r-xl" : ""}`}
-                        >
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stocks.map((stock) => (
-                      <tr
-                        key={stock.ticker}
-                        className="group cursor-pointer"
-                        onClick={() => handleStockClick(stock.ticker)}
-                      >
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
-                          {stock.ticker}
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                          {stock.price != null ? `$${Number(stock.price).toFixed(2)}` : "-"}
-                        </td>
-                        <td
-                          className={`px-3 py-2 bg-white ring-1 ring-gray-200 font-medium ${
-                            stock.changesPercentage >= 0 ? "text-green-600" : "text-red-600"
-                          }`}
-                        >
-                          {stock.changesPercentage?.toFixed?.(2) ?? "-"}%
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                          {stock.marketCap != null ? Number(stock.marketCap).toLocaleString() : "-"}
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                          {stock.sharesOutstanding != null ? Number(stock.sharesOutstanding).toLocaleString() : "-"}
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                          {stock.volume != null ? Number(stock.volume).toLocaleString() : "-"}
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                          {stock.avgVolume != null ? Number(stock.avgVolume).toLocaleString() : "-"}
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">
-                          {stock.employees != null ? Number(stock.employees).toLocaleString() : "-"}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </Panel>
-        </Rnd>
 
-        {/* Bot Status */}
-        <Rnd
-          bounds="#content-area"
-          default={{ x: 16, y: 700, width: 420, height: 420 }}
-          minWidth={320}
-          minHeight={220}
-          enableResizing={resizingConfig}
-          className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
-        >
-          <Panel title="Bot Status" color="green">
-            {statusError && <p className="text-red-600 text-sm">Error: {statusError}</p>}
+                {recommendation && <div className="mt-4 text-sm whitespace-pre-wrap">{recommendation}</div>}
 
-            <div className="rounded-lg px-3 py-2 text-sm mb-3 bg-gray-50 border">
-              {(statusTick as any)?.debug?.lastMessage ?? "Waiting for next update…"}
-              <div className="mt-1 text-[11px] text-gray-500 space-x-3">
-                {typeof statusTick?.info?.snapshotAgeMs === "number" && (
-                  <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>
-                )}
-                {typeof statusTick?.info?.inEntryWindow === "boolean" && (
-                  <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>
-                )}
-              </div>
-            </div>
+                <div className="mt-auto text-xs text-gray-500">
+                  Server ET:{" "}
+                  {botData?.serverTimeET
+                    ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+                    : "…"}
+                </div>
+              </Panel>
+            </Rnd>
+          </>
+        )}
 
-            <div className="text-sm bg-gray-50 border rounded p-2 mb-2">
-              <div>
-                Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}
-              </div>
-              <div>
-                Server (ET):{" "}
-                {statusTick?.serverTimeET
-                  ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                  : "—"}
-              </div>
-            </div>
-
-            <div className="text-xs">
-              <div className="font-semibold mb-1">Last Recommendation</div>
-              <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
-                {statusTick?.lastRec
-                  ? `Pick: ${statusTick.lastRec.ticker} @ ${
-                      typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
-                    }`
-                  : "No recommendation yet — bot is waiting for a valid pick."}
-              </div>
-            </div>
-
-            <div className="text-xs mt-3">
-              <div className="font-semibold mb-1">Open Position</div>
-              <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
-                {statusTick?.position
-                  ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(
-                      statusTick.position.entryPrice
-                    ).toFixed(2)}`
-                  : "No open position — bot will enter only if conditions are met during the entry window."}
-              </div>
-            </div>
-
-            <div className="text-xs mt-3">
-              <div className="font-semibold mb-1">Recent Trades</div>
-              <div className="text-[11px] bg-gray-50 p-2 rounded min-h-[40px]">
-                {todayTradeCount
-                  ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).`
-                  : "No trades executed yet today."}
-              </div>
-            </div>
-          </Panel>
-        </Rnd>
-
-        {/* Trade Log — modernized like Top Gainers */}
-        <Rnd
-          bounds="#content-area"
-          default={{ x: 460, y: 940, width: 760, height: 280 }}
-          minWidth={520}
-          minHeight={220}
-          enableResizing={resizingConfig}
-          className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
-        >
-          <Panel
-            title="Trade Log"
-            color="orange"
-            right={
-              <div className="flex items-center gap-2">
-                {tradeData?.openPos && (
-                  <div className="text-sm bg-gray-900 text-white/90 px-2 py-1 rounded-md">
-                    Open: <b>{tradeData.openPos.ticker}</b> @ ${Number(tradeData.openPos.entryPrice).toFixed(2)} •{" "}
-                    {tradeData.openPos.shares} sh
-                  </div>
-                )}
-                <Button
-                  onClick={openReset}
-                  className="bg-rose-600 hover:bg-rose-700 text-white text-sm px-3 py-1 rounded-md"
-                  title="Reset trades/positions/recs (admin)"
-                >
-                  Reset (admin)
-                </Button>
-              </div>
-            }
-          >
-            {!tradeData?.trades?.length ? (
-              <p className="text-gray-500 text-sm">No trades yet.</p>
-            ) : (
-              <div className="flex-1 overflow-auto">
-                <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
-                  <thead>
-                    <tr className="bg-black text-white">
-                      {["Time (ET)", "Side", "Ticker", "Price", "Shares"].map((h, idx, arr) => (
-                        <th
-                          key={h}
-                          className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}
-                        >
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tradeData.trades.map((t) => (
-                      <tr key={String(t.id)} className="group">
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
-                          {formatETFromTrade(t)}
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                          <span
-                            className={`px-2 py-0.5 rounded text-xs font-semibold ${
-                              t.side === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
-                            }`}
-                          >
-                            {t.side}
-                          </span>
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">{t.ticker}</td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                          ${Number(t.price).toFixed(2)}
-                        </td>
-                        <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">{t.shares}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </Panel>
-        </Rnd>
-
-        {/* TradingView Chart */}
+        {/* ===== TradingView Chart — draggable overlay ===== */}
         {chartVisible && selectedStock && (
           <Rnd
             bounds="#content-area"
-            default={{ x: 1460, y: 0, width: 800, height: 900 }}
+            default={{ x: (container?.w || 1200) - 880, y: (container?.h || 800) - 580, width: 860, height: 560 }}
             minWidth={420}
             minHeight={260}
             enableResizing={resizingConfig}
-            className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
+            className="rounded-2xl border border-zinc-200/60 shadow-lg z-50 bg-transparent"
           >
             <Panel
               title={`${selectedStock} Chart`}
@@ -887,20 +959,6 @@ export default function Home() {
             </Panel>
           </Rnd>
         )}
-
-        {/* AI Chat panel */}
-        <Rnd
-          bounds="#content-area"
-          default={{ x: 1460, y: 940, width: 400, height: 480 }}
-          minWidth={360}
-          minHeight={220}
-          enableResizing={resizingConfig}
-          className="rounded-2xl border border-zinc-200/60 shadow-none z-40 bg-transparent"
-        >
-          <Panel title="AI Chat" color="cyan">
-            <ChatBox />
-          </Panel>
-        </Rnd>
       </div>
 
       {/* ===== Password Modal (Reset admin) ===== */}
