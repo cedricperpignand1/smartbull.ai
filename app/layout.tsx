@@ -1,18 +1,10 @@
+// app/layout.tsx
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "geist/font";
+import { GeistSans } from "geist/font/sans";
+import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 import SessionProviderWrapper from "../providers/SessionProviderWrapper";
 import AuthGuard from "../components/AuthGuard";
-
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
 
 export const metadata: Metadata = {
   title: "SmartBull.ai",
@@ -26,9 +18,8 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
+      {/* NOTE: fonts are objects, not functions */}
+      <body className={`${GeistSans.className} ${GeistMono.variable} antialiased`}>
         <SessionProviderWrapper>
           <AuthGuard>{children}</AuthGuard>
         </SessionProviderWrapper>
