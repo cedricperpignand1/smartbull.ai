@@ -16,6 +16,8 @@ import {
   premarketRangeISO,
   computePremarketLevelsFromBars,
   spreadGuardOK,
+  // NEW: fetch real Alpaca balances
+  getAccount,
 } from "@/lib/alpaca";
 
 /** ───────────────── Throttle / Coalesce ───────────────── */
@@ -117,7 +119,6 @@ type SnapStock = {
   volume?: number | null;
   avgVolume?: number | null;
   marketCap?: number | null;
-  // Optional float if your snapshot includes it
   float?: number | null;
 };
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
@@ -340,8 +341,8 @@ function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
 }
 function computeDayHighSoFar(candles: Candle[], todayYMD: string) {
   const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
-  if (day.length < 2) return null;
   const prior = day.slice(0, -1);
+  if (!prior.length) return null;
   return Math.max(...prior.map((c) => c.high));
 }
 
@@ -488,6 +489,12 @@ async function handle(req: Request) {
     let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
     let livePrice: number | null = null;
 
+    // NEW: fetch real Alpaca balances for display
+    let alpacaAccount: any = null;
+    try {
+      alpacaAccount = await getAccount(); // { cash, equity, buying_power, portfolio_value, ... }
+    } catch { /* ignore: UI will handle null */ }
+
     const today = yyyyMmDdET();
 
     /** ── Mandatory exit after 15:55 ET ── */
@@ -530,7 +537,24 @@ async function handle(req: Request) {
       debug.reasons.push("not_weekday");
       return {
         state, lastRec, position: openPos, live: null,
-        serverTimeET: nowET().toISOString(), skipped: "not_weekday", debug,
+        serverTimeET: nowET().toISOString(), skipped: "not_weekday",
+        account: alpacaAccount,
+        budget: { investPerTrade: INVEST_BUDGET },
+        info: {
+          prescan_0914_0929: inPreScanWindow(),
+          scan_0930_0944: inScanWindow(),
+          force_0945_0946: inForceWindow(),
+          requireAiPick: REQUIRE_AI_PICK,
+          targetPct: TARGET_PCT,
+          stopPct: STOP_PCT,
+          aiFreshnessMs: FRESHNESS_MS,
+          liquidity: {
+            minSharesAbs: MIN_SHARES_ABS,
+            floatPctPerMin: FLOAT_MIN_PCT_PER_MIN,
+            minDollarVol: MIN_DOLLAR_VOL,
+          },
+        },
+        debug,
       };
     }
     const marketOpen = isMarketHoursET();
@@ -647,9 +671,9 @@ async function handle(req: Request) {
         }
         debug[`scan_signals_${ticker}`] = {
           aboveVWAP, volPulse: vol?.mult ?? null, VOL_MULT_MIN,
-          breakORH, nearOR, NEAR_OR_PCT, vwapRecl, VWAP_RECLAIM_BAND,
-          signalCount, mSince930: m
-        };
+  breakORH, nearOR, NEAR_OR_PCT, vwapRecl, VWAP_RECLAIM_BAND,
+  signalCount, mSince930: m
+};
 
         if (!armed) return false;
 
@@ -1040,6 +1064,9 @@ async function handle(req: Request) {
       position: openPos,
       live: { ticker: openPos?.ticker ?? lastRec?.ticker ?? null, price: livePrice },
       serverTimeET: nowET().toISOString(),
+      // NEW: surface real Alpaca balances + fixed budget for the UI
+      account: alpacaAccount,
+      budget: { investPerTrade: INVEST_BUDGET },
       info: {
         prescan_0914_0929: inPreScanWindow(),
         scan_0930_0944: inScanWindow(),

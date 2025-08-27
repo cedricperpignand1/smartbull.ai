@@ -160,6 +160,17 @@ interface TradePayload {
   openPos: { ticker: string; entryPrice: number; shares: number } | null;
 }
 
+/** ---- Alpaca account types (for real balances/PnL) ---- */
+type AlpacaAccount = {
+  cash: number | null;
+  equity: number | null;
+  last_equity: number | null;
+  buying_power: number | null;
+  day_pnl: number | null;
+  day_pnl_pct: number | null;
+  timestampET: string;
+};
+
 /* =========================================================
    Time helpers
    ========================================================= */
@@ -209,12 +220,7 @@ type Layout = {
 
 const LAYOUT_KEY = "dash_layout_v5";
 
-/** Defaults tuned to your last screenshot:
- *  - Chat wider (460px)
- *  - Gainers large center
- *  - Trade Log top-right wide
- *  - AI Rec + Bot Status bottom-right halves, shorter (less white space)
- */
+/** Defaults tuned to your last screenshot */
 function computeDefaultLayout(w: number, h: number): Layout {
   const gap = 22;          // spacing between boxes
   const left = 460;        // AI Chat width (wider)
@@ -273,6 +279,9 @@ export default function Home() {
   const [tradeData, setTradeData] = useState<TradePayload | null>(null);
   const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
 
+  // ---- NEW: real Alpaca account state ----
+  const [alpaca, setAlpaca] = useState<AlpacaAccount | null>(null);
+
   // SSE: stocks
   useEffect(() => {
     const es = new EventSource("/api/stocks/stream");
@@ -304,7 +313,7 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // Poll /api/trades
+  // Poll /api/trades (today by default from your backend)
   useEffect(() => {
     let id: any;
     const run = async () => {
@@ -316,6 +325,21 @@ export default function Home() {
     };
     run();
     id = setInterval(run, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ---- NEW: poll /api/alpaca/account every 10s ----
+  useEffect(() => {
+    let id: any;
+    const run = async () => {
+      try {
+        const r = await fetch("/api/alpaca/account", { cache: "no-store" });
+        const j = await r.json();
+        if (j?.ok && j?.account) setAlpaca(j.account as AlpacaAccount);
+      } catch {}
+    };
+    run();
+    id = setInterval(run, 10_000);
     return () => clearInterval(id);
   }, []);
 
@@ -695,7 +719,7 @@ export default function Home() {
                   tradelog: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
                 })
               }
-              className="rounded-2xl 1 border-gray-300 shadow-none z-40 bg-transparent"
+              className="rounded-2xl border-[0.5px] border-gray-300 shadow-none z-40 bg-transparent"
             >
               <Panel
                 title="Trade Log"
@@ -763,7 +787,7 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* AI Recommendation — bottom-right left (short to remove blank) */}
+            {/* AI Recommendation — bottom-right left */}
             <Rnd
               bounds="#content-area"
               default={{ x: layout.airec.x, y: layout.airec.y, width: layout.airec.width, height: layout.airec.height }}
@@ -800,21 +824,43 @@ export default function Home() {
                   </div>
                 )}
 
-                {botData?.state && (
+                {/* ---- NEW: Prefer real Alpaca balances/PnL; fallback to bot state ---- */}
+                {(alpaca || botData?.state) && (
                   <div className="mb-3 text-sm border border-gray-200 rounded p-2">
-                    <div>Money I Have: <b>${Number(botData.state.cash).toFixed(2)}</b></div>
-                    <div>Equity: <b>${Number(botData.state.equity).toFixed(2)}</b></div>
-                    <div>
-                      PNL:{" "}
-                      <b className={Number(botData.state.pnl) >= 0 ? "text-green-600" : "text-red-600"}>
-                        {Number(botData.state.pnl) >= 0 ? "+" : ""}${Number(botData.state.pnl).toFixed(2)}
-                      </b>
-                    </div>
-                    {botData?.live?.ticker && (
-                      <div className="mt-1 text-xs text-gray-600">
-                        Live: {botData.live.ticker} {botData.live.price != null ? `$${Number(botData.live.price).toFixed(2)}` : "…"}
-                      </div>
-                    )}
+                    {(() => {
+                      const money = alpaca?.cash ?? botData?.state?.cash ?? null;
+                      const eq    = alpaca?.equity ?? botData?.state?.equity ?? null;
+                      const dayPnl = alpaca?.day_pnl ?? botData?.state?.pnl ?? null;
+
+                      return (
+                        <>
+                          <div>
+                            Money I Have:{" "}
+                            <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b>{" "}
+                            {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
+                          </div>
+                          <div>
+                            Equity:{" "}
+                            <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b>{" "}
+                            {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
+                          </div>
+                          <div>
+                            PNL:{" "}
+                            <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
+                              {dayPnl != null
+                                ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}`
+                                : "—"}
+                            </b>{" "}
+                            {alpaca && <span className="text-xs text-gray-500">(Today, Alpaca)</span>}
+                          </div>
+                          {alpaca?.day_pnl_pct != null && (
+                            <div className="text-xs text-gray-600">
+                              Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
 
@@ -834,7 +880,7 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* Bot Status — bottom-right right (short to remove blank) */}
+            {/* Bot Status — bottom-right right */}
             <Rnd
               bounds="#content-area"
               default={{ x: layout.botstatus.x, y: layout.botstatus.y, width: layout.botstatus.width, height: layout.botstatus.height }}

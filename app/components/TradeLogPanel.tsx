@@ -24,6 +24,10 @@ type Position = {
 
 const LS_KEY = "tradeLog_allTime_v2_fifo";
 
+/** ===== NEW: table window (7 days) ===== */
+const WINDOW_DAYS = 7;
+const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
 /** ===== Helpers ===== */
 function parseTs(input: any): number | null {
   if (input == null) return null;
@@ -172,7 +176,8 @@ export default function TradeLogPanel() {
   useEffect(() => {
     const fetchTrades = async () => {
       try {
-        let res = await fetch("/api/trades?limit=200", { cache: "no-store" });
+        let res = await fetch("/api/trades?days=7&limit=2000", { cache: "no-store" });
+
         if (!res.ok) {
           res = await fetch("/api/bot/trades?limit=200", { cache: "no-store" });
         }
@@ -200,14 +205,19 @@ export default function TradeLogPanel() {
     };
   }, []);
 
-  // PnL + positions
+  // PnL + positions (computed across FULL history to keep FIFO accurate)
   const { annotated, positions: computedPos } = useMemo(
     () => computePnLandPositions(history),
     [history]
   );
-  const rows = useMemo(() => annotated.slice().reverse(), [annotated]);
 
-  // Fetch last prices for unrealized P&L
+  // ===== NEW: table rows filtered to the last 7 days =====
+  const rows = useMemo(() => {
+    const cutoff = Date.now() - WINDOW_MS;
+    return annotated.filter((t) => t.ts >= cutoff).slice().reverse();
+  }, [annotated]);
+
+  // Fetch last prices for unrealized P&L (based on FULL computed positions)
   useEffect(() => {
     const loadPrices = async () => {
       if (computedPos.length === 0) {
@@ -326,10 +336,12 @@ export default function TradeLogPanel() {
           Reset (admin)
         </button>
 
-        <h2 className="font-bold text-lg mb-2 pr-28">Trade Log</h2>
+        <h2 className="font-bold text-lg mb-2 pr-28">
+          Trade Log (last {WINDOW_DAYS} days)
+        </h2>
 
         {rows.length === 0 ? (
-          <p className="text-gray-500">No trades yet.</p>
+          <p className="text-gray-500">No trades in the last {WINDOW_DAYS} days.</p>
         ) : (
           <table className="min-w-full text-sm border">
             <thead className="bg-slate-900 text-white">

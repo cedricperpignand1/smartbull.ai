@@ -19,21 +19,22 @@ function authorized(req: Request) {
   // Occasionally present on Vercel cron runs
   if (h.get("x-vercel-signature")) return true;
 
-  // "Run" button on dashboard
+  // "Run" button on dashboard (best-effort)
   const ua = (h.get("user-agent") || "").toLowerCase();
   if (ua.includes("vercel") && ua.includes("cron")) return true;
 
   // Manual / local: ?token=ALPACA_WEBHOOK_SECRET
   const SECRET = process.env.ALPACA_WEBHOOK_SECRET?.trim();
-  if (!SECRET) return true; // dev convenience
+  if (!SECRET) return true; // dev convenience if not set
   const u = new URL(req.url);
   return u.searchParams.get("token") === SECRET;
 }
 
-/** ───────────────── Alpaca client (consistent envs) ───────────────── */
+/** ───────────────── Alpaca client ───────────────── */
 const RAW_BASE = (process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets").trim();
-// normalize: no trailing slash, no trailing /v2 (we add /v2 in paths below)
+// normalize: no trailing slash, no trailing /v2
 const BASE = RAW_BASE.replace(/\/+$/, "").replace(/\/v2$/, "");
+
 const KEY =
   process.env.ALPACA_API_KEY_ID ||
   process.env.ALPACA_API_KEY ||
@@ -63,7 +64,11 @@ async function alpGet(
   });
   const text = await r.text();
   let json: any = null;
-  try { json = text ? JSON.parse(text) : null; } catch { /* keep raw text */ }
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    /* keep raw text */
+  }
   if (!r.ok) {
     const msg = json?.message || json?.error || text || `HTTP ${r.status}`;
     throw new Error(`Alpaca GET ${path} ${r.status}: ${msg}`);
@@ -112,6 +117,13 @@ function norm(o: any): AlpOrder {
   };
 }
 
+function startOfETDayISO(isoLike?: string) {
+  const base = isoLike ? new Date(isoLike) : new Date();
+  const d = new Date(base.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
 /** Ensure bot state exists (for cash/PnL/equity updates). */
 async function ensureBotState() {
   let s = await prisma.botState.findUnique({ where: { id: 1 } });
@@ -123,11 +135,7 @@ async function ensureBotState() {
   return s;
 }
 
-/** ───────────────── Apply BUY fill ─────────────────
- * - Reconciles cash if our assumed entry differs from actual fill.
- * - Updates/creates BUY trade with filledAt/filledPrice.
- * - Ensures position has the true entryPrice and brokerOrderId.
- */
+/** ───────────────── Apply BUY fill ───────────────── */
 async function applyBuyFill(o: AlpOrder) {
   if (o.side !== "buy") return;
   const ticker = o.symbol;
@@ -135,7 +143,6 @@ async function applyBuyFill(o: AlpOrder) {
 
   const filledAvg = o.filled_avg_price ?? null;
   const filledAt = o.filled_at ? new Date(o.filled_at) : nowET();
-
   await ensureBotState();
 
   // Prefer a position we created at submit; fallback to most recent open with same ticker
@@ -158,9 +165,9 @@ async function applyBuyFill(o: AlpOrder) {
       },
     });
   }
-  if (!pos) return; // nothing to do if we still can't resolve a position
+  if (!pos) return;
 
-  // The BUY trade we inserted on submit (or not)
+  // BUY trade we inserted on submit (or not)
   let buyTrade = await prisma.trade.findFirst({
     where: { side: "BUY", brokerOrderId: o.id },
     orderBy: { id: "desc" },
@@ -172,20 +179,20 @@ async function applyBuyFill(o: AlpOrder) {
 
   // Reconcile cash if our assumed price differs from actual fill (one-time)
   if (buyTrade && !buyTrade.filledAt && Number.isFinite(entryAssumed) && Number.isFinite(fillPx)) {
-    const delta = shares * entryAssumed - shares * fillPx; // positive if fill better than assumed
+    const delta = shares * entryAssumed - shares * fillPx; // + if fill better than assumed
     if (delta !== 0) {
       const st = await ensureBotState();
       await prisma.botState.update({
         where: { id: 1 },
         data: {
-          cash:   Number(st.cash) + delta,
+          cash: Number(st.cash) + delta,
           equity: Number(st.equity) + delta,
         },
       });
     }
   }
 
-  // Update position to true fill price and ensure brokerOrderId is mapped
+  // Update position to true fill price & ensure brokerOrderId
   await prisma.position.update({
     where: { id: pos.id },
     data: { entryPrice: fillPx, brokerOrderId: (pos as any).brokerOrderId ?? o.id },
@@ -212,16 +219,12 @@ async function applyBuyFill(o: AlpOrder) {
   }
 }
 
-/** ───────────────── Apply SELL fill ─────────────────
- * - Closes the position, records SELL trade, and updates cash/PnL/equity.
- * - Works for TP/SL child legs or manual market close.
- */
+/** ───────────────── Apply SELL fill ───────────────── */
 async function applySellFill(o: AlpOrder) {
   if (o.side !== "sell") return;
   const ticker = o.symbol;
   if (!ticker) return;
 
-  // find open position
   const pos = await prisma.position.findFirst({
     where: { open: true, ticker },
     orderBy: { id: "desc" },
@@ -229,11 +232,11 @@ async function applySellFill(o: AlpOrder) {
   if (!pos) return;
 
   const shares = Number(pos.shares);
-  const entry  = Number(pos.entryPrice);
+  const entry = Number(pos.entryPrice);
   const fillPx = o.filled_avg_price ?? entry;
   const filledAt = o.filled_at ? new Date(o.filled_at) : nowET();
 
-  const exitVal  = shares * fillPx;
+  const exitVal = shares * fillPx;
   const entryVal = shares * entry;
   const realized = exitVal - entryVal;
 
@@ -265,31 +268,29 @@ async function applySellFill(o: AlpOrder) {
   // Update state
   const st = await ensureBotState();
   const newCash = Number(st.cash) + exitVal;
-  const newPnl  = Number(st.pnl) + realized;
+  const newPnl = Number(st.pnl) + realized;
 
   await prisma.botState.update({
     where: { id: 1 },
     data: {
-      cash:   newCash,
-      pnl:    newPnl,
-      equity: newCash, // no open pos left for this symbol; if multiple symbols, equity will be refreshed by tick route
+      cash: newCash,
+      pnl: newPnl,
+      equity: newCash, // if multiple symbols open, equity will be refreshed by tick route
     },
   });
 }
 
 /** ───────────────── Sync recent orders ─────────────────
- * Pulls recent orders (parents + TP/SL legs), flattens, and mirrors fills.
+ * Pulls orders (parents + TP/SL legs), flattens, and mirrors fills.
  */
-async function syncRecentOrders() {
-  // Pull last 90 minutes; adjust if you want more/less history
-  const afterISO = new Date(Date.now() - 90 * 60 * 1000).toISOString();
-
+async function syncRecentOrders(afterISO: string, untilISO?: string) {
   // status=all & nested=true brings bracket legs along
   const ordersRaw = await alpGet("/v2/orders", {
     status: "all",
     limit: 200,
     nested: true,
     after: afterISO,
+    ...(untilISO ? { until: untilISO } : {}),
     direction: "desc",
   });
 
@@ -302,12 +303,12 @@ async function syncRecentOrders() {
 
   let processed = 0;
   for (const o of flat) {
-    // treat as filled if status says filled OR we have a filled_avg_price
-    const isFilled =
-      (o.status && o.status.includes("filled")) ||
-      (o.filled_qty && (o.filled_qty ?? 0) > 0 && o.filled_avg_price != null);
+    // Consider filled if fully/partially filled OR has a filled_avg_price
+    const filled =
+      (o.status && (o.status.includes("filled") || o.status.includes("partially_filled"))) ||
+      ((o.filled_qty ?? 0) > 0 && o.filled_avg_price != null);
 
-    if (!isFilled) continue;
+    if (!filled) continue;
 
     if (o.side === "buy") {
       await applyBuyFill(o);
@@ -318,7 +319,7 @@ async function syncRecentOrders() {
     }
   }
 
-  return { checked: flat.length, processed, afterISO };
+  return { checked: flat.length, processed, afterISO, untilISO: untilISO || null };
 }
 
 /** ───────────────── Handlers ───────────────── */
@@ -326,9 +327,30 @@ export async function GET(req: Request) {
   if (!authorized(req)) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
+
   try {
-    const res = await syncRecentOrders();
-    return NextResponse.json({ ok: true, base: BASE, ...res });
+    const u = new URL(req.url);
+
+    // Accept either a rolling window OR a whole day
+    const day = u.searchParams.get("day"); // e.g. "2025-08-27" (ET day)
+    let afterISO: string;
+
+    if (day) {
+      // start of ET day
+      afterISO = startOfETDayISO(`${day}T00:00:00Z`);
+    } else {
+      const wm = Math.max(15, Math.min(1440 * 7, Number(u.searchParams.get("windowMinutes") ?? "90"))); // up to 7 days
+      afterISO = new Date(Date.now() - wm * 60 * 1000).toISOString();
+    }
+
+    // Optional until=ISO
+    const untilISO = u.searchParams.get("until") || undefined;
+
+    const res = await syncRecentOrders(afterISO, untilISO);
+
+    // Quick echo for troubleshooting env mismatches
+    const keyLast4 = KEY ? KEY.slice(-4) : "";
+    return NextResponse.json({ ok: true, base: BASE, keyLast4, ...res });
   } catch (e: any) {
     console.error("[alpaca-sync] error", e?.message || e);
     return NextResponse.json({ ok: false, error: e?.message || "sync_error" }, { status: 500 });
@@ -336,5 +358,6 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
+  // mirror GET
   return GET(req);
 }
