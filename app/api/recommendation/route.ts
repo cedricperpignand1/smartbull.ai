@@ -2,12 +2,20 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
+// ⬇️ use the cached FMP helpers (relative import avoids alias issues)
+import {
+  fmpProfileCached,
+  fmpRatiosTTMCached,
+  fmpNewsCached,
+  fmpQuoteCached,
+  fmpAvgVolumeSmartCached,
+} from "../../../lib/fmpCached";
+
 export const runtime = "nodejs";
 
 /* ──────────────────────────────────────────────────────────
    Config
    ────────────────────────────────────────────────────────── */
-const FMP_API_KEY = process.env.FMP_API_KEY || "M0MLRDp8dLak6yJOfdv7joKaKGSje8pp";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_PROJECT_ID = process.env.OPENAI_PROJECT_ID || "";
 const OPENAI_ORG = process.env.OPENAI_ORGANIZATION_ID || "";
@@ -20,7 +28,7 @@ const ALPACA_SECRET = process.env.ALPACA_SECRET || process.env.ALPACA_API_SECRET
    Limits to control API usage
    ────────────────────────────────────────────────────────── */
 const MAX_INPUT = 20;        // read at most 20 incoming rows
-const FMP_ENRICH_LIMIT = 12; // only enrich top 12 by DollarVol with FMP
+const FMP_ENRICH_LIMIT = 6;  // ⬅️ reduced to cut rate usage
 const PREMARKET_LIMIT = 8;   // analyze premarket for top 8 (single Alpaca call)
 
 // Premarket+open window you want the model to consider
@@ -95,66 +103,6 @@ function isoEndCapTo(h: number, m: number): string {
   target.setHours(h, m, 0, 0);
   const use = cap.getTime() < target.getTime() ? cap : target;
   return isoAtEtTime(use.getHours(), use.getMinutes());
-}
-
-/* ──────────────────────────────────────────────────────────
-   FMP helpers
-   ────────────────────────────────────────────────────────── */
-async function fmpProfile(ticker: string) {
-  try {
-    const u = `https://financialmodelingprep.com/api/v3/profile/${ticker}?apikey=${FMP_API_KEY}`;
-    const r = await fetch(u, { cache: "no-store" });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return Array.isArray(j) && j.length ? j[0] : null;
-  } catch { return null; }
-}
-async function fmpRatiosTTM(ticker: string) {
-  try {
-    const u = `https://financialmodelingprep.com/api/v3/ratios-ttm/${ticker}?apikey=${FMP_API_KEY}`;
-    const r = await fetch(u, { cache: "no-store" });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return Array.isArray(j) && j.length ? j[0] : null;
-  } catch { return null; }
-}
-async function fmpNews(ticker: string, limit = 5) {
-  try {
-    const u = `https://financialmodelingprep.com/api/v3/stock_news?tickers=${ticker}&limit=${limit}&apikey=${FMP_API_KEY}`;
-    const r = await fetch(u, { cache: "no-store" });
-    if (!r.ok) return [];
-    return await r.json();
-  } catch { return []; }
-}
-async function fmpQuote(ticker: string) {
-  try {
-    const u = `https://financialmodelingprep.com/api/v3/quote/${ticker}?apikey=${FMP_API_KEY}`;
-    const r = await fetch(u, { cache: "no-store" });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return Array.isArray(j) && j.length ? j[0] : null;
-  } catch { return null; }
-}
-async function fmpAvgVolume(ticker: string): Promise<number | null> {
-  try {
-    const q = await fmpQuote(ticker);
-    const direct =
-      num(q?.avgVolume) ?? num(q?.volAvg) ?? num(q?.averageVolume) ?? null;
-    if (typeof direct === "number") return direct;
-  } catch { /* fallthrough */ }
-  try {
-    const u = `https://financialmodelingprep.com/api/v3/historical-price-full/${ticker}?serietype=line&timeseries=30&apikey=${FMP_API_KEY}`;
-    const r = await fetch(u, { cache: "no-store" });
-    if (!r.ok) return null;
-    const j = await r.json();
-    const hist = j?.historical;
-    if (!Array.isArray(hist) || hist.length === 0) return null;
-    let sum = 0, n = 0;
-    for (const d of hist) {
-      if (typeof d?.volume === "number") { sum += d.volume; n++; }
-    }
-    return n ? Math.round(sum / n) : null;
-  } catch { return null; }
 }
 
 /* ──────────────────────────────────────────────────────────
@@ -299,7 +247,7 @@ async function getOrFetchPremarket(symbols: string[]) {
   const startISO = isoAtEtTime(PM_START_H, PM_START_M);
   const endISO   = isoEndCapTo(PM_END_H, PM_END_M); // min(now, 09:45)
 
-  // If we already have a cache for today and it's for >= current end, reuse it
+  // Reset cache on new day
   const needReset = pmCacheDate !== today;
   if (needReset) {
     pmCacheDate = today;
@@ -309,7 +257,7 @@ async function getOrFetchPremarket(symbols: string[]) {
     pmLastFetchMs = 0;
   }
 
-  // After 09:45, ensure we have one full-day snapshot. If already cached → reuse.
+  // After 09:45, if we already have a full snapshot → reuse
   const nowAfter945 = isAfterOrAt(PM_END_H, PM_END_M);
   const nowBefore9  = isBefore(PM_START_H, PM_START_M);
 
@@ -317,7 +265,6 @@ async function getOrFetchPremarket(symbols: string[]) {
     return { bySym: out, skipped: "before_09_00_ET" };
   }
 
-  // If we have a cache built to the day's final end (09:45), just reuse
   if (nowAfter945 && pmCacheDate === today && pmCacheEndISO) {
     return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
   }
@@ -416,7 +363,7 @@ function buildExplanationForPick(
 /* ──────────────────────────────────────────────────────────
    Soft preference helpers (Employees ↑, AvgVolume)
    ────────────────────────────────────────────────────────── */
-// CHANGED: increase Employees weight to 0.7 and AvgVolume to 0.3; MarketCap is ignored.
+// Employees weight = 0.7, AvgVolume = 0.3; MarketCap is ignored.
 function buildSoftPrefScorer(rows: Array<{ employees?: number|null; avgVolume?: number|null }>) {
   const empVals = rows.map(r => r.employees ?? null).filter((v): v is number => v != null && Number.isFinite(v));
   const avgVals = rows.map(r => r.avgVolume ?? null).filter((v): v is number => v != null && Number.isFinite(v));
@@ -490,11 +437,11 @@ export async function POST(req: Request) {
     const enriched = await Promise.all(
       preFmpPool.map(async (row) => {
         const [profile, ratios, news, avgVolRaw, quote] = await Promise.all([
-          fmpProfile(row.ticker),
-          fmpRatiosTTM(row.ticker),
-          fmpNews(row.ticker, 5),
-          fmpAvgVolume(row.ticker),
-          fmpQuote(row.ticker),
+          fmpProfileCached(row.ticker),
+          fmpRatiosTTMCached(row.ticker),
+          fmpNewsCached(row.ticker, 3),          // ⬅️ smaller news set to save calls
+          fmpAvgVolumeSmartCached(row.ticker),   // ⬅️ quote-first avgVolume, historical fallback
+          fmpQuoteCached(row.ticker),
         ]);
 
         const isEtf =
@@ -545,7 +492,7 @@ export async function POST(req: Request) {
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
-    // Top candidates AFTER FMP filters; primarily by DollarVol, tie-break by SoftPref (which now favors Employees more)
+    // Top candidates AFTER FMP filters; primarily by DollarVol, tie-break by SoftPref (employees-weighted)
     const byDollarVol = (arr: any[]) =>
       arr.slice().sort((a, b) => {
         const dv = (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0);

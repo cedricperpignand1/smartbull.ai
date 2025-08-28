@@ -5,7 +5,8 @@ export const revalidate = 0;
 
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getQuote } from "@/lib/quote";
+// REMOVED: getQuote (we'll use the cached quote helper instead)
+// import { getQuote } from "@/lib/quote";
 import { isWeekdayET, isMarketHoursET, yyyyMmDdET, nowET } from "@/lib/market";
 import {
   submitBracketBuy,
@@ -19,6 +20,15 @@ import {
   // NEW: fetch real Alpaca balances
   getAccount,
 } from "@/lib/alpaca";
+
+// ✅ Use the cached FMP helpers
+import { fmpQuoteCached } from "../../../../lib/fmpCached";
+
+/** Extract a numeric price from FMP quote payload */
+function priceFromFmp(q: any): number | null {
+  const n = Number(q?.price ?? q?.c ?? q?.close ?? q?.previousClose);
+  return Number.isFinite(n) ? n : null;
+}
 
 /** ───────────────── Throttle / Coalesce ───────────────── */
 let lastTickAt = 0;
@@ -251,11 +261,12 @@ async function ensureRollingRecommendationTwo(
           // If primary changed or old row stale, persist row for UI/back-compat
           const inTop = topStocks.some(s => s.ticker === primary);
           if (inTop) {
-            let ref: number | null =
-              Number(topStocks.find((s) => s.ticker === primary)?.price ?? NaN);
+            let ref: number | null = Number(topStocks.find((s) => s.ticker === primary)?.price ?? NaN);
             if (!Number.isFinite(Number(ref))) {
-              const q = await getQuote(primary!);
-              if (q != null && Number.isFinite(Number(q))) ref = Number(q);
+              // ⬇️ use cached quote
+              const q = await fmpQuoteCached(primary!);
+              const p = priceFromFmp(q);
+              if (p != null) ref = p;
             }
             const priceNum = Number.isFinite(Number(ref)) ? Number(ref) : null;
             const data: any = { ticker: primary! };
@@ -533,10 +544,10 @@ async function handle(req: Request) {
       try {
         await closePositionMarket(exitTicker);
 
-        const pQuote = await getQuote(exitTicker);
-        const p = (pQuote != null && Number.isFinite(Number(pQuote)))
-          ? Number(pQuote)
-          : Number(openPos.entryPrice);
+        // ⬇️ Use cached quote for exit valuation
+        const q = await fmpQuoteCached(exitTicker);
+        const parsed = priceFromFmp(q);
+        const p = parsed != null ? parsed : Number(openPos.entryPrice);
 
         const shares   = Number(openPos.shares);
         const entry    = Number(openPos.entryPrice);
@@ -733,8 +744,10 @@ async function handle(req: Request) {
           ref = Number(snapshot?.stocks?.find((s) => s.ticker === ticker)?.price ?? NaN);
         }
         if (!Number.isFinite(Number(ref))) {
-          const q = await getQuote(ticker);
-          if (q != null && Number.isFinite(Number(q))) ref = Number(q);
+          // ⬇️ use cached quote as final fallback
+          const q = await fmpQuoteCached(ticker);
+          const p = priceFromFmp(q);
+          if (p != null) ref = p;
         }
         if (ref == null || !Number.isFinite(Number(ref))) {
           debug.reasons.push(`scan_no_price_for_entry_${ticker}`);
@@ -835,8 +848,9 @@ async function handle(req: Request) {
       let ref: number | null =
         Number(snapshot?.stocks?.find((s) => s.ticker === ticker)?.price ?? NaN);
       if (!Number.isFinite(Number(ref))) {
-        const q = await getQuote(ticker);
-        if (q != null && Number.isFinite(Number(q))) ref = Number(q);
+        const q = await fmpQuoteCached(ticker);
+        const p = priceFromFmp(q);
+        if (p != null) ref = p;
       }
       if (ref == null || !Number.isFinite(Number(ref))) {
         debug.reasons.push(`force_no_price_for_entry_${ticker}`);
@@ -969,9 +983,11 @@ async function handle(req: Request) {
 
     /** ───────────────── Holding: refresh equity for UI + ratchet stop/TP ───────────────── */
     if (openPos) {
-      const q = await getQuote(openPos.ticker);
-      if (q != null && Number.isFinite(Number(q))) {
-        const p = Number(q);
+      // ⬇️ cached price for live/equity update
+      const q = await fmpQuoteCached(openPos.ticker);
+      const pParsed = priceFromFmp(q);
+      if (pParsed != null) {
+        const p = pParsed;
         livePrice = p;
 
         const equityNow = Number(state!.cash) + Number(openPos.shares) * p;
@@ -1088,8 +1104,10 @@ async function handle(req: Request) {
         }
       }
     } else if (lastRec?.ticker) {
-      const q = await getQuote(lastRec.ticker);
-      if (q != null && Number.isFinite(Number(q))) livePrice = Number(q);
+      // cached price for the "live" panel when no open position
+      const q = await fmpQuoteCached(lastRec.ticker);
+      const p = priceFromFmp(q);
+      if (p != null) livePrice = p;
     }
 
     return {
