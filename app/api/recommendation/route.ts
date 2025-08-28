@@ -414,8 +414,9 @@ function buildExplanationForPick(
 }
 
 /* ──────────────────────────────────────────────────────────
-   Soft preference helpers (Employees + AvgVolume)
+   Soft preference helpers (Employees ↑, AvgVolume)
    ────────────────────────────────────────────────────────── */
+// CHANGED: increase Employees weight to 0.7 and AvgVolume to 0.3; MarketCap is ignored.
 function buildSoftPrefScorer(rows: Array<{ employees?: number|null; avgVolume?: number|null }>) {
   const empVals = rows.map(r => r.employees ?? null).filter((v): v is number => v != null && Number.isFinite(v));
   const avgVals = rows.map(r => r.avgVolume ?? null).filter((v): v is number => v != null && Number.isFinite(v));
@@ -430,11 +431,13 @@ function buildSoftPrefScorer(rows: Array<{ employees?: number|null; avgVolume?: 
     return Math.max(0, Math.min(1, (x - lo) / (hi - lo)));
   };
 
+  const W_EMP = 0.7; // employees favored more
+  const W_AVG = 0.3;
+
   return (row: { employees?: number|null; avgVolume?: number|null }) => {
     const empN = norm(row.employees ?? null, empMin, empMax);
     const avgN = norm(row.avgVolume ?? null, avgMin, avgMax);
-    // equal weight; tweak if you want to favor one more
-    return 0.5 * avgN + 0.5 * empN;
+    return W_EMP * empN + W_AVG * avgN; // 0..1
   };
 }
 
@@ -524,7 +527,7 @@ export async function POST(req: Request) {
       })
     );
 
-    /* Soft preference scoring (Employees + AvgVolume) */
+    /* Soft preference scoring (Employees ↑ + AvgVolume) */
     const scoreSoft = buildSoftPrefScorer(enriched);
     for (const r of enriched) {
       (r as any).softPref = scoreSoft(r); // 0..1
@@ -542,12 +545,12 @@ export async function POST(req: Request) {
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
-    // Top candidates AFTER FMP filters; primarily by DollarVol, tie-break by SoftPref
+    // Top candidates AFTER FMP filters; primarily by DollarVol, tie-break by SoftPref (which now favors Employees more)
     const byDollarVol = (arr: any[]) =>
       arr.slice().sort((a, b) => {
         const dv = (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0);
         if (Math.abs(dv) > 0) return dv;
-        // tiebreaker: higher softPref wins
+        // tiebreaker: higher softPref wins (employees-weighted)
         return ((b as any).softPref ?? 0) - ((a as any).softPref ?? 0);
       });
 
@@ -595,7 +598,7 @@ export async function POST(req: Request) {
         `Sector:${s.sector ?? "n/a"}`,
         `Industry:${s.industry ?? "n/a"}`,
         `Headlines(+/-):${s.headlinePos}/${s.headlineNeg}`,
-        // ── Morning window fields (09:00–09:45) ──
+        // ── Morning 09:00–09:45 fields ──
         `AM_High:${(s as any).pmHigh ?? "n/a"}`,
         `AM_Low:${(s as any).pmLow ?? "n/a"}`,
         `AM_RangePct:${(s as any).pmRangePct != null ? (((s as any).pmRangePct*100).toFixed(2) + "%") : "n/a"}`,
@@ -628,8 +631,8 @@ Use ONLY the provided data (no outside facts).
 - Spike Potential: smaller Float (≤ 50M) preferred but allow larger with very high DollarVol.
 - Quality: prefer positive netProfitMarginTTM.
 - Catalysts: positive headlines; penalize clusters of negatives.
-- **Soft Preference (tie-break, ~10% weight)**: when two candidates are similar on the above,
-  slightly prefer the one with **higher Employees** and **higher AvgVol** (see the provided SoftPref value, 0–1).
+- **Soft Preference (tie-break)**: when two candidates are similar on the above,
+  **prefer the one with higher Employees (strongest) and then higher AvgVol** (see SoftPref 0–1). Ignore MarketCap.
 
 ## Output (strict JSON)
 {
