@@ -207,7 +207,7 @@ function ymdET(d: Date) {
 }
 
 /* =========================================================
-   Draggable layout helpers
+   Draggable layout helpers + anti-overlap
    ========================================================= */
 type Rect = { x: number; y: number; width: number; height: number };
 type Layout = {
@@ -218,7 +218,7 @@ type Layout = {
   botstatus: Rect;
 };
 
-const LAYOUT_KEY = "dash_layout_v5";
+const LAYOUT_KEY = "dash_layout_v6_no_overlap"; // bumped key to avoid stale layouts
 
 /** Defaults tuned to your last screenshot */
 function computeDefaultLayout(w: number, h: number): Layout {
@@ -244,6 +244,90 @@ function computeDefaultLayout(w: number, h: number): Layout {
     airec: { x: xRight, y: tradeH + gap, width: halfRight, height: bottomH },
     botstatus: { x: xRight2, y: tradeH + gap, width: halfRight, height: bottomH },
   };
+}
+
+/** geometry helpers */
+const MARGIN = 8; // anti-overlap margin
+function clampRectToBounds(r: Rect, W: number, H: number, minW = 380, minH = 220): Rect {
+  const w = Math.max(minW, Math.min(r.width, W));
+  const h = Math.max(minH, Math.min(r.height, H));
+  const x = Math.max(0, Math.min(r.x, W - w));
+  const y = Math.max(0, Math.min(r.y, H - h));
+  return { x, y, width: w, height: h };
+}
+function overlaps(a: Rect, b: Rect, margin = MARGIN): boolean {
+  return !(
+    a.x + a.width + margin <= b.x ||
+    b.x + b.width + margin <= a.x ||
+    a.y + a.height + margin <= b.y ||
+    b.y + b.height + margin <= a.y
+  );
+}
+function layoutToArray(layout: Layout): Array<[keyof Layout, Rect]> {
+  return [
+    ["chat", layout.chat],
+    ["gainers", layout.gainers],
+    ["tradelog", layout.tradelog],
+    ["airec", layout.airec],
+    ["botstatus", layout.botstatus],
+  ];
+}
+
+/**
+ * Try to resolve overlaps by nudging the moved rect to the right/down
+ * in small steps, keeping it inside bounds. Bounded attempts so it finishes fast.
+ */
+function resolveCollisions(
+  layout: Layout,
+  movedKey: keyof Layout,
+  W: number,
+  H: number
+): Layout {
+  const STEP = 10;        // pixels per nudge
+  const MAX_TRIES = 300;  // upper bound
+  const MIN_W = 320;      // safety min widths when clamping
+  const MIN_H = 200;
+
+  let next: Layout = { ...layout, [movedKey]: { ...layout[movedKey] } } as Layout;
+  // First clamp to bounds
+  next[movedKey] = clampRectToBounds(next[movedKey], W, H, MIN_W, MIN_H);
+
+  const moved = () => next[movedKey];
+  let tries = 0;
+
+  // Keep pushing until no overlap or we hit limit
+  while (tries++ < MAX_TRIES) {
+    let collidedWith: keyof Layout | null = null;
+
+    for (const [key, rect] of layoutToArray(next)) {
+      if (key === movedKey) continue;
+      if (overlaps(moved(), rect)) {
+        collidedWith = key;
+        break;
+      }
+    }
+
+    if (!collidedWith) break; // no collisions — done
+
+    // Nudge strategy: prefer push right; if can't, push down; else wrap to x=0 and push down
+    const m = moved();
+    const canPushRight = m.x + m.width + STEP <= W;
+    const canPushDown = m.y + m.height + STEP <= H;
+
+    if (canPushRight) {
+      next[movedKey] = { ...m, x: Math.min(W - m.width, m.x + STEP) };
+    } else if (canPushDown) {
+      next[movedKey] = { ...m, y: Math.min(H - m.height, m.y + STEP) };
+    } else {
+      // Try wrapping to left and move down a row
+      const newY = Math.min(H - m.height, m.y + STEP);
+      next[movedKey] = { ...m, x: 0, y: newY };
+    }
+  }
+
+  // Final clamp just in case
+  next[movedKey] = clampRectToBounds(next[movedKey], W, H, MIN_W, MIN_H);
+  return next;
 }
 
 /* =========================================================
@@ -519,6 +603,7 @@ export default function Home() {
   const contentRef = useRef<HTMLDivElement>(null);
   const [container, setContainer] = useState<{ w: number; h: number } | null>(null);
   const [layout, setLayout] = useState<Layout | null>(null);
+  const [activeKey, setActiveKey] = useState<keyof Layout | null>(null); // raise z-index while dragging
 
   useEffect(() => {
     const el = contentRef.current;
@@ -558,6 +643,14 @@ export default function Home() {
     } catch {}
   };
 
+  // unified handlers that resolve overlaps
+  const applyAndResolve = (key: keyof Layout, rect: Rect) => {
+    if (!layout || !container) return;
+    const base: Layout = { ...layout, [key]: rect } as Layout;
+    const resolved = resolveCollisions(base, key, container.w, container.h);
+    saveLayout(resolved);
+  };
+
   const resizingConfig = {
     top: true,
     right: true,
@@ -591,11 +684,17 @@ export default function Home() {
               dragGrid={[10, 10]}
               resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
-              onDragStop={(_, d) => saveLayout({ ...layout, chat: { ...layout.chat, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                saveLayout({ ...layout, chat: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } })
+              onDragStart={() => setActiveKey("chat")}
+              onResizeStart={() => setActiveKey("chat")}
+              onDragStop={(_, d) =>
+                applyAndResolve("chat", { ...layout.chat, x: d.x, y: d.y })
               }
-              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
+              onResizeStop={(_, __, ref, _delta, pos) =>
+                applyAndResolve("chat", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
+              }
+              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
+                activeKey === "chat" ? "z-50" : "z-40"
+              }`}
             >
               <Panel title="AI Chat" color="cyan" dense>
                 <ChatBox />
@@ -611,14 +710,17 @@ export default function Home() {
               dragGrid={[10, 10]}
               resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
-              onDragStop={(_, d) => saveLayout({ ...layout, gainers: { ...layout.gainers, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                saveLayout({
-                  ...layout,
-                  gainers: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
-                })
+              onDragStart={() => setActiveKey("gainers")}
+              onResizeStart={() => setActiveKey("gainers")}
+              onDragStop={(_, d) =>
+                applyAndResolve("gainers", { ...layout.gainers, x: d.x, y: d.y })
               }
-              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
+              onResizeStop={(_, __, ref, _delta, pos) =>
+                applyAndResolve("gainers", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
+              }
+              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
+                activeKey === "gainers" ? "z-50" : "z-40"
+              }`}
             >
               <Panel
                 title="Top Gainers"
@@ -712,14 +814,17 @@ export default function Home() {
               dragGrid={[10, 10]}
               resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
-              onDragStop={(_, d) => saveLayout({ ...layout, tradelog: { ...layout.tradelog, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                saveLayout({
-                  ...layout,
-                  tradelog: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
-                })
+              onDragStart={() => setActiveKey("tradelog")}
+              onResizeStart={() => setActiveKey("tradelog")}
+              onDragStop={(_, d) =>
+                applyAndResolve("tradelog", { ...layout.tradelog, x: d.x, y: d.y })
               }
-              className="rounded-2xl border-[0.5px] border-gray-300 shadow-none z-40 bg-transparent"
+              onResizeStop={(_, __, ref, _delta, pos) =>
+                applyAndResolve("tradelog", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
+              }
+              className={`rounded-2xl border-[0.5px] border-gray-300 shadow-none bg-transparent ${
+                activeKey === "tradelog" ? "z-50" : "z-40"
+              }`}
             >
               <Panel
                 title="Trade Log"
@@ -796,14 +901,17 @@ export default function Home() {
               dragGrid={[10, 10]}
               resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
-              onDragStop={(_, d) => saveLayout({ ...layout, airec: { ...layout.airec, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                saveLayout({
-                  ...layout,
-                  airec: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
-                })
+              onDragStart={() => setActiveKey("airec")}
+              onResizeStart={() => setActiveKey("airec")}
+              onDragStop={(_, d) =>
+                applyAndResolve("airec", { ...layout.airec, x: d.x, y: d.y })
               }
-              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
+              onResizeStop={(_, __, ref, _delta, pos) =>
+                applyAndResolve("airec", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
+              }
+              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
+                activeKey === "airec" ? "z-50" : "z-40"
+              }`}
             >
               <Panel title="AI Recommendation" color="blue" dense>
                 {botData?.lastRec ? (
@@ -889,14 +997,17 @@ export default function Home() {
               dragGrid={[10, 10]}
               resizeGrid={[10, 10]}
               enableResizing={resizingConfig}
-              onDragStop={(_, d) => saveLayout({ ...layout, botstatus: { ...layout.botstatus, x: d.x, y: d.y } })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                saveLayout({
-                  ...layout,
-                  botstatus: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight },
-                })
+              onDragStart={() => setActiveKey("botstatus")}
+              onResizeStart={() => setActiveKey("botstatus")}
+              onDragStop={(_, d) =>
+                applyAndResolve("botstatus", { ...layout.botstatus, x: d.x, y: d.y })
               }
-              className="rounded-2xl border-[0.5px] border-gray-200 shadow-none z-40 bg-transparent"
+              onResizeStop={(_, __, ref, _delta, pos) =>
+                applyAndResolve("botstatus", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
+              }
+              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
+                activeKey === "botstatus" ? "z-50" : "z-40"
+              }`}
             >
               <Panel title="Bot Status" color="green" dense>
                 {statusError && <p className="text-red-600 text-sm">Error: {statusError}</p>}
@@ -968,6 +1079,7 @@ export default function Home() {
             dragGrid={[10, 10]}
             resizeGrid={[10, 10]}
             enableResizing={resizingConfig}
+            onDragStart={() => setActiveKey(null)}
             className="rounded-2xl border-[0.5px] border-gray-200 shadow-xl z-50 bg-transparent"
           >
             <Panel

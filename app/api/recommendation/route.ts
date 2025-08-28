@@ -12,6 +12,91 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_PROJECT_ID = process.env.OPENAI_PROJECT_ID || "";
 const OPENAI_ORG = process.env.OPENAI_ORGANIZATION_ID || "";
 
+// Alpaca (free IEX feed works for premarket with these keys)
+const ALPACA_KEY = process.env.ALPACA_KEY || process.env.ALPACA_API_KEY || "";
+const ALPACA_SECRET = process.env.ALPACA_SECRET || process.env.ALPACA_API_SECRET || "";
+
+/* ──────────────────────────────────────────────────────────
+   Limits to control API usage
+   ────────────────────────────────────────────────────────── */
+const MAX_INPUT = 20;        // read at most 20 incoming rows
+const FMP_ENRICH_LIMIT = 12; // only enrich top 12 by DollarVol with FMP
+const PREMARKET_LIMIT = 8;   // analyze premarket for top 8 (single Alpaca call)
+
+// Premarket+open window you want the model to consider
+const PM_START_H = 9, PM_START_M = 0;
+const PM_END_H   = 9, PM_END_M   = 45;
+
+// Optional: global toggle to disable PM fetch without redeploy
+const PM_ENABLED = (process.env.RECOMMENDATION_PM_ENABLED ?? "true").toLowerCase() !== "false";
+
+/* ──────────────────────────────────────────────────────────
+   Utils (time, numbers)
+   ────────────────────────────────────────────────────────── */
+const num = (v: any) =>
+  v === null || v === undefined || v === "" || Number.isNaN(Number(v))
+    ? null
+    : Number(v);
+
+function nowET(): Date {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+}
+function yyyyMmDdET(): string {
+  const d = nowET();
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${y}-${mo}-${da}`;
+}
+function isWeekdayET(): boolean {
+  const d = nowET().getDay();
+  return d >= 1 && d <= 5; // Mon–Fri
+}
+function isAfterOrAt(h: number, m: number) {
+  const d = nowET();
+  const hh = d.getHours(), mm = d.getMinutes();
+  return (hh > h) || (hh === h && mm >= m);
+}
+function isBefore(h: number, m: number) {
+  const d = nowET();
+  const hh = d.getHours(), mm = d.getMinutes();
+  return (hh < h) || (hh === h && mm < m);
+}
+// Build ISO timestamp at a specific ET wall-clock time (e.g., 09:00 ET)
+function isoAtEtTime(h: number, m: number): string {
+  const d = nowET();
+  d.setHours(h, m, 0, 0);
+  const tz = Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  }).formatToParts(d);
+  const get = (t: string) => tz.find(p => p.type === t)?.value || "";
+  const y = get("year");
+  const mo = get("month");
+  const da = get("day");
+  const hh = get("hour");
+  const mm = get("minute");
+  const ss = get("second");
+  const utc = new Date(d.toLocaleString("en-US", { timeZone: "UTC" }));
+  const et  = new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const offMin = Math.round((et.getTime() - utc.getTime()) / 60000);
+  const sign = offMin >= 0 ? "+" : "-";
+  const offAbs = Math.abs(offMin);
+  const offHH = String(Math.floor(offAbs / 60)).padStart(2, "0");
+  const offMM = String(offAbs % 60).padStart(2, "0");
+  return `${y}-${mo}-${da}T${hh}:${mm}:${ss}${sign}${offHH}:${offMM}`;
+}
+// min(nowET, target ET time as ISO)
+function isoEndCapTo(h: number, m: number): string {
+  const cap = nowET();
+  const target = nowET();
+  target.setHours(h, m, 0, 0);
+  const use = cap.getTime() < target.getTime() ? cap : target;
+  return isoAtEtTime(use.getHours(), use.getMinutes());
+}
+
 /* ──────────────────────────────────────────────────────────
    FMP helpers
    ────────────────────────────────────────────────────────── */
@@ -73,13 +158,195 @@ async function fmpAvgVolume(ticker: string): Promise<number | null> {
 }
 
 /* ──────────────────────────────────────────────────────────
-   Utils
+   Premarket helpers (Alpaca) with caching
    ────────────────────────────────────────────────────────── */
-const num = (v: any) =>
-  v === null || v === undefined || v === "" || Number.isNaN(Number(v))
-    ? null
-    : Number(v);
+type PMetrics = {
+  pmHigh?: number | null;
+  pmLow?: number | null;
+  pmRangePct?: number | null; // (high-low)/((high+low)/2)
+  pmVolume?: number | null;
+  pmVWAP?: number | null;
+  pmUpMinutePct?: number | null; // % of minutes close>open
+  pmScore?: number | null; // compact composite
+};
 
+// Simple in-memory cache (resets on server cold start)
+let pmCacheDate: string | null = null;
+let pmCache: Record<string, PMetrics> = {};
+let pmCacheWindow: string | null = null; // e.g., "09:00–09:45"
+let pmCacheEndISO: string | null = null; // actual end used (e.g., 09:23 before cap)
+let pmLastFetchMs = 0;
+const PM_FETCH_THROTTLE_MS = 2 * 60 * 1000; // 2 minutes
+
+async function fetchBarsWindow(symbols: string[], startISO: string, endISO: string) {
+  const out: Record<string, PMetrics> = {};
+  for (const s of symbols) out[s] = {};
+  if (!ALPACA_KEY || !ALPACA_SECRET || symbols.length === 0) return out;
+
+  const u = new URL("https://data.alpaca.markets/v2/stocks/bars");
+  u.searchParams.set("symbols", symbols.join(","));
+  u.searchParams.set("timeframe", "1Min");
+  u.searchParams.set("start", startISO);
+  u.searchParams.set("end", endISO);
+  u.searchParams.set("adjustment", "raw");
+  u.searchParams.set("feed", "iex");
+  u.searchParams.set("limit", "1000");
+
+  const r = await fetch(u.toString(), {
+    headers: {
+      "APCA-API-KEY-ID": ALPACA_KEY,
+      "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    },
+    cache: "no-store",
+  });
+  if (!r.ok) return out;
+  const j = await r.json();
+
+  let bySymbol: Record<string, any[]> = {};
+  if (j?.bars && typeof j.bars === "object" && !Array.isArray(j.bars)) {
+    bySymbol = j.bars;
+  } else if (Array.isArray(j?.bars)) {
+    for (const b of j.bars) {
+      const sym = (b?.S || b?.Symbol || b?.symbol || "").toUpperCase();
+      if (!sym) continue;
+      (bySymbol[sym] ||= []).push(b);
+    }
+  }
+
+  for (const sym of symbols) {
+    const bars: any[] = bySymbol[sym] || [];
+    if (!bars.length) continue;
+
+    let hi = -Infinity, lo = Infinity;
+    let volSum = 0;
+    let vwapNum = 0;
+    let upCount = 0;
+    let n = 0;
+
+    for (const b of bars) {
+      const o = num(b.o ?? b.open);
+      const h = num(b.h ?? b.high);
+      const l = num(b.l ?? b.low);
+      const c = num(b.c ?? b.close);
+      const v = num(b.v ?? b.volume) || 0;
+
+      if (h != null && h > hi) hi = h;
+      if (l != null && l < lo) lo = l;
+      volSum += v;
+      const px = (h != null && l != null) ? (h + l) / 2 : (c ?? o ?? null);
+      if (px != null) vwapNum += px * v;
+
+      if (o != null && c != null && c > o) upCount++;
+      n++;
+    }
+
+    const pmHigh = isFinite(hi) ? hi : null;
+    const pmLow = isFinite(lo) ? lo : null;
+    const mid = (pmHigh != null && pmLow != null) ? (pmHigh + pmLow) / 2 : null;
+    const pmRangePct = (pmHigh != null && pmLow != null && mid && mid > 0)
+      ? (pmHigh - pmLow) / mid
+      : null;
+    const pmVolume = volSum || null;
+    const pmVWAP = volSum > 0 ? vwapNum / volSum : null;
+    const pmUpMinutePct = n > 0 ? (upCount / n) : null;
+
+    out[sym] = { pmHigh, pmLow, pmRangePct, pmVolume, pmVWAP, pmUpMinutePct };
+  }
+
+  // Build normalized pmScore across this batch
+  const arr = symbols.map(s => ({
+    s,
+    vol: out[s]?.pmVolume ?? null,
+    rng: out[s]?.pmRangePct ?? null,
+    up:  out[s]?.pmUpMinutePct ?? null
+  }));
+  const nz = <T extends number>(x: T | null) => (x == null || !Number.isFinite(x)) ? null : x;
+
+  function norm(key: "vol" | "rng" | "up") {
+    const vals = arr.map(a => nz(a[key])).filter((v): v is number => v != null);
+    if (!vals.length) return (_: number | null) => null;
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    if (max - min < 1e-12) return (_: number | null) => 0.5;
+    return (x: number | null) => (x == null ? null : (x - min) / (max - min));
+  }
+  const nVol = norm("vol"), nRng = norm("rng"), nUp = norm("up");
+
+  for (const s of symbols) {
+    const v = nVol(out[s]?.pmVolume ?? null);
+    const r = nRng(out[s]?.pmRangePct ?? null);
+    const u = nUp(out[s]?.pmUpMinutePct ?? null);
+    const parts = [v, r, u].filter((x): x is number => x != null);
+    const score = parts.length
+      ? ( (v ?? 0)*0.4 + (r ?? 0)*0.4 + (u ?? 0)*0.2 )
+      : null;
+    out[s].pmScore = score;
+  }
+
+  return out;
+}
+
+// Get or refresh the 09:00–09:45 snapshot with caching/throttling
+async function getOrFetchPremarket(symbols: string[]) {
+  const out: Record<string, PMetrics> = {};
+  for (const s of symbols) out[s] = {};
+
+  if (!PM_ENABLED) return { bySym: out, skipped: "pm_disabled" };
+  if (!ALPACA_KEY || !ALPACA_SECRET) return { bySym: out, skipped: "missing_alpaca_credentials" };
+  if (!isWeekdayET()) return { bySym: out, skipped: "not_weekday" };
+
+  const today = yyyyMmDdET();
+  const startISO = isoAtEtTime(PM_START_H, PM_START_M);
+  const endISO   = isoEndCapTo(PM_END_H, PM_END_M); // min(now, 09:45)
+
+  // If we already have a cache for today and it's for >= current end, reuse it
+  const needReset = pmCacheDate !== today;
+  if (needReset) {
+    pmCacheDate = today;
+    pmCache = {};
+    pmCacheWindow = null;
+    pmCacheEndISO = null;
+    pmLastFetchMs = 0;
+  }
+
+  // After 09:45, ensure we have one full-day snapshot. If already cached → reuse.
+  const nowAfter945 = isAfterOrAt(PM_END_H, PM_END_M);
+  const nowBefore9  = isBefore(PM_START_H, PM_START_M);
+
+  if (nowBefore9) {
+    return { bySym: out, skipped: "before_09_00_ET" };
+  }
+
+  // If we have a cache built to the day's final end (09:45), just reuse
+  if (nowAfter945 && pmCacheDate === today && pmCacheEndISO) {
+    // if endISO equals the 09:45 ISO and we have cache, reuse
+    return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
+  }
+
+  // Throttle refetches while between 09:00 and 09:45
+  const nowMs = Date.now();
+  if (!nowAfter945 && pmLastFetchMs && (nowMs - pmLastFetchMs) < PM_FETCH_THROTTLE_MS) {
+    // return what we have (maybe partial) to save calls
+    return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
+  }
+
+  // Fetch the current partial window (09:00 → min(now, 09:45))
+  const fresh = await fetchBarsWindow(symbols, startISO, endISO);
+
+  // Merge into cache
+  for (const s of symbols) {
+    pmCache[s] = fresh[s] || pmCache[s] || {};
+  }
+  pmCacheWindow = "09:00–09:45";
+  pmCacheEndISO = endISO; // note: before 09:45 this is a moving cap
+  pmLastFetchMs = nowMs;
+
+  return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
+}
+
+/* ──────────────────────────────────────────────────────────
+   Headline scoring
+   ────────────────────────────────────────────────────────── */
 function quickHeadlineScore(news: any[]): { pos: number; neg: number } {
   const P = ["up","growth","beats","strong","buy","surge","profit","record","raise","approval","upgrade","guidance"];
   const N = ["down","miss","weak","cut","lawsuit","probe","loss","warning","downgrade","offering","sec","investigation"];
@@ -93,7 +360,7 @@ function quickHeadlineScore(news: any[]): { pos: number; neg: number } {
   return { pos, neg };
 }
 
-// Extract picks if JSON parsing fails
+/* Extract picks if JSON parsing fails */
 function parsePicksFromText(txt: string): string[] {
   if (!txt) return [];
   try {
@@ -107,7 +374,7 @@ function parsePicksFromText(txt: string): string[] {
   return found.slice(0, 2);
 }
 
-/* Build a compact explanation (reasons + key metrics) */
+/* Build explanation that includes PM bullets when available */
 function buildExplanationForPick(
   t: string,
   c: {
@@ -118,6 +385,12 @@ function buildExplanationForPick(
     profitMarginTTM?: number | null;
     headlinePos?: number;
     headlineNeg?: number;
+    pmHigh?: number | null;
+    pmLow?: number | null;
+    pmRangePct?: number | null;
+    pmVolume?: number | null;
+    pmVWAP?: number | null;
+    pmUpMinutePct?: number | null;
   } | undefined,
   reasons: string[] | undefined,
   risk: string | undefined
@@ -133,9 +406,13 @@ function buildExplanationForPick(
     bullets.push(`ProfitMarginTTM ${pm}%`);
   }
   if (c?.headlinePos != null && c?.headlineNeg != null) bullets.push(`Headlines +${c.headlinePos}/-${c.headlineNeg}`);
+  if (c?.pmRangePct != null) bullets.push(`09:00–09:45 range ${(c.pmRangePct*100).toFixed(1)}%`);
+  if (c?.pmVolume != null) bullets.push(`09:00–09:45 vol ${Math.round(c.pmVolume).toLocaleString()}`);
+  if (c?.pmVWAP != null) bullets.push(`09:00–09:45 VWAP ~$${c.pmVWAP.toFixed(2)}`);
+  if (c?.pmUpMinutePct != null) bullets.push(`Up-minutes ${(c.pmUpMinutePct*100).toFixed(0)}%`);
   if (risk?.trim()) bullets.push(`Risk: ${risk.trim()}`);
   const clean = bullets.map(b => b.replace(/\s+/g, " ").trim()).filter(Boolean);
-  return clean.length ? clean.join(" • ") : `${t.toUpperCase()} selected for momentum & liquidity profile.`;
+  return clean.length ? clean.join(" • ") : `${t.toUpperCase()} selected for momentum, liquidity & morning tone.`;
 }
 
 /* ──────────────────────────────────────────────────────────
@@ -158,8 +435,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ errorMessage: "No valid stock data provided to /api/recommendation." }, { status: 400 });
     }
 
-    // Normalize incoming (limit to 20)
-    const base = stocksIn.slice(0, 20).map((s: any) => {
+    // Normalize incoming (cap to MAX_INPUT)
+    const base = (stocksIn as any[]).slice(0, MAX_INPUT).map((s: any) => {
       const ticker = s.ticker || s.symbol;
       const price = num(s.price);
       const changesPercentage = num(s.changesPercentage);
@@ -178,9 +455,14 @@ export async function POST(req: Request) {
       };
     });
 
-    // Enrich rows
+    // ↓ Only enrich the most promising rows with FMP to reduce API use
+    const preFmpPool = base
+      .slice()
+      .sort((a, b) => (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0))
+      .slice(0, FMP_ENRICH_LIMIT);
+
     const enriched = await Promise.all(
-      base.map(async (row) => {
+      preFmpPool.map(async (row) => {
         const [profile, ratios, news, avgVolRaw, quote] = await Promise.all([
           fmpProfile(row.ticker),
           fmpRatiosTTM(row.ticker),
@@ -231,12 +513,30 @@ export async function POST(req: Request) {
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
+    // Top candidates AFTER FMP filters; send up to 8 for the morning window
     const candidates = (filtered.length ? filtered : enriched)
       .slice()
       .sort((a, b) => (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0))
-      .slice(0, 5);
+      .slice(0, PREMARKET_LIMIT);
 
-    /* Prompt (JSON mode) */
+    /* ── Get or fetch the 09:00–09:45 snapshot (cached) ── */
+    const symbols = candidates.map(c => String(c.ticker).toUpperCase());
+    const { bySym: pmBySym, skipped: pmSkippedReason } = await getOrFetchPremarket(symbols);
+
+    // Stitch morning stats into candidates
+    for (const c of candidates) {
+      const s = String(c.ticker).toUpperCase();
+      const pm = pmBySym[s] || {};
+      (c as any).pmHigh = pm.pmHigh ?? null;
+      (c as any).pmLow = pm.pmLow ?? null;
+      (c as any).pmRangePct = pm.pmRangePct ?? null;
+      (c as any).pmVolume = pm.pmVolume ?? null;
+      (c as any).pmVWAP = pm.pmVWAP ?? null;
+      (c as any).pmUpMinutePct = pm.pmUpMinutePct ?? null;
+      (c as any).pmScore = pm.pmScore ?? null;
+    }
+
+    /* Prompt (JSON mode), augmented with 09:00–09:45 signals */
     const lines = candidates.map((s) => {
       const pct =
         s.changesPercentage == null
@@ -260,6 +560,14 @@ export async function POST(req: Request) {
         `Sector:${s.sector ?? "n/a"}`,
         `Industry:${s.industry ?? "n/a"}`,
         `Headlines(+/-):${s.headlinePos}/${s.headlineNeg}`,
+        // ── Morning window fields (09:00–09:45) ──
+        `AM_High:${(s as any).pmHigh ?? "n/a"}`,
+        `AM_Low:${(s as any).pmLow ?? "n/a"}`,
+        `AM_RangePct:${(s as any).pmRangePct != null ? (((s as any).pmRangePct*100).toFixed(2) + "%") : "n/a"}`,
+        `AM_Vol:${(s as any).pmVolume ?? "n/a"}`,
+        `AM_VWAP:${(s as any).pmVWAP ?? "n/a"}`,
+        `AM_UpMin:${(s as any).pmUpMinutePct != null ? (((s as any).pmUpMinutePct*100).toFixed(0) + "%") : "n/a"}`,
+        `AM_Score:${(s as any).pmScore != null ? (s as any).pmScore.toFixed(2) : "n/a"}`,
       ].join(" | ");
     });
 
@@ -268,7 +576,7 @@ export async function POST(req: Request) {
       .join("\n\n");
 
     const system = `
-You are a disciplined **intraday** trading assistant selecting up to **two** long candidates to hold **< 1 day**.
+You are a disciplined **intraday** assistant selecting up to **two** long candidates to hold **< 1 day**.
 Use ONLY the provided data (no outside facts).
 
 ## Hard Filters (already enforced server-side)
@@ -279,9 +587,10 @@ Use ONLY the provided data (no outside facts).
 - Exclude ETFs/ETNs and OTC
 - Float (sharesOutstanding) > 1,999,999
 
-## Primary Signals
-- Liquidity/Momentum: higher DollarVol, RelVol (live/avg), RelVolFloat, healthy Change %.
-- Spike Potential: prefer smaller Float (≤ 50M) but allow larger with very high DollarVol.
+## Primary Signals (weight the 09:00–09:45 tone)
+- Liquidity/Momentum: higher DollarVol, RelVol (live/avg), RelVolFloat.
+- **09:00–09:45 tone**: prefer higher AM_RangePct, higher AM_Vol, AM_UpMin, price relative to AM_VWAP, and overall AM_Score.
+- Spike Potential: smaller Float (≤ 50M) preferred but allow larger with very high DollarVol.
 - Quality: prefer positive netProfitMarginTTM.
 - Catalysts: positive headlines; penalize clusters of negatives.
 
@@ -293,7 +602,7 @@ Use ONLY the provided data (no outside facts).
 }
 `.trim();
 
-    const user = `
+    const userMsg = `
 Candidates (numeric fields may be "n/a"):
 
 ${lines.join("\n")}
@@ -318,7 +627,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
         model: "gpt-4o-mini",
         messages: [
           { role: "system", content: system },
-          { role: "user", content: user },
+          { role: "user", content: userMsg },
         ],
         temperature: 0.15,
         max_tokens: 700,
@@ -354,21 +663,21 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     const reasonsMap: Record<string, string[]> = modelObj?.reasons || {};
     const risk: string | undefined = typeof modelObj?.risk === "string" ? modelObj.risk : undefined;
 
-    /* Save picks with explanation */
+    /* Save picks with explanation (includes AM bullets if present) */
     const saved: any[] = [];
     for (const sym of finalPicks) {
       const t = sym.toUpperCase();
       const c = candidates.find(x => String(x.ticker).toUpperCase() === t);
       const priceNum = Number(c?.price ?? 0);
 
-      const expl = buildExplanationForPick(t, c, reasonsMap[t], risk);
+      const expl = buildExplanationForPick(t, c as any, reasonsMap[t], risk);
 
       try {
         const row = await prisma.recommendation.create({
           data: {
             ticker: t,
-            price: priceNum,     // Prisma Decimal accepts number
-            explanation: expl,   // <<— critical: writes non-null explanation
+            price: priceNum,
+            explanation: expl,
           },
         });
         saved.push(row);
@@ -387,7 +696,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       saved,
       raw: typeof content === "string" ? content : JSON.stringify(content),
       context: {
-        tickers: candidates.map((x) => ({
+        tickers: candidates.map((x: any) => ({
           ticker: x.ticker,
           price: x.price,
           changesPercentage: x.changesPercentage,
@@ -402,7 +711,24 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           profitMarginTTM: x.profitMarginTTM,
           headlinePos: x.headlinePos,
           headlineNeg: x.headlineNeg,
+          // Morning 09:00–09:45 context
+          amHigh: x.pmHigh ?? null,
+          amLow: x.pmLow ?? null,
+          amRangePct: x.pmRangePct ?? null,
+          amVolume: x.pmVolume ?? null,
+          amVWAP: x.pmVWAP ?? null,
+          amUpMinutePct: x.pmUpMinutePct ?? null,
+          amScore: x.pmScore ?? null,
         })),
+        pmCache: {
+          date: pmCacheDate,
+          window: pmCacheWindow,
+          endISO: pmCacheEndISO,
+          lastFetchMs: pmLastFetchMs,
+          throttledMs: PM_FETCH_THROTTLE_MS,
+          skippedReason: pmSkippedReason ?? null,
+        },
+        nowET: nowET().toISOString(),
       },
     });
   } catch (error: any) {
@@ -411,7 +737,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
   }
 }
 
-/* Optional quick debug: returns last 10 saved rows (helps verify explanation is being written) */
+/* Optional quick debug: returns last 10 saved rows */
 export async function GET() {
   try {
     const last = await prisma.recommendation.findMany({

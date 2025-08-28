@@ -59,8 +59,7 @@ const NEAR_OR_END    = 0.0045;
 const VWAP_BAND_START = 0.002;
 const VWAP_BAND_END   = 0.003;
 
-// Execution guards (fixed)
-const SPREAD_MAX_PCT = 0.005;  // 0.50%
+// Execution guards (price band fixed; spread is dynamic below)
 const PRICE_MIN = 1;
 const PRICE_MAX = 70;
 
@@ -459,6 +458,37 @@ function passesBalancedLiquidityGuard(
   return { ok: sharesOK && dollarsOK, minSharesReq, dollarVol };
 }
 
+/** ───────────────── Dynamic spread limit (time + price aware) ─────────────────
+ * Scan window (09:30–09:44):
+ *   - 09:30–09:34 → 0.80%
+ *   - 09:35–09:39 → 0.60%
+ *   - 09:40–09:44 → 0.50%
+ * Force window (09:45–09:46): 0.70%
+ * Caps for cheap tickers:
+ *   - price < $2  → cap at 1.20%
+ *   - $2–$5       → cap at 0.80%
+ *   - >$5         → keep time-based base
+ */
+function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
+  const toPct = (v: number) => Math.max(0.001, Math.min(0.02, v)); // sanity clamp 0.10%..2.00%
+  let base =
+    phase === "force"
+      ? 0.007 // 0.70% during 09:45–09:46
+      : (function () {
+          const mins = now.getHours() * 60 + now.getMinutes();
+          if (mins <= 9 * 60 + 34) return 0.008; // 0.80%
+          if (mins <= 9 * 60 + 39) return 0.006; // 0.60%
+          return 0.005; // 0.50% thereafter until 09:44
+        })();
+
+  const p = Number(price);
+  if (Number.isFinite(p)) {
+    if (p < 2) base = Math.min(base, 0.012); // 1.20% cap
+    else if (p < 5) base = Math.min(base, 0.008); // 0.80% cap
+  }
+  return toPct(base);
+}
+
 /** ───────────────── Route handlers ───────────────── */
 export async function GET(req: Request) { return handle(req); }
 export async function POST(req: Request) { return handle(req); }
@@ -613,9 +643,11 @@ async function handle(req: Request) {
           debug.reasons.push(`scan_price_band_fail_${ticker}_${last.close.toFixed(2)}`);
           return false;
         }
-        const spreadOK = await spreadGuardOK(ticker, SPREAD_MAX_PCT);
+        // dynamic spread limit for scan window (use last.close as a proxy for price)
+        const spreadLimit = dynamicSpreadLimitPct(nowET(), last?.close ?? null, "scan");
+        const spreadOK = await spreadGuardOK(ticker, spreadLimit);
         if (!spreadOK) {
-          debug.reasons.push(`scan_spread_guard_fail_${ticker}`);
+          debug.reasons.push(`scan_spread_guard_fail_${ticker}_limit=${(spreadLimit*100).toFixed(2)}%`);
           return false;
         }
 
@@ -671,9 +703,9 @@ async function handle(req: Request) {
         }
         debug[`scan_signals_${ticker}`] = {
           aboveVWAP, volPulse: vol?.mult ?? null, VOL_MULT_MIN,
-  breakORH, nearOR, NEAR_OR_PCT, vwapRecl, VWAP_RECLAIM_BAND,
-  signalCount, mSince930: m
-};
+          breakORH, nearOR, NEAR_OR_PCT, vwapRecl, VWAP_RECLAIM_BAND,
+          signalCount, mSince930: m
+        };
 
         if (!armed) return false;
 
@@ -799,13 +831,7 @@ async function handle(req: Request) {
 
     /** helper: try one ticker in the FORCE window (returns true if entered) */
     const tryOneForce = async (ticker: string, snapshot: { stocks: SnapStock[] } | null): Promise<boolean> => {
-      const spreadOK = await spreadGuardOK(ticker, SPREAD_MAX_PCT);
-      if (!spreadOK) {
-        debug.reasons.push(`force_spread_guard_fail_${ticker}`);
-        return false;
-      }
-
-      // Resolve price for sizing & band check
+      // Resolve price first for limit + sizing checks
       let ref: number | null =
         Number(snapshot?.stocks?.find((s) => s.ticker === ticker)?.price ?? NaN);
       if (!Number.isFinite(Number(ref))) {
@@ -816,8 +842,16 @@ async function handle(req: Request) {
         debug.reasons.push(`force_no_price_for_entry_${ticker}`);
         return false;
       }
+
+      // Exec guards: price band + dynamic spread for force window
       if (ref < PRICE_MIN || ref > PRICE_MAX) {
         debug.reasons.push(`force_price_band_fail_${ticker}_${ref.toFixed(2)}`);
+        return false;
+      }
+      const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
+      const spreadOK = await spreadGuardOK(ticker, spreadLimit);
+      if (!spreadOK) {
+        debug.reasons.push(`force_spread_guard_fail_${ticker}_limit=${(spreadLimit*100).toFixed(2)}%`);
         return false;
       }
 
