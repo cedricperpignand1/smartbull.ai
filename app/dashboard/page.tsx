@@ -2,13 +2,12 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
-import { Rnd } from "react-rnd";
 import Navbar from "../components/Navbar";
 import { Button } from "../components/ui/button";
 import { useBotPoll } from "../components/useBotPoll";
 
 /* =========================================================
-   Reusable Panel — thicker border & clearer outline
+   OPAQUE Panel (original look) — used by all sections EXCEPT AI Chat
    ========================================================= */
 function Panel({
   title,
@@ -35,8 +34,8 @@ function Panel({
   }[color];
 
   return (
-    <div className="h-full flex flex-col bg-white rounded-2xl border-[0.5px] border-gray-200 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
-      <div className="px-4 py-2.5 flex items-center justify-between border-b border-gray-200/80 bg-white">
+    <div className="h-full flex flex-col bg-white rounded-2xl border border-gray-200 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
+      <div className="px-4 py-2.5 flex items-center justify-between border-b border-gray-200 bg-white">
         <span className={`inline-flex items-center px-3 py-1 rounded-md text-xs font-semibold text-white ${chip}`}>
           {title}
         </span>
@@ -48,16 +47,56 @@ function Panel({
 }
 
 /* =========================================================
-   Simple in-page AI Chat
+   GLASS Panel — used ONLY for AI Chat
+   ========================================================= */
+function GlassPanel({
+  title,
+  color = "cyan",
+  right,
+  children,
+  dense = false,
+}: {
+  title: string;
+  color?: "blue" | "purple" | "green" | "orange" | "rose" | "slate" | "amber" | "cyan";
+  right?: React.ReactNode;
+  children: React.ReactNode;
+  dense?: boolean;
+}) {
+  const chip = {
+    blue: "from-blue-500 to-blue-600",
+    purple: "from-purple-500 to-purple-600",
+    green: "from-emerald-500 to-emerald-600",
+    orange: "from-orange-500 to-orange-600",
+    rose: "from-rose-500 to-rose-600",
+    slate: "from-slate-700 to-slate-800",
+    amber: "from-amber-500 to-amber-600",
+    cyan: "from-cyan-500 to-cyan-600",
+  }[color];
+
+  return (
+    <div className="h-full flex flex-col rounded-3xl overflow-hidden bg-white/28 backdrop-blur-xl ring-1 ring-white/40 shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
+      <div className="px-4 py-3 flex items-center justify-between">
+        <span className={`inline-flex items-center px-3 py-1 rounded-lg text-[11px] font-semibold text-white bg-gradient-to-br ${chip}`}>
+          {title}
+        </span>
+        {right}
+      </div>
+      <div className={`flex-1 overflow-auto ${dense ? "p-3" : "px-4 pb-5 pt-2"}`}>{children}</div>
+    </div>
+  );
+}
+
+/* =========================================================
+   AI Chat — improved readability (larger, darker input)
    ========================================================= */
 function ChatBox() {
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const scrollId = "ai-chat-scroll";
+  const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const el = document.getElementById(scrollId);
+    const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
@@ -85,41 +124,56 @@ function ChatBox() {
 
   return (
     <div className="h-full flex flex-col">
-      <div id={scrollId} className="flex-1 overflow-auto rounded-xl border border-gray-300 bg-gray-50 p-3 space-y-2">
+      {/* Slightly more opaque glass so content is clear */}
+      <div
+        ref={scrollRef}
+        className="
+          flex-1 overflow-auto rounded-3xl p-4 md:p-5 space-y-3
+          bg-white/45 backdrop-blur-2xl ring-1 ring-white/50
+          shadow-[0_20px_60px_rgba(0,0,0,0.20)]
+        "
+      >
         {!messages.length && (
-          <div className="text-sm text-gray-600">
+          <div className="text-[14px] md:text-[15px] leading-relaxed text-slate-900">
             Ask me things like:
-            <br />• what did you trade today?
-            <br />• did you make money today?
-            <br />• are you in a position?
-            <br />• what ticker did you trade today?
+            <br />• What did you trade today?
+            <br />• Did you make money today?
+            <br />• Are you in a position?
+            <br />• What ticker did you trade today?
           </div>
         )}
+
         {messages.map((m, i) => (
           <div
             key={i}
-            className={`max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-2 text-sm ${
-              m.role === "user" ? "bg-black text-white ml-auto" : "bg-white text-gray-900 border border-gray-200"
-            }`}
+            className={[
+              "max-w-[85%] whitespace-pre-wrap px-4 py-2.5 text-[14px] md:text-[15px] rounded-2xl shadow-sm transition",
+              m.role === "user"
+                ? "ml-auto bg-blue-600 text-white ring-1 ring-white/40"
+                : "bg-white text-slate-900 ring-1 ring-gray-200",
+            ].join(" ")}
           >
             {m.content}
           </div>
         ))}
       </div>
 
+      {/* Input row: bigger, dark text, high contrast */}
       <div className="mt-3 flex items-center gap-2">
-        <input
-          className="flex-1 rounded-xl border border-gray-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
-          placeholder="Type your question…"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          disabled={busy}
-        />
+        <div className="flex-1 flex items-center gap-2 rounded-2xl pl-4 pr-3 bg-white/95 ring-1 ring-gray-300">
+          <input
+            className="flex-1 bg-transparent placeholder-gray-500 text-slate-900 px-0 py-3 text-[15px] md:text-base outline-none"
+            placeholder="Type your question…"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && send()}
+            disabled={busy}
+          />
+        </div>
         <button
           onClick={send}
           disabled={busy || !input.trim()}
-          className="rounded-xl bg-blue-600 text-white px-4 py-2 text-sm disabled:opacity-60"
+          className="rounded-xl bg-blue-600 text-white px-5 py-3 text-[15px] font-semibold shadow hover:bg-blue-700 disabled:opacity-60"
         >
           {busy ? "Sending…" : "Send"}
         </button>
@@ -204,100 +258,7 @@ function ymdET(d: Date) {
 }
 
 /* =========================================================
-   Draggable layout helpers + anti-overlap
-   ========================================================= */
-type Rect = { x: number; y: number; width: number; height: number };
-type Layout = {
-  chat: Rect;
-  gainers: Rect;
-  tradelog: Rect;
-  airec: Rect;
-  botstatus: Rect;
-};
-
-const LAYOUT_KEY = "dash_layout_v7_controlled";
-
-function computeDefaultLayout(w: number, h: number): Layout {
-  const gap = 22;
-  const left = 460;
-  const halfRight = 480;
-  const rightTotal = halfRight * 2 + gap;
-
-  const tradeH = Math.max(300, Math.min(420, Math.round(h * 0.44)));
-  const bottomH = Math.max(240, h - (tradeH + gap));
-
-  const xLeft = 0;
-  const xCenter = left + gap;
-  const center = Math.max(720, w - (left + gap + rightTotal + gap));
-  const xRight = xCenter + center + gap;
-  const xRight2 = xRight + halfRight + gap;
-
-  return {
-    chat: { x: xLeft, y: 0, width: left, height: h },
-    gainers: { x: xCenter, y: 0, width: center, height: h },
-    tradelog: { x: xRight, y: 0, width: rightTotal, height: tradeH },
-    airec: { x: xRight, y: tradeH + gap, width: halfRight, height: bottomH },
-    botstatus: { x: xRight2, y: tradeH + gap, width: halfRight, height: bottomH },
-  };
-}
-
-const MARGIN = 8;
-function clampRectToBounds(r: Rect, W: number, H: number, minW = 320, minH = 200): Rect {
-  const w = Math.max(minW, Math.min(r.width, W));
-  const h = Math.max(minH, Math.min(r.height, H));
-  const x = Math.max(0, Math.min(r.x, W - w));
-  const y = Math.max(0, Math.min(r.y, H - h));
-  return { x, y, width: w, height: h };
-}
-function overlaps(a: Rect, b: Rect, margin = MARGIN) {
-  return !(
-    a.x + a.width + margin <= b.x ||
-    b.x + b.width + margin <= a.x ||
-    a.y + a.height + margin <= b.y ||
-    b.y + b.height + margin <= a.y
-  );
-}
-function layoutToArray(layout: Layout): Array<[keyof Layout, Rect]> {
-  return [
-    ["chat", layout.chat],
-    ["gainers", layout.gainers],
-    ["tradelog", layout.tradelog],
-    ["airec", layout.airec],
-    ["botstatus", layout.botstatus],
-  ];
-}
-function resolveCollisions(layout: Layout, movedKey: keyof Layout, W: number, H: number): Layout {
-  const STEP = 10;
-  const MAX_TRIES = 300;
-  let next: Layout = { ...layout, [movedKey]: { ...layout[movedKey] } } as Layout;
-  next[movedKey] = clampRectToBounds(next[movedKey], W, H);
-
-  let tries = 0;
-  while (tries++ < MAX_TRIES) {
-    let collision: keyof Layout | null = null;
-    for (const [key, rect] of layoutToArray(next)) {
-      if (key === movedKey) continue;
-      if (overlaps(next[movedKey], rect)) {
-        collision = key;
-        break;
-      }
-    }
-    if (!collision) break;
-
-    const m = next[movedKey];
-    const canRight = m.x + m.width + STEP <= W;
-    const canDown = m.y + m.height + STEP <= H;
-    if (canRight) next[movedKey] = { ...m, x: Math.min(W - m.width, m.x + STEP) };
-    else if (canDown) next[movedKey] = { ...m, y: Math.min(H - m.height, m.y + STEP) };
-    else next[movedKey] = { ...m, x: 0, y: Math.min(H - m.height, m.y + STEP) };
-
-    next[movedKey] = clampRectToBounds(next[movedKey], W, H);
-  }
-  return next;
-}
-
-/* =========================================================
-   Page
+   Page — static grid (no dragging)
    ========================================================= */
 export default function Home() {
   const { data: session, status } = useSession();
@@ -510,44 +471,6 @@ export default function Home() {
     alert(`Added ${selectedStock} to your P&L with Buy: ${agentBuyPrice}, Sell: ${agentSellPrice}`);
   };
 
-  // Reset (admin)
-  const [showReset, setShowReset] = useState(false);
-  const [resetPassword, setResetPassword] = useState("");
-  const [resetBusy, setResetBusy] = useState(false);
-  const [resetMsg, setResetMsg] = useState<string | null>(null);
-  const closeReset = () => !resetBusy && setShowReset(false);
-  const confirmReset = async () => {
-    setResetBusy(true);
-    setResetMsg(null);
-    try {
-      const res = await fetch("/api/bot/reset", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: resetPassword }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data?.ok) {
-        setResetMsg("Incorrect password or reset failed.");
-      } else {
-        try {
-          localStorage.removeItem("tradeLog_allTime_v2_fifo");
-          localStorage.removeItem("pnlRows");
-          localStorage.removeItem(LAYOUT_KEY);
-        } catch {}
-        setTradeData({ trades: [], openPos: null });
-        setResetMsg("✅ Reset complete.");
-        setTimeout(() => {
-          setShowReset(false);
-          window.location.reload();
-        }, 600);
-      }
-    } catch {
-      setResetMsg("Reset error. Check server logs.");
-    } finally {
-      setResetBusy(false);
-    }
-  };
-
   // today's trades count (fallback)
   const todayTradeCount = useMemo(() => {
     if (Array.isArray(statusTradesToday)) return statusTradesToday.length;
@@ -564,508 +487,84 @@ export default function Home() {
     return n;
   }, [statusTradesToday, tradeData]);
 
-  /* ====== draggable dashboard state ====== */
-  const contentRef = useRef<HTMLDivElement>(null);
-  const [container, setContainer] = useState<{ w: number; h: number } | null>(null);
-  const [layout, setLayout] = useState<Layout | null>(null);
-  const [activeKey, setActiveKey] = useState<keyof Layout | null>(null);
-
-  useEffect(() => {
-    const el = contentRef.current;
-    if (!el) return;
-
-    const measure = () => {
-      const r = el.getBoundingClientRect();
-      setContainer({ w: Math.round(r.width), h: Math.round(r.height) });
-    };
-    measure();
-
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-
-    try {
-      const raw = localStorage.getItem(LAYOUT_KEY);
-      if (raw) setLayout(JSON.parse(raw));
-    } catch {}
-
-    const onResize = () => measure();
-    window.addEventListener("resize", onResize);
-    return () => {
-      ro.disconnect();
-      window.removeEventListener("resize", onResize);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!container) return;
-    if (!layout) setLayout(computeDefaultLayout(container.w, container.h));
-  }, [container, layout]);
-
-  const saveLayout = (next: Layout) => {
-    setLayout(next);
-    try {
-      localStorage.setItem(LAYOUT_KEY, JSON.stringify(next));
-    } catch {}
-  };
-
-  // unified handlers
-  const applyAndResolve = (key: keyof Layout, rect: Rect) => {
-    if (!layout || !container) return;
-    const base: Layout = { ...layout, [key]: rect } as Layout;
-    const resolved = resolveCollisions(base, key, container.w, container.h);
-    saveLayout(resolved);
-  };
-
-  const resizingConfig = {
-    top: true,
-    right: true,
-    bottom: true,
-    left: true,
-    topRight: true,
-    bottomRight: true,
-    bottomLeft: true,
-    topLeft: true,
-  };
-
-  const HEADERS = ["Symbol", "Price", "Change %", "Market Cap", "Float", "Volume", "Avg Vol", "Employees"];
-
+  /* ====== Layout (static grid) ====== */
   return (
-    <main className="min-h-screen w-full bg-gray-100 flex flex-col">
+    <main
+      className="min-h-screen w-full flex flex-col"
+      style={{
+        backgroundImage: "url(/bluebackground.jpg)",
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        backgroundRepeat: "no-repeat",
+        backgroundAttachment: "fixed",
+      }}
+    >
       <Navbar />
-      <div
-        id="content-area"
-        ref={contentRef}
-        className="relative flex-1 px-4 pt-20 overflow-hidden"
-        style={{ height: "calc(100vh - 112px)" }}
-      >
-        {layout && (
-          <>
-            {/* ========== AI Chat (controlled) ========== */}
-            <Rnd
-              bounds="#content-area"
-              position={{ x: layout.chat.x, y: layout.chat.y }}
-              size={{ width: layout.chat.width, height: layout.chat.height }}
-              minWidth={380}
-              minHeight={260}
-              dragGrid={[10, 10]}
-              resizeGrid={[10, 10]}
-              enableResizing={resizingConfig}
-              onDragStart={() => setActiveKey("chat")}
-              onResizeStart={() => setActiveKey("chat")}
-              onDrag={(_, d) => setLayout((L) => (L ? { ...L, chat: { ...L.chat, x: d.x, y: d.y } } : L))}
-              onResize={(_, __, ref, _delta, pos) =>
-                setLayout((L) => (L ? { ...L, chat: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L))
-              }
-              onDragStop={(_, d) => applyAndResolve("chat", { ...layout.chat, x: d.x, y: d.y })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                applyAndResolve("chat", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
-              }
-              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
-                activeKey === "chat" ? "z-50" : "z-40"
-              }`}
-            >
-              <Panel title="AI Chat" color="cyan" dense>
-                <ChatBox />
-              </Panel>
-            </Rnd>
 
-            {/* ========== Top Gainers (controlled) ========== */}
-            <Rnd
-              bounds="#content-area"
-              position={{ x: layout.gainers.x, y: layout.gainers.y }}
-              size={{ width: layout.gainers.width, height: layout.gainers.height }}
-              minWidth={720}
-              minHeight={420}
-              dragGrid={[10, 10]}
-              resizeGrid={[10, 10]}
-              enableResizing={resizingConfig}
-              onDragStart={() => setActiveKey("gainers")}
-              onResizeStart={() => setActiveKey("gainers")}
-              onDrag={(_, d) => setLayout((L) => (L ? { ...L, gainers: { ...L.gainers, x: d.x, y: d.y } } : L))}
-              onResize={(_, __, ref, _delta, pos) =>
-                setLayout((L) =>
-                  L ? { ...L, gainers: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L
-                )
-              }
-              onDragStop={(_, d) => applyAndResolve("gainers", { ...layout.gainers, x: d.x, y: d.y })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                applyAndResolve("gainers", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
-              }
-              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
-                activeKey === "gainers" ? "z-50" : "z-40"
-              }`}
-            >
-              <Panel
-                title="Top Gainers"
-                color="purple"
-                dense
-                right={
-                  <div className="flex items-center gap-2">
-                    <span className="px-2 py-1 rounded-md text-xs font-semibold bg-gray-900 text-white/90">
-                      {dataSource || "FMP (stream)"}
-                    </span>
-                    <Button
-                      onClick={askAIRecommendation}
-                      disabled={analyzing || stocks.length === 0}
-                      className="px-3 py-1 bg-gray-900 text-white hover:bg-gray-800 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                      title={stocks.length === 0 ? "No stocks loaded yet" : "Send list to AI (Top 1 & Top 2)"}
-                    >
-                      {analyzing ? "Analyzing..." : "Ask AI"}
-                    </Button>
-                  </div>
-                }
-              >
-                {loading ? (
-                  <p>Loading live data…</p>
-                ) : errorMessage ? (
-                  <p className="text-red-600">{errorMessage}</p>
-                ) : (
-                  <div className="h-full overflow-auto">
-                    <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
-                      <thead>
-                        <tr className="bg-black text-white">
-                          {HEADERS.map((h, idx) => (
-                            <th
-                              key={h}
-                              className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === HEADERS.length - 1 ? "rounded-r-xl" : ""}`}
-                            >
-                              {h}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {stocks.map((stock) => (
-                          <tr key={stock.ticker} className="group cursor-pointer" onClick={() => handleStockClick(stock.ticker)}>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
-                              {stock.ticker}
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                              {stock.price != null ? `$${Number(stock.price).toFixed(2)}` : "-"}
-                            </td>
-                            <td
-                              className={`px-3 py-2 bg-white ring-1 ring-gray-200 font-medium ${
-                                stock.changesPercentage >= 0 ? "text-green-600" : "text-red-600"
-                              }`}
-                            >
-                              {stock.changesPercentage?.toFixed?.(2) ?? "-"}%
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                              {stock.marketCap != null ? Number(stock.marketCap).toLocaleString() : "-"}
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                              {stock.sharesOutstanding != null ? Number(stock.sharesOutstanding).toLocaleString() : "-"}
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                              {stock.volume != null ? Number(stock.volume).toLocaleString() : "-"}
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                              {stock.avgVolume != null ? Number(stock.avgVolume).toLocaleString() : "-"}
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">
-                              {stock.employees != null ? Number(stock.employees).toLocaleString() : "-"}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </Panel>
-            </Rnd>
+      <div className="flex-1 px-4 pt-20 pb-6">
+        <div
+          className="
+            grid gap-5
+            xl:grid-cols-[460px_minmax(720px,1fr)_960px]
+            xl:grid-rows-[minmax(520px,1fr)_minmax(240px,320px)]
+            lg:grid-cols-1
+          "
+        >
+          {/* AI Chat — ONLY panel that is glass */}
+          <div className="xl:row-span-2">
+            <GlassPanel title="AI Chat" color="cyan" dense>
+              <ChatBox />
+            </GlassPanel>
+          </div>
 
-            {/* ========== Trade Log (controlled) ========== */}
-            <Rnd
-              bounds="#content-area"
-              position={{ x: layout.tradelog.x, y: layout.tradelog.y }}
-              size={{ width: layout.tradelog.width, height: layout.tradelog.height }}
-              minWidth={940}
-              minHeight={260}
-              dragGrid={[10, 10]}
-              resizeGrid={[10, 10]}
-              enableResizing={resizingConfig}
-              onDragStart={() => setActiveKey("tradelog")}
-              onResizeStart={() => setActiveKey("tradelog")}
-              onDrag={(_, d) => setLayout((L) => (L ? { ...L, tradelog: { ...L.tradelog, x: d.x, y: d.y } } : L))}
-              onResize={(_, __, ref, _delta, pos) =>
-                setLayout((L) =>
-                  L ? { ...L, tradelog: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L
-                )
-              }
-              onDragStop={(_, d) => applyAndResolve("tradelog", { ...layout.tradelog, x: d.x, y: d.y })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                applyAndResolve("tradelog", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
-              }
-              className={`rounded-2xl border-[0.5px] border-gray-300 shadow-none bg-transparent ${
-                activeKey === "tradelog" ? "z-50" : "z-40"
-              }`}
-            >
-              <Panel
-                title="Trade Log"
-                color="orange"
-                dense
-                right={
-                  <div className="flex items-center gap-2">
-                    {tradeData?.openPos && (
-                      <div className="text-sm bg-gray-900 text-white/90 px-2 py-1 rounded-md">
-                        Open: <b>{tradeData.openPos.ticker}</b> @ ${Number(tradeData.openPos.entryPrice).toFixed(2)} •{" "}
-                        {tradeData.openPos.shares} sh
-                      </div>
-                    )}
-                    <Button
-                      onClick={() => setShowReset(true)}
-                      className="bg-rose-600 hover:bg-rose-700 text-white text-sm px-3 py-1 rounded-md"
-                      title="Reset trades/positions/recs (admin)"
-                    >
-                      Reset (admin)
-                    </Button>
-                  </div>
-                }
-              >
-                {!tradeData?.trades?.length ? (
-                  <p className="text-gray-500 text-sm">No trades yet.</p>
-                ) : (
-                  <div className="h-full overflow-auto">
-                    <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
-                      <thead>
-                        <tr className="bg-black text-white">
-                          {["Time (ET)", "Side", "Ticker", "Price", "Shares"].map((h, idx, arr) => (
-                            <th key={h} className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}>
-                              {h}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {tradeData.trades.map((t) => (
-                          <tr key={String(t.id)} className="group">
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
-                              {formatETFromTrade(t)}
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
-                              <span
-                                className={`px-2 py-0.5 rounded text-xs font-semibold ${
-                                  t.side === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
-                                }`}
-                              >
-                                {t.side}
-                              </span>
-                            </td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">{t.ticker}</td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200">${Number(t.price).toFixed(2)}</td>
-                            <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">{t.shares}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </Panel>
-            </Rnd>
+          {/* Top Gainers — original opaque */}
+          <div className="xl:row-span-2">
+            <TopGainers
+              loading={loading}
+              errorMessage={errorMessage}
+              stocks={stocks}
+              dataSource={dataSource}
+              onAskAI={askAIRecommendation}
+              analyzing={analyzing}
+              onPick={handleStockClick}
+            />
+          </div>
 
-            {/* ========== AI Recommendation (controlled) ========== */}
-            <Rnd
-              bounds="#content-area"
-              position={{ x: layout.airec.x, y: layout.airec.y }}
-              size={{ width: layout.airec.width, height: layout.airec.height }}
-              minWidth={420}
-              minHeight={220}
-              dragGrid={[10, 10]}
-              resizeGrid={[10, 10]}
-              enableResizing={resizingConfig}
-              onDragStart={() => setActiveKey("airec")}
-              onResizeStart={() => setActiveKey("airec")}
-              onDrag={(_, d) => setLayout((L) => (L ? { ...L, airec: { ...L.airec, x: d.x, y: d.y } } : L))}
-              onResize={(_, __, ref, _delta, pos) =>
-                setLayout((L) => (L ? { ...L, airec: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L))
-              }
-              onDragStop={(_, d) => applyAndResolve("airec", { ...layout.airec, x: d.x, y: d.y })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                applyAndResolve("airec", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
-              }
-              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
-                activeKey === "airec" ? "z-50" : "z-40"
-              }`}
-            >
-              <Panel title="AI Recommendation" color="blue" dense>
-                {botData?.lastRec ? (
-                  <div className="mb-3 text-sm border border-gray-200 rounded p-2 bg-gray-50">
-                    <div>
-                      <b>AI Pick:</b> {botData.lastRec.ticker}
-                    </div>
-                    <div>
-                      <b>Price:</b>{" "}
-                      {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
-                    </div>
-                    <div>
-                      <b>Time:</b>{" "}
-                      {botData.lastRec.at
-                        ? new Date(botData.lastRec.at).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                        : "—"}{" "}
-                      ET
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-gray-600 text-sm mb-3">
-                    {botData?.skipped === "market_closed" ? "Market closed. Waiting for next session." : "No recommendation yet today."}
-                  </div>
-                )}
+          {/* Trade Log — original opaque */}
+          <div>
+            <TradeLog tradeData={tradeData} />
+          </div>
 
-                {(alpaca || botData?.state) && (
-                  <div className="mb-3 text-sm border border-gray-200 rounded p-2">
-                    {(() => {
-                      const money = alpaca?.cash ?? botData?.state?.cash ?? null;
-                      const eq = alpaca?.equity ?? botData?.state?.equity ?? null;
-                      const dayPnl = alpaca?.day_pnl ?? botData?.state?.pnl ?? null;
+          {/* AI Rec + Bot Status — original opaque */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <AIRecommendation
+              botData={botData}
+              alpaca={alpaca}
+              analyzing={analyzing}
+              askAI={askAIRecommendation}
+              stocksCount={stocks.length}
+              recommendation={recommendation}
+            />
+            <BotStatus statusError={statusError} statusTick={statusTick} todayTradeCount={todayTradeCount} />
+          </div>
+        </div>
+      </div>
 
-                      return (
-                        <>
-                          <div>
-                            Money I Have: <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b>{" "}
-                            {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
-                          </div>
-                          <div>
-                            Equity: <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b>{" "}
-                            {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
-                          </div>
-                          <div>
-                            PNL:{" "}
-                            <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
-                              {dayPnl != null ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}` : "—"}
-                            </b>{" "}
-                            {alpaca && <span className="text-xs text-gray-500">(Today, Alpaca)</span>}
-                          </div>
-                          {alpaca?.day_pnl_pct != null && (
-                            <div className="text-xs text-gray-600">Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%</div>
-                          )}
-                        </>
-                      );
-                    })()}
-                  </div>
-                )}
-
-                <Button
-                  onClick={askAIRecommendation}
-                  disabled={analyzing || stocks.length === 0}
-                  className="px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
-                  title={stocks.length === 0 ? "No stocks loaded yet" : "Send list to AI (Top 1 & Top 2)"}
-                >
-                  {analyzing ? "Analyzing..." : "Ask AI"}
-                </Button>
-
-                {recommendation && <div className="mt-3 text-sm whitespace-pre-wrap">{recommendation}</div>}
-                <div className="mt-2 text-xs text-gray-500">
-                  Server ET:{" "}
-                  {botData?.serverTimeET
-                    ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                    : "…"}
-                </div>
-              </Panel>
-            </Rnd>
-
-            {/* ========== Bot Status (controlled) ========== */}
-            <Rnd
-              bounds="#content-area"
-              position={{ x: layout.botstatus.x, y: layout.botstatus.y }}
-              size={{ width: layout.botstatus.width, height: layout.botstatus.height }}
-              minWidth={420}
-              minHeight={220}
-              dragGrid={[10, 10]}
-              resizeGrid={[10, 10]}
-              enableResizing={resizingConfig}
-              onDragStart={() => setActiveKey("botstatus")}
-              onResizeStart={() => setActiveKey("botstatus")}
-              onDrag={(_, d) => setLayout((L) => (L ? { ...L, botstatus: { ...L.botstatus, x: d.x, y: d.y } } : L))}
-              onResize={(_, __, ref, _delta, pos) =>
-                setLayout((L) =>
-                  L ? { ...L, botstatus: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L
-                )
-              }
-              onDragStop={(_, d) => applyAndResolve("botstatus", { ...layout.botstatus, x: d.x, y: d.y })}
-              onResizeStop={(_, __, ref, _delta, pos) =>
-                applyAndResolve("botstatus", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
-              }
-              className={`rounded-2xl border-[0.5px] border-gray-200 shadow-none bg-transparent ${
-                activeKey === "botstatus" ? "z-50" : "z-40"
-              }`}
-            >
-              <Panel title="Bot Status" color="green" dense>
-                {statusError && <p className="text-red-600 text-sm">Error: {statusError}</p>}
-
-                <div className="rounded-lg px-3 py-2 text-sm mb-2 bg-gray-50 border border-gray-200">
-                  {(statusTick as any)?.debug?.lastMessage ?? "Waiting for next update…"}
-                  <div className="mt-1 text-[11px] text-gray-500 space-x-3">
-                    {typeof statusTick?.info?.snapshotAgeMs === "number" && (
-                      <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>
-                    )}
-                    {typeof statusTick?.info?.inEntryWindow === "boolean" && (
-                      <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="text-sm bg-gray-50 border border-gray-200 rounded p-2 mb-2">
-                  <div>Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}</div>
-                  <div>
-                    Server (ET):{" "}
-                    {statusTick?.serverTimeET
-                      ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-                      : "—"}
-                  </div>
-                </div>
-
-                <div className="text-xs">
-                  <div className="font-semibold mb-1">Last Recommendation</div>
-                  <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
-                    {statusTick?.lastRec
-                      ? `Pick: ${statusTick.lastRec.ticker} @ ${
-                          typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
-                        }`
-                      : "No recommendation yet — bot is waiting for a valid pick."}
-                  </div>
-                </div>
-
-                <div className="text-xs mt-2">
-                  <div className="font-semibold mb-1">Open Position</div>
-                  <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
-                    {statusTick?.position
-                      ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(
-                          statusTick.position.entryPrice
-                        ).toFixed(2)}`
-                      : "No open position — bot will enter only if conditions are met during the entry window."}
-                  </div>
-                </div>
-
-                <div className="text-xs mt-2">
-                  <div className="font-semibold mb-1">Recent Trades</div>
-                  <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
-                    {todayTradeCount ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).` : "No trades executed yet today."}
-                  </div>
-                </div>
-              </Panel>
-            </Rnd>
-          </>
-        )}
-
-        {/* Chart overlay (leave as default overlay) */}
-        {chartVisible && selectedStock && (
-          <Rnd
-            bounds="#content-area"
-            default={{ x: (container?.w || 1200) - 880, y: (container?.h || 800) - 580, width: 860, height: 560 }}
-            minWidth={420}
-            minHeight={260}
-            dragGrid={[10, 10]}
-            resizeGrid={[10, 10]}
-            enableResizing={resizingConfig}
-            onDragStart={() => setActiveKey(null)}
-            className="rounded-2xl border-[0.5px] border-gray-200 shadow-xl z-50 bg-transparent"
-          >
+      {/* Chart modal (unchanged) */}
+      {chartVisible && selectedStock && (
+        <div
+          className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setChartVisible(false);
+          }}
+        >
+          <div className="w-full max-w-5xl">
             <Panel
               title={`${selectedStock} Chart`}
               color="slate"
               right={
                 <button
-                  onClick={closeChart}
+                  onClick={() => setChartVisible(false)}
                   className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-slate-300 text-slate-600 hover:bg-slate-100"
                   aria-label="Close chart"
                   title="Close chart"
@@ -1097,57 +596,317 @@ export default function Home() {
                 </div>
               )}
             </Panel>
-          </Rnd>
-        )}
-      </div>
-
-      {/* Reset admin modal */}
-      {showReset && (
-        <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) closeReset();
-          }}
-        >
-          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl border-1 border-gray-300">
-            <div className="text-lg font-semibold text-slate-800">Confirm Reset</div>
-            <p className="mt-1 text-sm text-slate-600">This wipes all trades, positions, and AI picks, and resets the bot balance.</p>
-
-            <label className="block mt-4 text-sm text-slate-700">Password</label>
-            <input
-              type="password"
-              autoFocus
-              className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-rose-500"
-              placeholder="Enter password"
-              value={resetPassword}
-              onChange={(e) => setResetPassword(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && resetPassword) confirmReset();
-                if (e.key === "Escape") closeReset();
-              }}
-            />
-
-            {resetMsg && <div className="mt-3 text-sm">{resetMsg}</div>}
-
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <Button disabled={resetBusy} onClick={closeReset} className="border border-slate-300 text-slate-700 bg-white hover:bg-slate-50">
-                Cancel
-              </Button>
-              <Button
-                disabled={resetBusy || resetPassword.length === 0}
-                onClick={confirmReset}
-                className="bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-60"
-              >
-                {resetBusy ? "Resetting…" : "Confirm Reset"}
-              </Button>
-            </div>
-
-            <div className="mt-3 text-xs text-slate-500">
-              Hint: password is <span className="font-semibold">Fuck OFF</span>
-            </div>
           </div>
         </div>
       )}
     </main>
+  );
+}
+
+/* =========================================================
+   Subpanels (OPAQUE — unchanged)
+   ========================================================= */
+function TopGainers({
+  loading,
+  errorMessage,
+  stocks,
+  dataSource,
+  onAskAI,
+  analyzing,
+  onPick,
+}: {
+  loading: boolean;
+  errorMessage: string | null;
+  stocks: Stock[];
+  dataSource: string;
+  onAskAI: () => void;
+  analyzing: boolean;
+  onPick: (ticker: string) => void;
+}) {
+  const HEADERS = ["Symbol", "Price", "Change %", "Market Cap", "Float", "Volume", "Avg Vol", "Employees"];
+
+  return (
+    <Panel
+      title="Top Gainers"
+      color="purple"
+      dense
+      right={
+        <div className="flex items-center gap-2">
+          <span className="px-2 py-1 rounded-md text-xs font-semibold bg-gray-900 text-white/90">
+            {dataSource || "FMP (stream)"}
+          </span>
+          <Button
+            onClick={onAskAI}
+            disabled={analyzing || stocks.length === 0}
+            className="px-3 py-1 bg-gray-900 text-white hover:bg-gray-800 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            title={stocks.length === 0 ? "No stocks loaded yet" : "Send list to AI (Top 1 & Top 2)"}
+          >
+            {analyzing ? "Analyzing..." : "Ask AI"}
+          </Button>
+        </div>
+      }
+    >
+      {loading ? (
+        <p>Loading live data…</p>
+      ) : errorMessage ? (
+        <p className="text-red-600">{errorMessage}</p>
+      ) : (
+        <div className="h-full overflow-auto">
+          <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
+            <thead>
+              <tr className="bg-black text-white">
+                {HEADERS.map((h, idx) => (
+                  <th
+                    key={h}
+                    className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === HEADERS.length - 1 ? "rounded-r-xl" : ""}`}
+                  >
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {stocks.map((stock) => (
+                <tr key={stock.ticker} className="group cursor-pointer transition" onClick={() => onPick(stock.ticker)}>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
+                    {stock.ticker}
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                    {stock.price != null ? `$${Number(stock.price).toFixed(2)}` : "-"}
+                  </td>
+                  <td
+                    className={`px-3 py-2 bg-white ring-1 ring-gray-200 font-medium ${
+                      stock.changesPercentage >= 0 ? "text-green-600" : "text-red-600"
+                    }`}
+                  >
+                    {stock.changesPercentage?.toFixed?.(2) ?? "-"}%
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                    {stock.marketCap != null ? Number(stock.marketCap).toLocaleString() : "-"}
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                    {stock.sharesOutstanding != null ? Number(stock.sharesOutstanding).toLocaleString() : "-"}
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                    {stock.volume != null ? Number(stock.volume).toLocaleString() : "-"}
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                    {stock.avgVolume != null ? Number(stock.avgVolume).toLocaleString() : "-"}
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">
+                    {stock.employees != null ? Number(stock.employees).toLocaleString() : "-"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function TradeLog({ tradeData }: { tradeData: TradePayload | null }) {
+  return (
+    <Panel title="Trade Log" color="orange" dense>
+      {!tradeData?.trades?.length ? (
+        <p className="text-gray-500 text-sm">No trades yet.</p>
+      ) : (
+        <div className="h-full overflow-auto">
+          <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
+            <thead>
+              <tr className="bg-black text-white">
+                {["Time (ET)", "Side", "Ticker", "Price", "Shares"].map((h, idx, arr) => (
+                  <th key={h} className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {tradeData.trades.map((t) => (
+                <tr key={String(t.id)} className="group">
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
+                    {formatETFromTrade(t)}
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">
+                    <span
+                      className={`px-2 py-0.5 rounded text-xs font-semibold ${
+                        t.side === "BUY" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                      }`}
+                    >
+                      {t.side}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">{t.ticker}</td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200">${Number(t.price).toFixed(2)}</td>
+                  <td className="px-3 py-2 bg-white ring-1 ring-gray-200 last:rounded-r-xl">{t.shares}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function AIRecommendation({
+  botData,
+  alpaca,
+  analyzing,
+  askAI,
+  stocksCount,
+  recommendation,
+}: {
+  botData: any;
+  alpaca: AlpacaAccount | null;
+  analyzing: boolean;
+  askAI: () => void;
+  stocksCount: number;
+  recommendation: string | null;
+}) {
+  return (
+    <Panel title="AI Recommendation" color="blue" dense>
+      {botData?.lastRec ? (
+        <div className="mb-3 text-sm border border-gray-200 rounded p-2 bg-gray-50">
+          <div>
+            <b>AI Pick:</b> {botData.lastRec.ticker}
+          </div>
+          <div>
+            <b>Price:</b>{" "}
+            {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
+          </div>
+          <div>
+            <b>Time:</b>{" "}
+            {botData.lastRec.at
+              ? new Date(botData.lastRec.at).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+              : "—"}{" "}
+            ET
+          </div>
+        </div>
+      ) : (
+        <div className="text-gray-600 text-sm mb-3">
+          {botData?.skipped === "market_closed" ? "Market closed. Waiting for next session." : "No recommendation yet today."}
+        </div>
+      )}
+
+      {(alpaca || botData?.state) && (
+        <div className="mb-3 text-sm border border-gray-200 rounded p-2">
+          {(() => {
+            const money = alpaca?.cash ?? botData?.state?.cash ?? null;
+            const eq = alpaca?.equity ?? botData?.state?.equity ?? null;
+            const dayPnl = alpaca?.day_pnl ?? botData?.state?.pnl ?? null;
+
+            return (
+              <>
+                <div>
+                  Money I Have: <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b>{" "}
+                  {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
+                </div>
+                <div>
+                  Equity: <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b>{" "}
+                  {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
+                </div>
+                <div>
+                  PNL:{" "}
+                  <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
+                    {dayPnl != null ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}` : "—"}
+                  </b>{" "}
+                  {alpaca && <span className="text-xs text-gray-500">(Today, Alpaca)</span>}
+                </div>
+                {alpaca?.day_pnl_pct != null && (
+                  <div className="text-xs text-gray-600">Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%</div>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      <Button
+        onClick={askAI}
+        disabled={analyzing || stocksCount === 0}
+        className="px-4 py-2 bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed"
+        title={stocksCount === 0 ? "No stocks loaded yet" : "Send list to AI (Top 1 & Top 2)"}
+      >
+        {analyzing ? "Analyzing..." : "Ask AI"}
+      </Button>
+
+      {recommendation && <div className="mt-3 text-sm whitespace-pre-wrap">{recommendation}</div>}
+      <div className="mt-2 text-xs text-gray-500">
+        Server ET:{" "}
+        {botData?.serverTimeET
+          ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+          : "…"}
+      </div>
+    </Panel>
+  );
+}
+
+function BotStatus({
+  statusError,
+  statusTick,
+  todayTradeCount,
+}: {
+  statusError: string | null | undefined;
+  statusTick: any;
+  todayTradeCount: number;
+}) {
+  return (
+    <Panel title="Bot Status" color="green" dense>
+      {statusError && <p className="text-red-600 text-sm">Error: {statusError}</p>}
+
+      <div className="rounded-lg px-3 py-2 text-sm mb-2 bg-gray-50 border border-gray-200">
+        {(statusTick as any)?.debug?.lastMessage ?? "Waiting for next update…"}
+        <div className="mt-1 text-[11px] text-gray-500 space-x-3">
+          {typeof statusTick?.info?.snapshotAgeMs === "number" && (
+            <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>
+          )}
+          {typeof statusTick?.info?.inEntryWindow === "boolean" && (
+            <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>
+          )}
+        </div>
+      </div>
+
+      <div className="text-sm bg-gray-50 border border-gray-200 rounded p-2 mb-2">
+        <div>Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}</div>
+        <div>
+          Server (ET):{" "}
+          {statusTick?.serverTimeET
+            ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+            : "—"}
+        </div>
+      </div>
+
+      <div className="text-xs">
+        <div className="font-semibold mb-1">Last Recommendation</div>
+        <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
+          {statusTick?.lastRec
+            ? `Pick: ${statusTick.lastRec.ticker} @ ${
+                typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
+              }`
+            : "No recommendation yet — bot is waiting for a valid pick."}
+        </div>
+      </div>
+
+      <div className="text-xs mt-2">
+        <div className="font-semibold mb-1">Open Position</div>
+        <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
+          {statusTick?.position
+            ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(
+                statusTick.position.entryPrice
+              ).toFixed(2)}`
+            : "No open position — bot will enter only if conditions are met during the entry window."}
+        </div>
+      </div>
+
+      <div className="text-xs mt-2">
+        <div className="font-semibold mb-1">Recent Trades</div>
+        <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
+          {todayTradeCount ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).` : "No trades executed yet today."}
+        </div>
+      </div>
+    </Panel>
   );
 }
