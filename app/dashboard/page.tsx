@@ -21,7 +21,6 @@ function Panel({
   color?: "blue" | "purple" | "green" | "orange" | "rose" | "slate" | "amber" | "cyan";
   right?: React.ReactNode;
   children: React.ReactNode;
-  /** smaller inner padding (helps reduce empty white space) */
   dense?: boolean;
 }) {
   const chip = {
@@ -159,8 +158,6 @@ interface TradePayload {
   trades: Trade[];
   openPos: { ticker: string; entryPrice: number; shares: number } | null;
 }
-
-/** ---- Alpaca account types (for real balances/PnL) ---- */
 type AlpacaAccount = {
   cash: number | null;
   equity: number | null;
@@ -218,16 +215,14 @@ type Layout = {
   botstatus: Rect;
 };
 
-const LAYOUT_KEY = "dash_layout_v6_no_overlap"; // bumped key to avoid stale layouts
+const LAYOUT_KEY = "dash_layout_v7_controlled";
 
-/** Defaults tuned to your last screenshot */
 function computeDefaultLayout(w: number, h: number): Layout {
-  const gap = 22;          // spacing between boxes
-  const left = 460;        // AI Chat width (wider)
-  const halfRight = 480;   // width of each bottom-right half
+  const gap = 22;
+  const left = 460;
+  const halfRight = 480;
   const rightTotal = halfRight * 2 + gap;
 
-  // Trade Log takes ~40–45% height; bottom row uses rest (less blank space)
   const tradeH = Math.max(300, Math.min(420, Math.round(h * 0.44)));
   const bottomH = Math.max(240, h - (tradeH + gap));
 
@@ -246,16 +241,15 @@ function computeDefaultLayout(w: number, h: number): Layout {
   };
 }
 
-/** geometry helpers */
-const MARGIN = 8; // anti-overlap margin
-function clampRectToBounds(r: Rect, W: number, H: number, minW = 380, minH = 220): Rect {
+const MARGIN = 8;
+function clampRectToBounds(r: Rect, W: number, H: number, minW = 320, minH = 200): Rect {
   const w = Math.max(minW, Math.min(r.width, W));
   const h = Math.max(minH, Math.min(r.height, H));
   const x = Math.max(0, Math.min(r.x, W - w));
   const y = Math.max(0, Math.min(r.y, H - h));
   return { x, y, width: w, height: h };
 }
-function overlaps(a: Rect, b: Rect, margin = MARGIN): boolean {
+function overlaps(a: Rect, b: Rect, margin = MARGIN) {
   return !(
     a.x + a.width + margin <= b.x ||
     b.x + b.width + margin <= a.x ||
@@ -272,61 +266,33 @@ function layoutToArray(layout: Layout): Array<[keyof Layout, Rect]> {
     ["botstatus", layout.botstatus],
   ];
 }
-
-/**
- * Try to resolve overlaps by nudging the moved rect to the right/down
- * in small steps, keeping it inside bounds. Bounded attempts so it finishes fast.
- */
-function resolveCollisions(
-  layout: Layout,
-  movedKey: keyof Layout,
-  W: number,
-  H: number
-): Layout {
-  const STEP = 10;        // pixels per nudge
-  const MAX_TRIES = 300;  // upper bound
-  const MIN_W = 320;      // safety min widths when clamping
-  const MIN_H = 200;
-
+function resolveCollisions(layout: Layout, movedKey: keyof Layout, W: number, H: number): Layout {
+  const STEP = 10;
+  const MAX_TRIES = 300;
   let next: Layout = { ...layout, [movedKey]: { ...layout[movedKey] } } as Layout;
-  // First clamp to bounds
-  next[movedKey] = clampRectToBounds(next[movedKey], W, H, MIN_W, MIN_H);
+  next[movedKey] = clampRectToBounds(next[movedKey], W, H);
 
-  const moved = () => next[movedKey];
   let tries = 0;
-
-  // Keep pushing until no overlap or we hit limit
   while (tries++ < MAX_TRIES) {
-    let collidedWith: keyof Layout | null = null;
-
+    let collision: keyof Layout | null = null;
     for (const [key, rect] of layoutToArray(next)) {
       if (key === movedKey) continue;
-      if (overlaps(moved(), rect)) {
-        collidedWith = key;
+      if (overlaps(next[movedKey], rect)) {
+        collision = key;
         break;
       }
     }
+    if (!collision) break;
 
-    if (!collidedWith) break; // no collisions — done
+    const m = next[movedKey];
+    const canRight = m.x + m.width + STEP <= W;
+    const canDown = m.y + m.height + STEP <= H;
+    if (canRight) next[movedKey] = { ...m, x: Math.min(W - m.width, m.x + STEP) };
+    else if (canDown) next[movedKey] = { ...m, y: Math.min(H - m.height, m.y + STEP) };
+    else next[movedKey] = { ...m, x: 0, y: Math.min(H - m.height, m.y + STEP) };
 
-    // Nudge strategy: prefer push right; if can't, push down; else wrap to x=0 and push down
-    const m = moved();
-    const canPushRight = m.x + m.width + STEP <= W;
-    const canPushDown = m.y + m.height + STEP <= H;
-
-    if (canPushRight) {
-      next[movedKey] = { ...m, x: Math.min(W - m.width, m.x + STEP) };
-    } else if (canPushDown) {
-      next[movedKey] = { ...m, y: Math.min(H - m.height, m.y + STEP) };
-    } else {
-      // Try wrapping to left and move down a row
-      const newY = Math.min(H - m.height, m.y + STEP);
-      next[movedKey] = { ...m, x: 0, y: newY };
-    }
+    next[movedKey] = clampRectToBounds(next[movedKey], W, H);
   }
-
-  // Final clamp just in case
-  next[movedKey] = clampRectToBounds(next[movedKey], W, H, MIN_W, MIN_H);
   return next;
 }
 
@@ -363,7 +329,7 @@ export default function Home() {
   const [tradeData, setTradeData] = useState<TradePayload | null>(null);
   const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
 
-  // ---- NEW: real Alpaca account state ----
+  // Alpaca account state
   const [alpaca, setAlpaca] = useState<AlpacaAccount | null>(null);
 
   // SSE: stocks
@@ -397,7 +363,7 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // Poll /api/trades (today by default from your backend)
+  // Poll /api/trades
   useEffect(() => {
     let id: any;
     const run = async () => {
@@ -412,7 +378,7 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // ---- NEW: poll /api/alpaca/account every 10s ----
+  // Poll Alpaca account
   useEffect(() => {
     let id: any;
     const run = async () => {
@@ -432,7 +398,6 @@ export default function Home() {
     try {
       setAnalyzing(true);
       setRecommendation(null);
-
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -603,7 +568,7 @@ export default function Home() {
   const contentRef = useRef<HTMLDivElement>(null);
   const [container, setContainer] = useState<{ w: number; h: number } | null>(null);
   const [layout, setLayout] = useState<Layout | null>(null);
-  const [activeKey, setActiveKey] = useState<keyof Layout | null>(null); // raise z-index while dragging
+  const [activeKey, setActiveKey] = useState<keyof Layout | null>(null);
 
   useEffect(() => {
     const el = contentRef.current;
@@ -643,7 +608,7 @@ export default function Home() {
     } catch {}
   };
 
-  // unified handlers that resolve overlaps
+  // unified handlers
   const applyAndResolve = (key: keyof Layout, rect: Rect) => {
     if (!layout || !container) return;
     const base: Layout = { ...layout, [key]: rect } as Layout;
@@ -675,10 +640,11 @@ export default function Home() {
       >
         {layout && (
           <>
-            {/* AI Chat — wider left column */}
+            {/* ========== AI Chat (controlled) ========== */}
             <Rnd
               bounds="#content-area"
-              default={{ x: layout.chat.x, y: layout.chat.y, width: layout.chat.width, height: layout.chat.height }}
+              position={{ x: layout.chat.x, y: layout.chat.y }}
+              size={{ width: layout.chat.width, height: layout.chat.height }}
               minWidth={380}
               minHeight={260}
               dragGrid={[10, 10]}
@@ -686,9 +652,11 @@ export default function Home() {
               enableResizing={resizingConfig}
               onDragStart={() => setActiveKey("chat")}
               onResizeStart={() => setActiveKey("chat")}
-              onDragStop={(_, d) =>
-                applyAndResolve("chat", { ...layout.chat, x: d.x, y: d.y })
+              onDrag={(_, d) => setLayout((L) => (L ? { ...L, chat: { ...L.chat, x: d.x, y: d.y } } : L))}
+              onResize={(_, __, ref, _delta, pos) =>
+                setLayout((L) => (L ? { ...L, chat: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L))
               }
+              onDragStop={(_, d) => applyAndResolve("chat", { ...layout.chat, x: d.x, y: d.y })}
               onResizeStop={(_, __, ref, _delta, pos) =>
                 applyAndResolve("chat", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
               }
@@ -701,10 +669,11 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* Top Gainers — big center */}
+            {/* ========== Top Gainers (controlled) ========== */}
             <Rnd
               bounds="#content-area"
-              default={{ x: layout.gainers.x, y: layout.gainers.y, width: layout.gainers.width, height: layout.gainers.height }}
+              position={{ x: layout.gainers.x, y: layout.gainers.y }}
+              size={{ width: layout.gainers.width, height: layout.gainers.height }}
               minWidth={720}
               minHeight={420}
               dragGrid={[10, 10]}
@@ -712,9 +681,13 @@ export default function Home() {
               enableResizing={resizingConfig}
               onDragStart={() => setActiveKey("gainers")}
               onResizeStart={() => setActiveKey("gainers")}
-              onDragStop={(_, d) =>
-                applyAndResolve("gainers", { ...layout.gainers, x: d.x, y: d.y })
+              onDrag={(_, d) => setLayout((L) => (L ? { ...L, gainers: { ...L.gainers, x: d.x, y: d.y } } : L))}
+              onResize={(_, __, ref, _delta, pos) =>
+                setLayout((L) =>
+                  L ? { ...L, gainers: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L
+                )
               }
+              onDragStop={(_, d) => applyAndResolve("gainers", { ...layout.gainers, x: d.x, y: d.y })}
               onResizeStop={(_, __, ref, _delta, pos) =>
                 applyAndResolve("gainers", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
               }
@@ -763,11 +736,7 @@ export default function Home() {
                       </thead>
                       <tbody>
                         {stocks.map((stock) => (
-                          <tr
-                            key={stock.ticker}
-                            className="group cursor-pointer"
-                            onClick={() => handleStockClick(stock.ticker)}
-                          >
+                          <tr key={stock.ticker} className="group cursor-pointer" onClick={() => handleStockClick(stock.ticker)}>
                             <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
                               {stock.ticker}
                             </td>
@@ -805,10 +774,11 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* Trade Log — top-right (wide) */}
+            {/* ========== Trade Log (controlled) ========== */}
             <Rnd
               bounds="#content-area"
-              default={{ x: layout.tradelog.x, y: layout.tradelog.y, width: layout.tradelog.width, height: layout.tradelog.height }}
+              position={{ x: layout.tradelog.x, y: layout.tradelog.y }}
+              size={{ width: layout.tradelog.width, height: layout.tradelog.height }}
               minWidth={940}
               minHeight={260}
               dragGrid={[10, 10]}
@@ -816,9 +786,13 @@ export default function Home() {
               enableResizing={resizingConfig}
               onDragStart={() => setActiveKey("tradelog")}
               onResizeStart={() => setActiveKey("tradelog")}
-              onDragStop={(_, d) =>
-                applyAndResolve("tradelog", { ...layout.tradelog, x: d.x, y: d.y })
+              onDrag={(_, d) => setLayout((L) => (L ? { ...L, tradelog: { ...L.tradelog, x: d.x, y: d.y } } : L))}
+              onResize={(_, __, ref, _delta, pos) =>
+                setLayout((L) =>
+                  L ? { ...L, tradelog: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L
+                )
               }
+              onDragStop={(_, d) => applyAndResolve("tradelog", { ...layout.tradelog, x: d.x, y: d.y })}
               onResizeStop={(_, __, ref, _delta, pos) =>
                 applyAndResolve("tradelog", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
               }
@@ -856,10 +830,7 @@ export default function Home() {
                       <thead>
                         <tr className="bg-black text-white">
                           {["Time (ET)", "Side", "Ticker", "Price", "Shares"].map((h, idx, arr) => (
-                            <th
-                              key={h}
-                              className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}
-                            >
+                            <th key={h} className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}>
                               {h}
                             </th>
                           ))}
@@ -892,10 +863,11 @@ export default function Home() {
               </Panel>
             </Rnd>
 
-            {/* AI Recommendation — bottom-right left */}
+            {/* ========== AI Recommendation (controlled) ========== */}
             <Rnd
               bounds="#content-area"
-              default={{ x: layout.airec.x, y: layout.airec.y, width: layout.airec.width, height: layout.airec.height }}
+              position={{ x: layout.airec.x, y: layout.airec.y }}
+              size={{ width: layout.airec.width, height: layout.airec.height }}
               minWidth={420}
               minHeight={220}
               dragGrid={[10, 10]}
@@ -903,9 +875,11 @@ export default function Home() {
               enableResizing={resizingConfig}
               onDragStart={() => setActiveKey("airec")}
               onResizeStart={() => setActiveKey("airec")}
-              onDragStop={(_, d) =>
-                applyAndResolve("airec", { ...layout.airec, x: d.x, y: d.y })
+              onDrag={(_, d) => setLayout((L) => (L ? { ...L, airec: { ...L.airec, x: d.x, y: d.y } } : L))}
+              onResize={(_, __, ref, _delta, pos) =>
+                setLayout((L) => (L ? { ...L, airec: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L))
               }
+              onDragStop={(_, d) => applyAndResolve("airec", { ...layout.airec, x: d.x, y: d.y })}
               onResizeStop={(_, __, ref, _delta, pos) =>
                 applyAndResolve("airec", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
               }
@@ -916,8 +890,13 @@ export default function Home() {
               <Panel title="AI Recommendation" color="blue" dense>
                 {botData?.lastRec ? (
                   <div className="mb-3 text-sm border border-gray-200 rounded p-2 bg-gray-50">
-                    <div><b>AI Pick:</b> {botData.lastRec.ticker}</div>
-                    <div><b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}</div>
+                    <div>
+                      <b>AI Pick:</b> {botData.lastRec.ticker}
+                    </div>
+                    <div>
+                      <b>Price:</b>{" "}
+                      {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
+                    </div>
                     <div>
                       <b>Time:</b>{" "}
                       {botData.lastRec.at
@@ -932,39 +911,32 @@ export default function Home() {
                   </div>
                 )}
 
-                {/* ---- NEW: Prefer real Alpaca balances/PnL; fallback to bot state ---- */}
                 {(alpaca || botData?.state) && (
                   <div className="mb-3 text-sm border border-gray-200 rounded p-2">
                     {(() => {
                       const money = alpaca?.cash ?? botData?.state?.cash ?? null;
-                      const eq    = alpaca?.equity ?? botData?.state?.equity ?? null;
+                      const eq = alpaca?.equity ?? botData?.state?.equity ?? null;
                       const dayPnl = alpaca?.day_pnl ?? botData?.state?.pnl ?? null;
 
                       return (
                         <>
                           <div>
-                            Money I Have:{" "}
-                            <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b>{" "}
+                            Money I Have: <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b>{" "}
                             {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
                           </div>
                           <div>
-                            Equity:{" "}
-                            <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b>{" "}
+                            Equity: <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b>{" "}
                             {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
                           </div>
                           <div>
                             PNL:{" "}
                             <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
-                              {dayPnl != null
-                                ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}`
-                                : "—"}
+                              {dayPnl != null ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}` : "—"}
                             </b>{" "}
                             {alpaca && <span className="text-xs text-gray-500">(Today, Alpaca)</span>}
                           </div>
                           {alpaca?.day_pnl_pct != null && (
-                            <div className="text-xs text-gray-600">
-                              Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%
-                            </div>
+                            <div className="text-xs text-gray-600">Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%</div>
                           )}
                         </>
                       );
@@ -983,15 +955,19 @@ export default function Home() {
 
                 {recommendation && <div className="mt-3 text-sm whitespace-pre-wrap">{recommendation}</div>}
                 <div className="mt-2 text-xs text-gray-500">
-                  Server ET: {botData?.serverTimeET ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "…"}
+                  Server ET:{" "}
+                  {botData?.serverTimeET
+                    ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+                    : "…"}
                 </div>
               </Panel>
             </Rnd>
 
-            {/* Bot Status — bottom-right right */}
+            {/* ========== Bot Status (controlled) ========== */}
             <Rnd
               bounds="#content-area"
-              default={{ x: layout.botstatus.x, y: layout.botstatus.y, width: layout.botstatus.width, height: layout.botstatus.height }}
+              position={{ x: layout.botstatus.x, y: layout.botstatus.y }}
+              size={{ width: layout.botstatus.width, height: layout.botstatus.height }}
               minWidth={420}
               minHeight={220}
               dragGrid={[10, 10]}
@@ -999,9 +975,13 @@ export default function Home() {
               enableResizing={resizingConfig}
               onDragStart={() => setActiveKey("botstatus")}
               onResizeStart={() => setActiveKey("botstatus")}
-              onDragStop={(_, d) =>
-                applyAndResolve("botstatus", { ...layout.botstatus, x: d.x, y: d.y })
+              onDrag={(_, d) => setLayout((L) => (L ? { ...L, botstatus: { ...L.botstatus, x: d.x, y: d.y } } : L))}
+              onResize={(_, __, ref, _delta, pos) =>
+                setLayout((L) =>
+                  L ? { ...L, botstatus: { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight } } : L
+                )
               }
+              onDragStop={(_, d) => applyAndResolve("botstatus", { ...layout.botstatus, x: d.x, y: d.y })}
               onResizeStop={(_, __, ref, _delta, pos) =>
                 applyAndResolve("botstatus", { x: pos.x, y: pos.y, width: ref.offsetWidth, height: ref.offsetHeight })
               }
@@ -1059,9 +1039,7 @@ export default function Home() {
                 <div className="text-xs mt-2">
                   <div className="font-semibold mb-1">Recent Trades</div>
                   <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
-                    {todayTradeCount
-                      ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).`
-                      : "No trades executed yet today."}
+                    {todayTradeCount ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).` : "No trades executed yet today."}
                   </div>
                 </div>
               </Panel>
@@ -1069,7 +1047,7 @@ export default function Home() {
           </>
         )}
 
-        {/* Chart overlay */}
+        {/* Chart overlay (leave as default overlay) */}
         {chartVisible && selectedStock && (
           <Rnd
             bounds="#content-area"
@@ -1133,9 +1111,7 @@ export default function Home() {
         >
           <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl border-1 border-gray-300">
             <div className="text-lg font-semibold text-slate-800">Confirm Reset</div>
-            <p className="mt-1 text-sm text-slate-600">
-              This wipes all trades, positions, and AI picks, and resets the bot balance.
-            </p>
+            <p className="mt-1 text-sm text-slate-600">This wipes all trades, positions, and AI picks, and resets the bot balance.</p>
 
             <label className="block mt-4 text-sm text-slate-700">Password</label>
             <input
