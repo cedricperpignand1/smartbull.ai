@@ -286,7 +286,7 @@ async function fetchBarsWindow(symbols: string[], startISO: string, endISO: stri
   return out;
 }
 
-// Get or refresh the 09:00–09:45 snapshot with caching/throttling
+// Get or fetch the 09:00–09:45 snapshot with caching/throttling
 async function getOrFetchPremarket(symbols: string[]) {
   const out: Record<string, PMetrics> = {};
   for (const s of symbols) out[s] = {};
@@ -319,14 +319,12 @@ async function getOrFetchPremarket(symbols: string[]) {
 
   // If we have a cache built to the day's final end (09:45), just reuse
   if (nowAfter945 && pmCacheDate === today && pmCacheEndISO) {
-    // if endISO equals the 09:45 ISO and we have cache, reuse
     return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
   }
 
   // Throttle refetches while between 09:00 and 09:45
   const nowMs = Date.now();
   if (!nowAfter945 && pmLastFetchMs && (nowMs - pmLastFetchMs) < PM_FETCH_THROTTLE_MS) {
-    // return what we have (maybe partial) to save calls
     return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
   }
 
@@ -416,6 +414,31 @@ function buildExplanationForPick(
 }
 
 /* ──────────────────────────────────────────────────────────
+   Soft preference helpers (Employees + AvgVolume)
+   ────────────────────────────────────────────────────────── */
+function buildSoftPrefScorer(rows: Array<{ employees?: number|null; avgVolume?: number|null }>) {
+  const empVals = rows.map(r => r.employees ?? null).filter((v): v is number => v != null && Number.isFinite(v));
+  const avgVals = rows.map(r => r.avgVolume ?? null).filter((v): v is number => v != null && Number.isFinite(v));
+
+  const empMin = empVals.length ? Math.min(...empVals) : null;
+  const empMax = empVals.length ? Math.max(...empVals) : null;
+  const avgMin = avgVals.length ? Math.min(...avgVals) : null;
+  const avgMax = avgVals.length ? Math.max(...avgVals) : null;
+
+  const norm = (x: number|null, lo: number|null, hi: number|null) => {
+    if (x == null || lo == null || hi == null || !Number.isFinite(x) || hi - lo <= 0) return 0;
+    return Math.max(0, Math.min(1, (x - lo) / (hi - lo)));
+  };
+
+  return (row: { employees?: number|null; avgVolume?: number|null }) => {
+    const empN = norm(row.employees ?? null, empMin, empMax);
+    const avgN = norm(row.avgVolume ?? null, avgMin, avgMax);
+    // equal weight; tweak if you want to favor one more
+    return 0.5 * avgN + 0.5 * empN;
+  };
+}
+
+/* ──────────────────────────────────────────────────────────
    Route
    ────────────────────────────────────────────────────────── */
 export async function POST(req: Request) {
@@ -501,6 +524,12 @@ export async function POST(req: Request) {
       })
     );
 
+    /* Soft preference scoring (Employees + AvgVolume) */
+    const scoreSoft = buildSoftPrefScorer(enriched);
+    for (const r of enriched) {
+      (r as any).softPref = scoreSoft(r); // 0..1
+    }
+
     /* Hard filters */
     const filtered = enriched.filter((s) => {
       const passAvgVol    = (s.avgVolume ?? 0) >= 500_000;
@@ -513,11 +542,16 @@ export async function POST(req: Request) {
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
-    // Top candidates AFTER FMP filters; send up to 8 for the morning window
-    const candidates = (filtered.length ? filtered : enriched)
-      .slice()
-      .sort((a, b) => (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0))
-      .slice(0, PREMARKET_LIMIT);
+    // Top candidates AFTER FMP filters; primarily by DollarVol, tie-break by SoftPref
+    const byDollarVol = (arr: any[]) =>
+      arr.slice().sort((a, b) => {
+        const dv = (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0);
+        if (Math.abs(dv) > 0) return dv;
+        // tiebreaker: higher softPref wins
+        return ((b as any).softPref ?? 0) - ((a as any).softPref ?? 0);
+      });
+
+    const candidates = byDollarVol(filtered.length ? filtered : enriched).slice(0, PREMARKET_LIMIT);
 
     /* ── Get or fetch the 09:00–09:45 snapshot (cached) ── */
     const symbols = candidates.map(c => String(c.ticker).toUpperCase());
@@ -536,7 +570,7 @@ export async function POST(req: Request) {
       (c as any).pmScore = pm.pmScore ?? null;
     }
 
-    /* Prompt (JSON mode), augmented with 09:00–09:45 signals */
+    /* Prompt (JSON mode), augmented with 09:00–09:45 signals + soft pref */
     const lines = candidates.map((s) => {
       const pct =
         s.changesPercentage == null
@@ -556,6 +590,7 @@ export async function POST(req: Request) {
         `RelVolFloat:${s.relVolFloat != null ? s.relVolFloat.toFixed(3) + "x" : "n/a"}`,
         `DollarVol:${s.dollarVolume != null ? Math.round(s.dollarVolume).toLocaleString() : "n/a"}`,
         `Employees:${s.employees ?? "n/a"}`,
+        `SoftPref:${((s as any).softPref ?? 0).toFixed(2)}`, // 0..1 helper for tie-break
         `ProfitMarginTTM:${s.profitMarginTTM != null ? (Math.abs(s.profitMarginTTM) <= 1 ? (s.profitMarginTTM*100).toFixed(2) : s.profitMarginTTM.toFixed(2)) + "%" : "n/a"}`,
         `Sector:${s.sector ?? "n/a"}`,
         `Industry:${s.industry ?? "n/a"}`,
@@ -593,6 +628,8 @@ Use ONLY the provided data (no outside facts).
 - Spike Potential: smaller Float (≤ 50M) preferred but allow larger with very high DollarVol.
 - Quality: prefer positive netProfitMarginTTM.
 - Catalysts: positive headlines; penalize clusters of negatives.
+- **Soft Preference (tie-break, ~10% weight)**: when two candidates are similar on the above,
+  slightly prefer the one with **higher Employees** and **higher AvgVol** (see the provided SoftPref value, 0–1).
 
 ## Output (strict JSON)
 {
@@ -711,6 +748,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           profitMarginTTM: x.profitMarginTTM,
           headlinePos: x.headlinePos,
           headlineNeg: x.headlineNeg,
+          softPref: (x as any).softPref ?? 0, // expose for debugging
           // Morning 09:00–09:45 context
           amHigh: x.pmHigh ?? null,
           amLow: x.pmLow ?? null,
