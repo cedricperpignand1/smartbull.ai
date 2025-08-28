@@ -1,4 +1,6 @@
 import type { Metadata } from "next";
+import { GeistSans } from "geist/font/sans";
+import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 import SessionProviderWrapper from "../providers/SessionProviderWrapper";
 import AuthGuard from "../components/AuthGuard";
@@ -15,7 +17,8 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className="font-sans antialiased">
+      {/* NOTE: fonts are objects, not functions */}
+      <body className={`${GeistSans.className} ${GeistMono.variable} antialiased`}>
         <SessionProviderWrapper>
           <AuthGuard>{children}</AuthGuard>
         </SessionProviderWrapper>
