@@ -439,8 +439,8 @@ export async function POST(req: Request) {
         const [profile, ratios, news, avgVolRaw, quote] = await Promise.all([
           fmpProfileCached(row.ticker),
           fmpRatiosTTMCached(row.ticker),
-          fmpNewsCached(row.ticker, 3),          // ⬅️ smaller news set to save calls
-          fmpAvgVolumeSmartCached(row.ticker),   // ⬅️ quote-first avgVolume, historical fallback
+          fmpNewsCached(row.ticker, 3),
+          fmpAvgVolumeSmartCached(row.ticker),
           fmpQuoteCached(row.ticker),
         ]);
 
@@ -480,16 +480,23 @@ export async function POST(req: Request) {
       (r as any).softPref = scoreSoft(r); // 0..1
     }
 
-    /* Hard filters */
+    /* Hard filters (UPDATED PRICE BAND: $1–$70) */
     const filtered = enriched.filter((s) => {
       const passAvgVol    = (s.avgVolume ?? 0) >= 500_000;
       const passRelVol    = (s.relVol ?? 0) >= 3.0;
       const passDollarVol = (s.dollarVolume ?? 0) >= 10_000_000;
       const p = s.price ?? 0;
-      const passPrice     = p >= 1 && p <= 50;
+      const passPrice     = p >= 1 && p <= 70; // ← updated from 50 → 70
       const passVenue     = !s.isEtf && !s.isOTC;
       const passFloat     = (s.sharesOutstanding ?? 0) > 1_999_999;
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
+    });
+
+    // EXTRA price-band safety: if no "filtered" survive other rules,
+    // prefer $1–$70 names from enriched before falling back to everything.
+    const enrichedPriceBand = enriched.filter((s) => {
+      const p = s.price ?? 0;
+      return p >= 1 && p <= 70;
     });
 
     // Top candidates AFTER FMP filters; primarily by DollarVol, tie-break by SoftPref (employees-weighted)
@@ -501,7 +508,12 @@ export async function POST(req: Request) {
         return ((b as any).softPref ?? 0) - ((a as any).softPref ?? 0);
       });
 
-    const candidates = byDollarVol(filtered.length ? filtered : enriched).slice(0, PREMARKET_LIMIT);
+    const prePool =
+      filtered.length
+        ? filtered
+        : (enrichedPriceBand.length ? enrichedPriceBand : enriched);
+
+    const candidates = byDollarVol(prePool).slice(0, PREMARKET_LIMIT);
 
     /* ── Get or fetch the 09:00–09:45 snapshot (cached) ── */
     const symbols = candidates.map(c => String(c.ticker).toUpperCase());
@@ -568,7 +580,7 @@ Use ONLY the provided data (no outside facts).
 - AvgVolume ≥ 500,000
 - Live Volume ≥ 3 × AvgVolume (RelVol ≥ 3.0)
 - Dollar Volume today ≥ $10,000,000
-- Price between $1 and $50
+- Price between $1 and $70
 - Exclude ETFs/ETNs and OTC
 - Float (sharesOutstanding) > 1,999,999
 
