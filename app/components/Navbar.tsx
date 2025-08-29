@@ -204,7 +204,7 @@ export default function Navbar() {
               className="
                 inline-flex items-center rounded-md
                 px-4 py-2 text-base font-semibold
-                bg-white text-blue-700 hover:bg-gray-50
+                bg-white text-black hover:bg-gray-50
                 shadow-sm
                 transition
               "
