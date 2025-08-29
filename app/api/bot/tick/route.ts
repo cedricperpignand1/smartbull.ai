@@ -17,6 +17,8 @@ import {
   spreadGuardOK,
   // NEW: fetch real Alpaca balances
   getAccount,
+  // NEW: market sell helper for partial TP
+  sellMarket,
 } from "@/lib/alpaca";
 
 // ✅ Use the cached FMP helpers
@@ -43,9 +45,9 @@ const TOP_CANDIDATES = 8;
 
 // Ratchet config
 const RATCHET_ENABLED = true;
-const RATCHET_STEP_PCT = 0.05;
-const RATCHET_LIFT_BROKER_CHILDREN = true;
-const RATCHET_VIRTUAL_EXITS = true;
+const RATCHET_STEP_PCT = 0.05; // trail jumps every +5% from entry (compounded)
+const RATCHET_LIFT_BROKER_CHILDREN = true; // keep trying to lift TP/SL children upward (never down)
+const RATCHET_VIRTUAL_EXITS = true;        // also do virtual exits if dyn TP/SL hit
 
 // Alpaca TP/SL lift cooldown
 const LIFT_COOLDOWN_MS = 6000;
@@ -343,12 +345,6 @@ function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
   if (!avgPrior) return { mult: null as number | null, latestVol: latest.volume, avgPrior };
   return { mult: latest.volume / avgPrior, latestVol: latest.volume, avgPrior };
 }
-function computeDayHighSoFar(candles: Candle[], todayYMD: string) {
-  const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
-  const prior = day.slice(0, -1);
-  if (!prior.length) return null;
-  return Math.max(...prior.map((c) => c.high));
-}
 
 /** Buy-the-Dip helpers */
 function sessionOpenAt930(candles: Candle[], todayYMD: string): number | null {
@@ -405,7 +401,7 @@ function dipArmedNow(params: {
   };
 }
 
-/** Ratcheting targets */
+/** Ratcheting targets (never lower than initial stop) */
 function computeRatchetTargets(entry: number, dayHighSinceOpen: number) {
   if (!RATCHET_ENABLED) return null;
   if (!Number.isFinite(entry) || !Number.isFinite(dayHighSinceOpen) || entry <= 0) return null;
@@ -413,9 +409,9 @@ function computeRatchetTargets(entry: number, dayHighSinceOpen: number) {
   const step = Math.max(0.0001, RATCHET_STEP_PCT);
   const steps = Math.max(0, Math.floor(upFromEntry / step));
   const factor = Math.pow(1 + step, steps);
-  const initialSL = entry * (1 + STOP_PCT);
+  const initialSL = entry * (1 + STOP_PCT); // entry * 0.95
   const initialTP = entry * (1 + TARGET_PCT);
-  const dynSL = initialSL * factor;
+  const dynSL = Math.max(initialSL, initialSL * factor);
   const dynTP = initialTP * factor;
   const round2 = (n: number) => Math.round(n * 100) / 100;
   return {
@@ -525,9 +521,7 @@ function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" |
   return toPct(base);
 }
 
-/** ───────────────── NEW: Evaluate-only pass for a ticker ─────────────────
- * Returns all eligibility + signals without placing any orders.
- */
+/** ───────────────── Evaluate-only pass for a ticker ───────────────── */
 async function evaluateEntrySignals(
   ticker: string,
   snapshot: { stocks: SnapStock[] } | null,
@@ -665,6 +659,12 @@ async function placeEntryNow(
   }
 }
 
+/** ─────────── memos for runtime-only state ─────────── */
+// Track that we already sold half once for a given ticker/day
+const partialTPMemo: Record<string, { day: string; taken: boolean }> = {};
+// Never lower SL: remember last pushed SL per ticker for the day
+const lastDynSLMemo: Record<string, { day: string; sl: number }> = {};
+
 /** ───────────────── Route handlers ───────────────── */
 export async function GET(req: Request) { return handle(req); }
 export async function POST(req: Request) { return handle(req); }
@@ -709,6 +709,7 @@ async function handle(req: Request) {
       try {
         await closePositionMarket(exitTicker);
 
+        // ⬇️ Use cached quote for exit valuation
         const q = await fmpQuoteCached(exitTicker);
         const parsed = priceFromFmp(q);
         const p = parsed != null ? parsed : Number(openPos.entryPrice);
@@ -828,7 +829,7 @@ async function handle(req: Request) {
         const picks = [primary, secondary].filter(Boolean) as string[];
         debug.scan_considered_order = picks;
 
-        // NEW: evaluate both first (no orders yet)
+        // Evaluate both first
         const evals: Record<string, Awaited<ReturnType<typeof evaluateEntrySignals>>> = {};
         for (const sym of picks) {
           evals[sym!] = await evaluateEntrySignals(sym!, snapshot, today);
@@ -845,7 +846,7 @@ async function handle(req: Request) {
           .sort((a, b) => {
             const pa = Number(evals[a]?.meta?.dipMeta?.pullbackPct ?? 0);
             const pb = Number(evals[b]?.meta?.dipMeta?.pullbackPct ?? 0);
-            return pb - pa; // bigger pullback wins
+            return pb - pa;
           });
 
         if (dipArmed.length) {
@@ -878,7 +879,7 @@ async function handle(req: Request) {
             if (already) {
               debug.reasons.push("scan_pos_open_after_claim");
             } else {
-              // Resolve reference price (use last close from eval; fallback to snapshot/quote if needed)
+              // Resolve reference price
               let ref = evals[chosen]?.refPrice ?? null;
               if (ref == null || !Number.isFinite(Number(ref))) {
                 ref = Number(snapshot?.stocks?.find((s) => s.ticker === chosen)?.price ?? NaN);
@@ -1002,7 +1003,7 @@ async function handle(req: Request) {
       }
     }
 
-    /** ───────────────── Holding: refresh equity + ratchet (unchanged) ───────────────── */
+    /** ───────────────── Holding: refresh equity + partial TP + ratchet ───────────────── */
     if (openPos) {
       const q = await fmpQuoteCached(openPos.ticker);
       const pParsed = priceFromFmp(q);
@@ -1024,12 +1025,75 @@ async function handle(req: Request) {
             const prior = day.slice(0, -1);
             const dayHigh = Math.max(...prior.map((c) => c.high));
 
-            const rat = computeRatchetTargets(Number(openPos.entryPrice), dayHigh);
-            if (rat) {
+            const entry = Number(openPos.entryPrice);
+            const rat = computeRatchetTargets(entry, dayHigh);
+
+            // ── Try partial take-profit once at +10% from entry ──
+            const baseTP = Math.round(entry * (1 + TARGET_PCT) * 100) / 100;
+            const memoKey = `${openPos.ticker}:${todayYMD}`;
+            const alreadyTookHalf = partialTPMemo[memoKey]?.taken === true && partialTPMemo[memoKey].day === todayYMD;
+
+            if (!alreadyTookHalf && p >= baseTP) {
+              const half = Math.floor(Number(openPos.shares) / 2);
+              if (half >= 1) {
+                try {
+                  await sellMarket({ symbol: openPos.ticker, qty: half }); // real broker sell half
+
+                  const realized = half * (p - entry);
+                  const exitVal  = half * p;
+                  // Record trade + shrink open position shares (keep it open)
+                  await prisma.trade.create({ data: { side: "SELL", ticker: openPos.ticker, price: p, shares: half } });
+                  await prisma.position.update({
+                    where: { id: openPos.id },
+                    data: { shares: Number(openPos.shares) - half }
+                  });
+
+                  // Update state
+                  state = await prisma.botState.update({
+                    where: { id: 1 },
+                    data: {
+                      cash:   Number(state!.cash) + exitVal,
+                      pnl:    Number(state!.pnl) + realized,
+                      equity: Number(state!.cash) + exitVal + (Number(openPos.shares) - half) * p,
+                    },
+                  });
+
+                  // Mark memo
+                  partialTPMemo[memoKey] = { day: todayYMD, taken: true };
+                  debug.partialTP = { tookHalfAt: p, baseTP, halfQty: half };
+                  // Refresh local openPos snapshot for the rest of this tick
+                  openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+
+                  // Optional: lift remaining children to current dyn targets (if any)
+                  if (rat && RATCHET_LIFT_BROKER_CHILDREN && openPos) {
+                    const prev = lastDynSLMemo[memoKey]?.sl ?? rat.initialSL;
+                    const monotonicSL = Math.max(prev, rat.dynSL);
+                    try {
+                      await replaceTpSlIfBetter({
+                        symbol: openPos.ticker,
+                        newTp: rat.dynTP,
+                        newSl: monotonicSL,
+                      });
+                      lastDynSLMemo[memoKey] = { day: todayYMD, sl: monotonicSL };
+                    } catch {}
+                  }
+                } catch (e: any) {
+                  debug.reasons.push(`partial_tp_sell_exception:${e?.message || "unknown"}`);
+                }
+              }
+            }
+
+            // ── Ratchet trailing for the remaining shares ──
+            if (rat && openPos) {
+              // Never lower SL (monotonic)
+              const prevSL = lastDynSLMemo[memoKey]?.sl ?? rat.initialSL;
+              const monotonicSL = Math.max(prevSL, rat.dynSL);
+              lastDynSLMemo[memoKey] = { day: todayYMD, sl: monotonicSL };
+
               debug.ratchet = {
                 steps: rat.steps,
                 dayHigh: Math.round(dayHigh * 100) / 100,
-                dynSL: rat.dynSL,
+                dynSL: monotonicSL,
                 dynTP: rat.dynTP
               };
 
@@ -1043,7 +1107,7 @@ async function handle(req: Request) {
                     const replaced = await replaceTpSlIfBetter({
                       symbol: key,
                       newTp: rat.dynTP,
-                      newSl: rat.dynSL,
+                      newSl: monotonicSL,
                     });
                     ratchetLiftMemo[key] = { lastStep: rat.steps, lastLiftAt: nowTs };
                     debug.ratchet_replace = { step: rat.steps, ...replaced, cooldownMs: LIFT_COOLDOWN_MS };
@@ -1060,14 +1124,15 @@ async function handle(req: Request) {
                 }
               }
 
-              if (RATCHET_VIRTUAL_EXITS) {
+              // Virtual exits for what remains
+              if (RATCHET_VIRTUAL_EXITS && openPos) {
                 if (p >= rat.dynTP) {
                   const exitTicker = openPos.ticker;
                   try {
+                    const shares = Number(openPos.shares);
+                    const entry  = Number(openPos.entryPrice);
                     await closePositionMarket(exitTicker);
 
-                    const shares   = Number(openPos.shares);
-                    const entry    = Number(openPos.entryPrice);
                     const exitVal  = shares * p;
                     const realized = exitVal - shares * entry;
 
@@ -1088,13 +1153,13 @@ async function handle(req: Request) {
                   } catch (e: any) {
                     debug.reasons.push(`ratchet_tp_close_exception:${e?.message || "unknown"}`);
                   }
-                } else if (p <= rat.dynSL) {
+                } else if (p <= lastDynSLMemo[memoKey]?.sl /* monotonic SL */) {
                   const exitTicker = openPos.ticker;
                   try {
+                    const shares = Number(openPos.shares);
+                    const entry  = Number(openPos.entryPrice);
                     await closePositionMarket(exitTicker);
 
-                    const shares   = Number(openPos.shares);
-                    const entry    = Number(openPos.entryPrice);
                     const exitVal  = shares * p;
                     const realized = exitVal - shares * entry;
 
@@ -1110,7 +1175,7 @@ async function handle(req: Request) {
                       },
                     });
 
-                    debug.lastMessage = `🛡️ Ratchet SL hit ${exitTicker} @ ${p.toFixed(2)} (dynSL=${rat.dynSL.toFixed(2)})`;
+                    debug.lastMessage = `🛡️ Ratchet SL hit ${exitTicker} @ ${p.toFixed(2)} (dynSL=${(lastDynSLMemo[memoKey]?.sl || 0).toFixed(2)})`;
                     openPos = null;
                   } catch (e: any) {
                     debug.reasons.push(`ratchet_sl_close_exception:${e?.message || "unknown"}`);
@@ -1120,7 +1185,7 @@ async function handle(req: Request) {
             }
           }
         } catch (e: any) {
-          debug.reasons.push(`ratchet_calc_exception:${e?.message || "unknown"}`);
+          debug.reasons.push(`hold_calc_exception:${e?.message || "unknown"}`);
         }
       }
     } else if (lastRec?.ticker) {
