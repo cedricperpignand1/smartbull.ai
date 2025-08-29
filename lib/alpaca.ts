@@ -179,10 +179,36 @@ export async function submitBracketBuy(params: {
   })) as AlpacaOrder;
 }
 
+/** Market-close position close (cancels bracket legs). */
 export async function closePositionMarket(symbol: string) {
   // DELETE closes at market and cancels related bracket legs
   return alpacaFetch(`/v2/positions/${encodeURIComponent(symbol)}`, {
     method: "DELETE",
+  });
+}
+
+/** NEW: Sells a specific quantity at market (used for partial exits / half TP). */
+export async function sellMarket(params: {
+  symbol: string;
+  qty: number;
+  tif?: "day" | "gtc";
+  extended_hours?: boolean;
+}) {
+  const { symbol, qty, tif = "day", extended_hours = false } = params;
+  if (!symbol || !Number.isFinite(qty) || qty <= 0) {
+    throw new Error("sellMarket: invalid params");
+  }
+
+  return alpacaFetch("/v2/orders", {
+    method: "POST",
+    body: JSON.stringify({
+      symbol,
+      qty: String(Math.floor(qty)), // Alpaca wants whole-share strings
+      side: "sell",
+      type: "market",
+      time_in_force: tif,
+      extended_hours,
+    }),
   });
 }
 
@@ -398,7 +424,7 @@ export async function spreadGuardOK(symbol: string, maxSpreadPct = 0.005) {
 
 /** Premarket window (ET) → ISO strings for Data API. */
 export function premarketRangeISO(etNow: Date) {
-  // build exact ET timestamps for today 04:00:00 → 09:29:59
+  // build exact ET timestamps for today 04:00:00 → 09:29:59 ET
   const y = etNow.getFullYear();
   const m = etNow.getMonth();
   const d = etNow.getDate();
