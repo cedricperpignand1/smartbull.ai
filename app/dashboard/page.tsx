@@ -7,6 +7,23 @@ import { Button } from "../components/ui/button";
 import { useBotPoll } from "../components/useBotPoll";
 
 /* =========================================================
+   Simple ET time + market open checker
+   ========================================================= */
+function nowET(): Date {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+}
+function isMarketOpenET(d = nowET()): boolean {
+  const day = d.getDay(); // 0=Sun, 6=Sat
+  if (day === 0 || day === 6) return false; // weekends
+  const h = d.getHours();
+  const m = d.getMinutes();
+  // Regular hours only (no holiday logic here):
+  const afterOpen = h > 9 || (h === 9 && m >= 30);
+  const beforeClose = h < 16;
+  return afterOpen && beforeClose;
+}
+
+/* =========================================================
    OPAQUE Panel (original look) — used by all sections EXCEPT AI Chat
    ========================================================= */
 function Panel({
@@ -124,7 +141,6 @@ function ChatBox() {
 
   return (
     <div className="h-full flex flex-col">
-      {/* Slightly more opaque glass so content is clear */}
       <div
         ref={scrollRef}
         className="
@@ -158,7 +174,6 @@ function ChatBox() {
         ))}
       </div>
 
-      {/* Input row: bigger, dark text, high contrast */}
       <div className="mt-3 flex items-center gap-2">
         <div className="flex-1 flex items-center gap-2 rounded-2xl pl-4 pr-3 bg-white/95 ring-1 ring-gray-300">
           <input
@@ -258,7 +273,7 @@ function ymdET(d: Date) {
 }
 
 /* =========================================================
-   Page — static grid (no dragging)
+   Page — static grid (no dragging) with dynamic background
    ========================================================= */
 export default function Home() {
   const { data: session, status } = useSession();
@@ -269,6 +284,30 @@ export default function Home() {
         <p className="text-lg font-bold">You need to log in to access this page.</p>
       </div>
     );
+
+  // Background that depends on market open/closed
+  const OPEN_BG = "/bluebackground.jpg";   // <-- your asset name
+  const CLOSED_BG = "/nightbackground.png";
+  const [bgUrl, setBgUrl] = useState<string>(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
+
+  useEffect(() => {
+    // Preload both images once
+    const i1 = new Image();
+    i1.src = OPEN_BG;
+    const i2 = new Image();
+    i2.src = CLOSED_BG;
+
+    const update = () => setBgUrl(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
+    update();
+
+    const id = setInterval(update, 30_000); // re-check every 30s
+    const onVis = () => document.visibilityState === "visible" && update();
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   // Stocks & AI analysis
   const [stocks, setStocks] = useState<Stock[]>([]);
@@ -492,11 +531,12 @@ export default function Home() {
     <main
       className="min-h-screen w-full flex flex-col"
       style={{
-        backgroundImage: "url(/bluebackground.jpg)",
+        backgroundImage: `url(${bgUrl})`,
         backgroundSize: "cover",
         backgroundPosition: "center",
         backgroundRepeat: "no-repeat",
         backgroundAttachment: "fixed",
+        transition: "background-image 300ms ease-in-out",
       }}
     >
       <Navbar />
