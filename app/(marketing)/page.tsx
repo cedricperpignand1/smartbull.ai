@@ -201,17 +201,17 @@ export default function LandingPage() {
   return (
     <>
       {!passOk ? (
-        <main className="min-h-screen w-full bg-gradient-to-b from-amber-50 to-gray-100 flex items-center justify-center p-4">
-          <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl p-6 md:p-8">
+        <main className="min-h-screen w-full bg-gradient-to-b from-sky-50 via-blue-50 to-slate-100 flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl p-6 md:p-8 ring-1 ring-slate-200">
             <div className="mb-6 text-center">
               <Image src="/logo4.png" alt="SmartBull logo" width={48} height={48} className="mx-auto mb-3" />
               <h1 className="text-2xl font-bold">Enter Access Key</h1>
-              <p className="mt-1 text-sm text-gray-500">This page is gated. Please enter the passkey to continue.</p>
+              <p className="mt-1 text-sm text-slate-500">This page is gated. Please enter the passkey to continue.</p>
             </div>
 
             <form onSubmit={handlePassSubmit} className="space-y-4">
               <label className="text-sm block">
-                <span className="block text-gray-700 mb-1">Passkey</span>
+                <span className="block text-slate-700 mb-1">Passkey</span>
                 <input
                   type="password"
                   inputMode="numeric"
@@ -223,7 +223,7 @@ export default function LandingPage() {
                     setPassErr("");
                   }}
                   placeholder="••••"
-                  className="w-full rounded-xl border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-amber-500"
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-sky-400"
                   required
                 />
               </label>
@@ -232,31 +232,34 @@ export default function LandingPage() {
 
               <button
                 type="submit"
-                className="w-full rounded-xl px-4 py-2.5 text-white font-medium bg-black hover:opacity-90"
+                className="w-full rounded-xl px-4 py-2.5 text-white font-medium bg-blue-600 hover:bg-blue-700"
               >
                 Unlock
               </button>
             </form>
 
-            <p className="mt-4 text-center text-xs text-gray-400">Hint: Provided by the admin.</p>
+            <p className="mt-4 text-center text-xs text-slate-400">Hint: Provided by the admin.</p>
           </div>
         </main>
       ) : (
-        <main className="min-h-screen w-full bg-gradient-to-b from-amber-50 to-gray-100 flex items-center justify-center p-4">
+        <main className="min-h-screen w-full relative flex items-center justify-center p-4 bg-gradient-to-b from-sky-50 via-blue-50 to-slate-100">
+          {/* soft radial blue glow background */}
+          <div className="pointer-events-none absolute inset-0 [background:radial-gradient(60%_50%_at_50%_10%,rgba(56,189,248,0.25),transparent)]" />
+
           <div className="relative w-full max-w-6xl">
             {/* soft outer glow */}
-            <div className="absolute -inset-2 rounded-[28px] bg-gradient-to-br from-amber-200/50 to-gray-300/40 blur" />
+            <div className="absolute -inset-2 rounded-[28px] bg-gradient-to-br from-sky-200/60 to-blue-300/50 blur" />
 
-            <div className="relative bg-white rounded-[24px] shadow-2xl overflow-hidden">
+            <div className="relative bg-white rounded-[24px] shadow-2xl overflow-hidden ring-1 ring-slate-200">
               {/* Book spine effect for top section */}
-              <div className="pointer-events-none absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-gradient-to-b from-gray-300 via-gray-200 to-gray-300 shadow-inner" />
+              <div className="pointer-events-none absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-gradient-to-b from-slate-200 via-slate-100 to-slate-200 shadow-inner" />
               <div className="pointer-events-none absolute inset-y-0 left-1/2 -translate-x-1/2 w-32 bg-gradient-to-r from-black/5 via-transparent to-black/5" />
 
               {/* === TOP: hero + auth === */}
               <div className="grid grid-cols-1 md:grid-cols-2">
                 {/* LEFT: welcome */}
-                <section className="relative p-8 md:p-12 bg-gradient-to-b from-amber-50 to-white flex">
-                  <div className="absolute bottom-6 left-8 text-xs text-gray-400 select-none">
+                <section className="relative p-8 md:p-12 bg-gradient-to-b from-sky-50 to-white flex">
+                  <div className="absolute bottom-6 left-8 text-xs text-slate-400 select-none">
                     SmartBull · I
                   </div>
 
@@ -271,16 +274,16 @@ export default function LandingPage() {
                         priority
                       />
                       <div>
-                        <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight text-gray-900">
-                          Welcome to <span className="text-amber-600">SmartBull.ai</span>
+                        <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight text-slate-900">
+                          Welcome to <span className="text-blue-600">SmartBull.ai</span>
                         </h1>
-                        <p className="mt-2 text-gray-600">
+                        <p className="mt-2 text-slate-600">
                           Track top gainers, get AI stock picks, and manage your daily trades in one place.
                         </p>
                       </div>
                     </div>
 
-                    <ul className="list-disc pl-6 text-gray-700 space-y-2">
+                    <ul className="list-disc pl-6 text-slate-700 space-y-2">
                       <li>Live top gainers & high relative volume</li>
                       <li>AI scoring: float, market cap, headlines</li>
                       <li>Quick entries with targets & risk</li>
@@ -291,11 +294,11 @@ export default function LandingPage() {
                       <button
                         type="button"
                         onClick={() => setShowDash(true)}
-                        className="group block rounded-xl overflow-hidden ring-1 ring-gray-200 hover:ring-gray-300 shadow hover:shadow-lg transition"
+                        className="group block rounded-xl overflow-hidden ring-1 ring-slate-200 hover:ring-slate-300 shadow hover:shadow-lg transition"
                         aria-label="Open SmartBull dashboard preview"
                       >
                         <Image
-                          src="/dashboard.png"
+                          src="/dashboard1.png"
                           alt="SmartBull dashboard preview"
                           width={1200}
                           height={700}
@@ -303,14 +306,14 @@ export default function LandingPage() {
                           priority
                         />
                       </button>
-                      <p className="mt-2 text-sm text-gray-500">Click to enlarge</p>
+                      <p className="mt-2 text-sm text-slate-500">Click to enlarge</p>
                     </div>
                   </div>
                 </section>
 
                 {/* RIGHT: sign in / sign up */}
                 <section className="relative p-8 md:p-12 bg-white">
-                  <div className="absolute bottom-6 right-8 text-xs text-gray-400 select-none">
+                  <div className="absolute bottom-6 right-8 text-xs text-slate-400 select-none">
                     {isLogin ? "Sign In" : "Sign Up"} · II
                   </div>
 
@@ -321,25 +324,25 @@ export default function LandingPage() {
 
                     <form onSubmit={isLogin ? handleLogin : handleSignup} className="flex flex-col gap-4">
                       <label className="text-sm">
-                        <span className="block text-gray-700 mb-1">Email</span>
+                        <span className="block text-slate-700 mb-1">Email</span>
                         <input
                           type="email"
                           value={email}
                           onChange={(e) => setEmail(e.target.value)}
                           placeholder="you@example.com"
-                          className="w-full rounded-xl border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-amber-500"
+                          className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-sky-400"
                           required
                         />
                       </label>
 
                       <label className="text-sm">
-                        <span className="block text-gray-700 mb-1">Password</span>
+                        <span className="block text-slate-700 mb-1">Password</span>
                         <input
                           type="password"
                           value={password}
                           onChange={(e) => setPassword(e.target.value)}
                           placeholder="••••••••"
-                          className="w-full rounded-xl border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-amber-500"
+                          className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-sky-400"
                           required
                         />
                       </label>
@@ -348,7 +351,7 @@ export default function LandingPage() {
                         type="submit"
                         disabled={loading || status === "loading"}
                         className={`w-full rounded-xl px-4 py-2.5 text-white font-medium transition
-                          ${isLogin ? "bg-black hover:opacity-90" : "bg-amber-600 hover:bg-amber-700"}
+                          ${isLogin ? "bg-blue-600 hover:bg-blue-700" : "bg-cyan-600 hover:bg-cyan-700"}
                           disabled:opacity-60`}
                       >
                         {loading ? (isLogin ? "Signing in..." : "Registering...") : isLogin ? "Sign In" : "Sign Up"}
@@ -356,14 +359,14 @@ export default function LandingPage() {
                     </form>
 
                     <div className="my-6 flex items-center gap-4">
-                      <div className="h-px flex-1 bg-gray-200" />
-                      <span className="text-xs text-gray-400 uppercase tracking-wider">or</span>
-                      <div className="h-px flex-1 bg-gray-200" />
+                      <div className="h-px flex-1 bg-slate-200" />
+                      <span className="text-xs text-slate-400 uppercase tracking-wider">or</span>
+                      <div className="h-px flex-1 bg-slate-200" />
                     </div>
 
                     <button
                       onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
-                      className="w-full rounded-xl border border-gray-300 bg-white px-4 py-2.5 text-gray-800 font-medium hover:bg-gray-50"
+                      className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-slate-800 font-medium hover:bg-slate-50"
                     >
                       Continue with Google
                     </button>
@@ -371,7 +374,7 @@ export default function LandingPage() {
                     <div className="mt-6 text-center">
                       <button
                         onClick={() => setIsLogin(!isLogin)}
-                        className="text-amber-700 hover:underline"
+                        className="text-blue-700 hover:underline"
                       >
                         {isLogin ? "Don't have an account? Sign Up" : "Already have an account? Sign In"}
                       </button>
@@ -381,12 +384,12 @@ export default function LandingPage() {
               </div>
 
               {/* === BOTTOM: Full-width Book section === */}
-              <section className="border-t border-gray-200 bg-white">
+              <section className="border-t border-slate-200 bg-white">
                 <div className="px-6 py-10 md:px-12">
-                  <h3 className="text-xl md:text-3xl font-semibold text-gray-900 mb-4">
+                  <h3 className="text-xl md:text-3xl font-semibold text-slate-900 mb-4">
                     Please Read Before you Proceed
                   </h3>
-                  <p className="text-gray-600 mb-8">A quick overview on Smartbull.ai.</p>
+                  <p className="text-slate-600 mb-8">A quick overview on Smartbull.ai.</p>
 
                   <BookViewer pages={PAGES} className="max-w-3xl w-full" />
                 </div>
