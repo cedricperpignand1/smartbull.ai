@@ -217,7 +217,7 @@ async function fetchBarsWindow(symbols: string[], startISO: string, endISO: stri
     const max = Math.max(...vals);
     if (max - min < 1e-12) return (_: number | null) => 0.5;
     return (x: number | null) => (x == null ? null : (x - min) / (max - min));
-  }
+    }
   const nVol = norm("vol"), nRng = norm("rng"), nUp = norm("up");
 
   for (const s of symbols) {
@@ -361,30 +361,53 @@ function buildExplanationForPick(
 }
 
 /* ──────────────────────────────────────────────────────────
-   Soft preference helpers (Employees ↑, AvgVolume)
+   Soft preference helpers (Float ↓ strongest, Employees ↑, AvgVolume ↑)
    ────────────────────────────────────────────────────────── */
-// Employees weight = 0.7, AvgVolume = 0.3; MarketCap is ignored.
-function buildSoftPrefScorer(rows: Array<{ employees?: number|null; avgVolume?: number|null }>) {
-  const empVals = rows.map(r => r.employees ?? null).filter((v): v is number => v != null && Number.isFinite(v));
-  const avgVals = rows.map(r => r.avgVolume ?? null).filter((v): v is number => v != null && Number.isFinite(v));
+// NEW: prefer smaller float most; employees still matters (log-scaled); avg volume modest.
+function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; employees?: number|null; avgVolume?: number|null }>) {
+  const floats = rows.map(r => r.sharesOutstanding ?? null).filter((v): v is number => v != null && Number.isFinite(v));
+  const emps   = rows.map(r => r.employees ?? null).filter((v): v is number => v != null && Number.isFinite(v));
+  const avgs   = rows.map(r => r.avgVolume ?? null).filter((v): v is number => v != null && Number.isFinite(v));
 
-  const empMin = empVals.length ? Math.min(...empVals) : null;
-  const empMax = empVals.length ? Math.max(...empVals) : null;
-  const avgMin = avgVals.length ? Math.min(...avgVals) : null;
-  const avgMax = avgVals.length ? Math.max(...avgVals) : null;
+  const fMin = floats.length ? Math.min(...floats) : null;
+  const fMax = floats.length ? Math.max(...floats) : null;
+
+  // log-scale employees to avoid Macy's-type domination
+  const log = (x: number) => Math.log10(Math.max(1, x));
+  const eLogs = emps.map(log);
+  const eMin = eLogs.length ? Math.min(...eLogs) : null;
+  const eMax = eLogs.length ? Math.max(...eLogs) : null;
+
+  const aMin = avgs.length ? Math.min(...avgs) : null;
+  const aMax = avgs.length ? Math.max(...avgs) : null;
 
   const norm = (x: number|null, lo: number|null, hi: number|null) => {
     if (x == null || lo == null || hi == null || !Number.isFinite(x) || hi - lo <= 0) return 0;
     return Math.max(0, Math.min(1, (x - lo) / (hi - lo)));
   };
 
-  const W_EMP = 0.7; // employees favored more
-  const W_AVG = 0.3;
+  const W_FLOAT = 0.60; // strongest: smaller float better
+  const W_EMP   = 0.25; // keep employees meaningful but not dominant
+  const W_AVG   = 0.15; // slight nudge for liquidity consistency
 
-  return (row: { employees?: number|null; avgVolume?: number|null }) => {
-    const empN = norm(row.employees ?? null, empMin, empMax);
-    const avgN = norm(row.avgVolume ?? null, avgMin, avgMax);
-    return W_EMP * empN + W_AVG * avgN; // 0..1
+  return (row: { sharesOutstanding?: number|null; employees?: number|null; avgVolume?: number|null }) => {
+    // Float: reverse-normalize so smaller float → higher score
+    const f = row.sharesOutstanding ?? null;
+    let floatN = 0;
+    if (f != null && fMin != null && fMax != null && fMax - fMin > 0) {
+      const straight = norm(f, fMin, fMax);   // small→0, big→1
+      floatN = 1 - straight;                  // invert: small→1, big→0
+    }
+
+    // Employees: log-normalized
+    const e = row.employees ?? null;
+    const eLog = e != null ? log(e) : null;
+    const empN = norm(eLog, eMin, eMax);
+
+    // Avg volume: linear
+    const avgN = norm(row.avgVolume ?? null, aMin, aMax);
+
+    return W_FLOAT * floatN + W_EMP * empN + W_AVG * avgN; // 0..1
   };
 }
 
@@ -474,21 +497,21 @@ export async function POST(req: Request) {
       })
     );
 
-    /* Soft preference scoring (Employees ↑ + AvgVolume) */
+    /* Soft preference scoring (Float ↓ strongest + Employees + AvgVolume) */
     const scoreSoft = buildSoftPrefScorer(enriched);
     for (const r of enriched) {
-      (r as any).softPref = scoreSoft(r); // 0..1
+      (r as any).softPref = scoreSoft(r as any); // 0..1
     }
 
-    /* Hard filters (UPDATED PRICE BAND: $1–$70) */
+    /* Hard filters (PRICE BAND: $1–$70) */
     const filtered = enriched.filter((s) => {
       const passAvgVol    = (s.avgVolume ?? 0) >= 500_000;
       const passRelVol    = (s.relVol ?? 0) >= 3.0;
       const passDollarVol = (s.dollarVolume ?? 0) >= 10_000_000;
       const p = s.price ?? 0;
-      const passPrice     = p >= 1 && p <= 70; // ← updated from 50 → 70
+      const passPrice     = p >= 1 && p <= 70;
       const passVenue     = !s.isEtf && !s.isOTC;
-      const passFloat     = (s.sharesOutstanding ?? 0) > 1_999_999;
+      const passFloat     = (s.sharesOutstanding ?? 0) > 1_999_999; // avoid ultra-tiny
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
@@ -499,12 +522,13 @@ export async function POST(req: Request) {
       return p >= 1 && p <= 70;
     });
 
-    // Top candidates AFTER FMP filters; primarily by DollarVol, tie-break by SoftPref (employees-weighted)
-    const byDollarVol = (arr: any[]) =>
+    // Sort helper: prioritize AM tone if available, then DollarVol, then SoftPref
+    const byComposite = (arr: any[]) =>
       arr.slice().sort((a, b) => {
+        const pmDiff = (b.pmScore ?? -1) - (a.pmScore ?? -1);
+        if (Math.abs(pmDiff) > 1e-9) return pmDiff;
         const dv = (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0);
         if (Math.abs(dv) > 0) return dv;
-        // tiebreaker: higher softPref wins (employees-weighted)
         return ((b as any).softPref ?? 0) - ((a as any).softPref ?? 0);
       });
 
@@ -513,10 +537,10 @@ export async function POST(req: Request) {
         ? filtered
         : (enrichedPriceBand.length ? enrichedPriceBand : enriched);
 
-    const candidates = byDollarVol(prePool).slice(0, PREMARKET_LIMIT);
+    const candidates = byComposite(prePool).slice(0, PREMARKET_LIMIT);
 
     /* ── Get or fetch the 09:00–09:45 snapshot (cached) ── */
-    const symbols = candidates.map(c => String(c.ticker).toUpperCase());
+    const symbols = candidates.map((c: any) => String(c.ticker).toUpperCase());
     const { bySym: pmBySym, skipped: pmSkippedReason } = await getOrFetchPremarket(symbols);
 
     // Stitch morning stats into candidates
@@ -533,7 +557,7 @@ export async function POST(req: Request) {
     }
 
     /* Prompt (JSON mode), augmented with 09:00–09:45 signals + soft pref */
-    const lines = candidates.map((s) => {
+    const lines = candidates.map((s: any) => {
       const pct =
         s.changesPercentage == null
           ? "n/a"
@@ -569,7 +593,7 @@ export async function POST(req: Request) {
     });
 
     const headlinesBlock = candidates
-      .map(s => `### ${s.ticker}\n- ${s.headlines?.join("\n- ") || "(no recent headlines)"}`)
+      .map((s: any) => `### ${s.ticker}\n- ${s.headlines?.join("\n- ") || "(no recent headlines)"}`)
       .join("\n\n");
 
     const system = `
@@ -587,11 +611,12 @@ Use ONLY the provided data (no outside facts).
 ## Primary Signals (weight the 09:00–09:45 tone)
 - Liquidity/Momentum: higher DollarVol, RelVol (live/avg), RelVolFloat.
 - **09:00–09:45 tone**: prefer higher AM_RangePct, higher AM_Vol, AM_UpMin, price relative to AM_VWAP, and overall AM_Score.
-- Spike Potential: smaller Float (≤ 50M) preferred but allow larger with very high DollarVol.
+- Spike Potential: **smaller Float is best** (≤ 50M preferred) but allow larger with very high DollarVol.
 - Quality: prefer positive netProfitMarginTTM.
 - Catalysts: positive headlines; penalize clusters of negatives.
 - **Soft Preference (tie-break)**: when two candidates are similar on the above,
-  **prefer the one with higher Employees (strongest) and then higher AvgVol** (see SoftPref 0–1). Ignore MarketCap.
+  **prefer smaller Float strongest**, then **higher Employees**, then **higher AvgVol**
+  (SoftPref 0–1 is provided; MarketCap should be ignored).
 
 ## Output (strict JSON)
 {
@@ -654,7 +679,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       ? modelObj.picks.map((s: any) => String(s).toUpperCase())
       : parsePicksFromText(content);
 
-    const candidateTickers = new Set(candidates.map(c => String(c.ticker).toUpperCase()));
+    const candidateTickers = new Set(candidates.map((c: any) => String(c.ticker).toUpperCase()));
     const validPicks = picksFromModel.filter(p => candidateTickers.has(p));
     const finalPicks = (validPicks.length ? validPicks : (candidates[0]?.ticker ? [String(candidates[0].ticker).toUpperCase()] : []))
       .slice(0, topN);
@@ -666,7 +691,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     const saved: any[] = [];
     for (const sym of finalPicks) {
       const t = sym.toUpperCase();
-      const c = candidates.find(x => String(x.ticker).toUpperCase() === t);
+      const c = candidates.find((x: any) => String(x.ticker).toUpperCase() === t);
       const priceNum = Number(c?.price ?? 0);
 
       const expl = buildExplanationForPick(t, c as any, reasonsMap[t], risk);
