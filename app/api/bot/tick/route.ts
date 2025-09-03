@@ -1,4 +1,4 @@
-// app/api/bot/tick/route.ts
+// app/api/bot/tick/route.ts 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -116,10 +116,11 @@ function inEndOfForceFailsafe() {
   const d = nowET();
   return d.getHours() === 9 && d.getMinutes() === 46 && d.getSeconds() >= 30;
 }
+/** Mandatory exit from 15:50 ET onward */
 function isMandatoryExitET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
-  return mins >= (15 * 60 + 55);
+  return mins >= (15 * 60 + 50);
 }
 
 /* -------------------------- buy-the-dip -------------------------- */
@@ -582,7 +583,7 @@ async function handle(req: Request) {
 
       const today = yyyyMmDdET();
 
-      // Mandatory exit after 15:55 ET
+      // Mandatory exit after 15:50 ET
       if (openPos && isMandatoryExitET()) {
         const exitTicker = openPos.ticker;
         try {
@@ -600,7 +601,7 @@ async function handle(req: Request) {
           state = await prisma.botState.update({ where: { id: 1 }, data: { cash: Number(state!.cash) + exitVal, pnl: Number(state!.pnl) + realized, equity: Number(state!.cash) + exitVal } });
 
           openPos = null;
-          debug.lastMessage = `⏱️ Mandatory 15:55+ exit ${exitTicker}`;
+          debug.lastMessage = `⏱️ Mandatory 15:50+ exit ${exitTicker}`;
         } catch { debug.reasons.push("mandatory_exit_exception"); }
       }
 
