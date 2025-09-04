@@ -17,14 +17,13 @@ function isMarketOpenET(d = nowET()): boolean {
   if (day === 0 || day === 6) return false; // weekends
   const h = d.getHours();
   const m = d.getMinutes();
-  // Regular hours only (no holiday logic here):
   const afterOpen = h > 9 || (h === 9 && m >= 30);
   const beforeClose = h < 16;
   return afterOpen && beforeClose;
 }
 
 /* =========================================================
-   OPAQUE Panel (original look) — used by all sections EXCEPT AI Chat
+   OPAQUE Panel
    ========================================================= */
 function Panel({
   title,
@@ -64,7 +63,7 @@ function Panel({
 }
 
 /* =========================================================
-   GLASS Panel — used ONLY for AI Chat
+   GLASS Panel (AI Chat)
    ========================================================= */
 function GlassPanel({
   title,
@@ -104,7 +103,7 @@ function GlassPanel({
 }
 
 /* =========================================================
-   AI Chat — improved readability (larger, darker input)
+   AI Chat
    ========================================================= */
 function ChatBox() {
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
@@ -273,7 +272,7 @@ function ymdET(d: Date) {
 }
 
 /* =========================================================
-   Panic Sell button (asks for passkey 9340 and calls API)
+   Panic Sell button (asks passkey 9340; shows real server errors)
    ========================================================= */
 function PanicSellButton({ disabled }: { disabled: boolean }) {
   const [open, setOpen] = useState(false);
@@ -296,24 +295,26 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key: key.trim() }),
       });
-      if (!res.ok) {
-        // optional fallback
-        res = await fetch("/api/bot/close-all", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ key: key.trim() }),
-        });
+
+      // surface detailed errors from server/Alpaca
+      let data: any = {};
+      try { data = await res.json(); } catch {}
+
+      if (!res.ok || !(data?.ok ?? false)) {
+        const reason =
+          data?.error ||
+          data?.message ||
+          (typeof data === "string" ? data : "") ||
+          `HTTP ${res.status}`;
+        setMsg(`Panic sell failed: ${reason}`);
+        return;
       }
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !(data?.ok ?? true)) {
-        setMsg("Panic sell failed. Check server logs.");
-      } else {
-        setMsg("✅ Sent market-close for all positions.");
-        setTimeout(() => {
-          setOpen(false);
-          window.location.reload();
-        }, 700);
-      }
+
+      setMsg("✅ Sent market-close for all positions.");
+      setTimeout(() => {
+        setOpen(false);
+        window.location.reload();
+      }, 700);
     } catch {
       setMsg("Network error during panic sell.");
     } finally {
@@ -327,12 +328,8 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
         onClick={() => setOpen(true)}
         disabled={disabled}
         className={`rounded-lg px-3 py-1 text-sm font-semibold shadow
-          ${
-            disabled
-              ? "bg-gray-300 text-gray-600 cursor-not-allowed"
-              : "bg-red-600 text-white hover:bg-red-700 active:scale-[.99]"
-          }
-        `}
+          ${disabled ? "bg-gray-300 text-gray-600 cursor-not-allowed"
+                     : "bg-red-600 text-white hover:bg-red-700 active:scale-[.99]"}`}
         title={disabled ? "No open position to close" : "Market close ALL positions"}
       >
         PANIC SELL
@@ -341,9 +338,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
       {open && (
         <div
           className="fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4"
-          onClick={(e) => {
-            if (e.target === e.currentTarget && !busy) setOpen(false);
-          }}
+          onClick={(e) => { if (e.target === e.currentTarget && !busy) setOpen(false); }}
         >
           <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
             <div className="text-lg font-semibold text-slate-800">Panic Sell — Close ALL Positions</div>
@@ -393,7 +388,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
 }
 
 /* =========================================================
-   Page — static grid (no dragging) with dynamic background
+   Page
    ========================================================= */
 export default function Home() {
   const { data: session, status } = useSession();
@@ -405,28 +400,20 @@ export default function Home() {
       </div>
     );
 
-  // Background that depends on market open/closed
-  const OPEN_BG = "/bluebackground.jpg";   // <-- your asset name
+  const OPEN_BG = "/bluebackground.jpg";
   const CLOSED_BG = "/nightbackground.png";
   const [bgUrl, setBgUrl] = useState<string>(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
 
   useEffect(() => {
-    // Preload both images once
-    const i1 = new Image();
-    i1.src = OPEN_BG;
-    const i2 = new Image();
-    i2.src = CLOSED_BG;
+    const i1 = new Image(); i1.src = OPEN_BG;
+    const i2 = new Image(); i2.src = CLOSED_BG;
 
     const update = () => setBgUrl(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
     update();
-
-    const id = setInterval(update, 30_000); // re-check every 30s
+    const id = setInterval(update, 30_000);
     const onVis = () => document.visibilityState === "visible" && update();
     document.addEventListener("visibilitychange", onVis);
-    return () => {
-      clearInterval(id);
-      document.removeEventListener("visibilitychange", onVis);
-    };
+    return () => { clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
   // Stocks & AI analysis
@@ -449,7 +436,7 @@ export default function Home() {
   const [tradeData, setTradeData] = useState<TradePayload | null>(null);
   const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
 
-  // Alpaca account state
+  // Alpaca account
   const [alpaca, setAlpaca] = useState<AlpacaAccount | null>(null);
 
   // SSE: stocks
@@ -630,7 +617,7 @@ export default function Home() {
     alert(`Added ${selectedStock} to your P&L with Buy: ${agentBuyPrice}, Sell: ${agentSellPrice}`);
   };
 
-  // today's trades count (fallback)
+  // today's trades count
   const todayTradeCount = useMemo(() => {
     if (Array.isArray(statusTradesToday)) return statusTradesToday.length;
     const all = tradeData?.trades || [];
@@ -646,7 +633,7 @@ export default function Home() {
     return n;
   }, [statusTradesToday, tradeData]);
 
-  /* ====== Layout (static grid) ====== */
+  /* ====== Layout ====== */
   return (
     <main
       className="min-h-screen w-full flex flex-col"
@@ -670,14 +657,14 @@ export default function Home() {
             lg:grid-cols-1
           "
         >
-          {/* AI Chat — ONLY panel that is glass */}
+          {/* AI Chat */}
           <div className="xl:row-span-2">
             <GlassPanel title="AI Chat" color="cyan" dense>
               <ChatBox />
             </GlassPanel>
           </div>
 
-          {/* Top Gainers — original opaque */}
+          {/* Top Gainers */}
           <div className="xl:row-span-2">
             <TopGainers
               loading={loading}
@@ -690,12 +677,12 @@ export default function Home() {
             />
           </div>
 
-          {/* Trade Log — original opaque, now with PanicSellButton in header */}
+          {/* Trade Log (with PANIC SELL) */}
           <div>
             <TradeLog tradeData={tradeData} />
           </div>
 
-          {/* AI Rec + Bot Status — original opaque */}
+          {/* AI Rec + Bot Status */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
             <AIRecommendation
               botData={botData}
@@ -710,13 +697,11 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Chart modal (unchanged) */}
+      {/* Chart modal */}
       {chartVisible && selectedStock && (
         <div
           className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setChartVisible(false);
-          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setChartVisible(false); }}
         >
           <div className="w-full max-w-5xl">
             <Panel
@@ -764,7 +749,7 @@ export default function Home() {
 }
 
 /* =========================================================
-   Subpanels (OPAQUE — TopGainers unchanged)
+   Subpanels
    ========================================================= */
 function TopGainers({
   loading,
@@ -866,9 +851,6 @@ function TopGainers({
   );
 }
 
-/* =========================================================
-   Trade Log — now includes PanicSellButton in header
-   ========================================================= */
 function TradeLog({ tradeData }: { tradeData: TradePayload | null }) {
   const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
 
@@ -925,9 +907,6 @@ function TradeLog({ tradeData }: { tradeData: TradePayload | null }) {
   );
 }
 
-/* =========================================================
-   AI Recommendation + Bot Status (unchanged)
-   ========================================================= */
 function AIRecommendation({
   botData,
   alpaca,
@@ -947,13 +926,8 @@ function AIRecommendation({
     <Panel title="AI Recommendation" color="blue" dense>
       {botData?.lastRec ? (
         <div className="mb-3 text-sm border border-gray-200 rounded p-2 bg-gray-50">
-          <div>
-            <b>AI Pick:</b> {botData.lastRec.ticker}
-          </div>
-          <div>
-            <b>Price:</b>{" "}
-            {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
-          </div>
+          <div><b>AI Pick:</b> {botData.lastRec.ticker}</div>
+          <div><b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}</div>
           <div>
             <b>Time:</b>{" "}
             {botData.lastRec.at
@@ -977,24 +951,13 @@ function AIRecommendation({
 
             return (
               <>
-                <div>
-                  Money I Have: <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b>{" "}
-                  {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
-                </div>
-                <div>
-                  Equity: <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b>{" "}
-                  {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
-                </div>
-                <div>
-                  PNL:{" "}
-                  <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
-                    {dayPnl != null ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}` : "—"}
-                  </b>{" "}
+                <div>Money I Have: <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b> {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}</div>
+                <div>Equity: <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b> {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}</div>
+                <div>PNL: <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
+                  {dayPnl != null ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}` : "—"}</b>{" "}
                   {alpaca && <span className="text-xs text-gray-500">(Today, Alpaca)</span>}
                 </div>
-                {alpaca?.day_pnl_pct != null && (
-                  <div className="text-xs text-gray-600">Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%</div>
-                )}
+                {alpaca?.day_pnl_pct != null && <div className="text-xs text-gray-600">Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%</div>}
               </>
             );
           })()}
@@ -1012,10 +975,7 @@ function AIRecommendation({
 
       {recommendation && <div className="mt-3 text-sm whitespace-pre-wrap">{recommendation}</div>}
       <div className="mt-2 text-xs text-gray-500">
-        Server ET:{" "}
-        {botData?.serverTimeET
-          ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-          : "…"}
+        Server ET: {botData?.serverTimeET ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "…"}
       </div>
     </Panel>
   );
@@ -1037,22 +997,15 @@ function BotStatus({
       <div className="rounded-lg px-3 py-2 text-sm mb-2 bg-gray-50 border border-gray-200">
         {(statusTick as any)?.debug?.lastMessage ?? "Waiting for next update…"}
         <div className="mt-1 text-[11px] text-gray-500 space-x-3">
-          {typeof statusTick?.info?.snapshotAgeMs === "number" && (
-            <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>
-          )}
-          {typeof statusTick?.info?.inEntryWindow === "boolean" && (
-            <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>
-          )}
+          {typeof statusTick?.info?.snapshotAgeMs === "number" && <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>}
+          {typeof statusTick?.info?.inEntryWindow === "boolean" && <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>}
         </div>
       </div>
 
       <div className="text-sm bg-gray-50 border border-gray-200 rounded p-2 mb-2">
         <div>Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}</div>
         <div>
-          Server (ET):{" "}
-          {statusTick?.serverTimeET
-            ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
-            : "—"}
+          Server (ET): {statusTick?.serverTimeET ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "—"}
         </div>
       </div>
 
@@ -1060,9 +1013,7 @@ function BotStatus({
         <div className="font-semibold mb-1">Last Recommendation</div>
         <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
           {statusTick?.lastRec
-            ? `Pick: ${statusTick.lastRec.ticker} @ ${
-                typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
-              }`
+            ? `Pick: ${statusTick.lastRec.ticker} @ ${typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"}`
             : "No recommendation yet — bot is waiting for a valid pick."}
         </div>
       </div>
@@ -1071,9 +1022,7 @@ function BotStatus({
         <div className="font-semibold mb-1">Open Position</div>
         <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
           {statusTick?.position
-            ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(
-                statusTick.position.entryPrice
-              ).toFixed(2)}`
+            ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(statusTick.position.entryPrice).toFixed(2)}`
             : "No open position — bot will enter only if conditions are met during the entry window."}
         </div>
       </div>
