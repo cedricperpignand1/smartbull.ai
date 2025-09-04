@@ -27,6 +27,7 @@ const LS_KEY = "tradeLog_allTime_v2_fifo";
 /** ===== NEW: table window (7 days) ===== */
 const WINDOW_DAYS = 7;
 const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
+const PANIC_PASSKEY = "9340";
 
 /** ===== Helpers ===== */
 function parseTs(input: any): number | null {
@@ -165,6 +166,12 @@ export default function TradeLogPanel() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
+  // Panic Sell UI
+  const [showPanic, setShowPanic] = useState(false);
+  const [panicKey, setPanicKey] = useState("");
+  const [panicBusy, setPanicBusy] = useState(false);
+  const [panicMsg, setPanicMsg] = useState<string | null>(null);
+
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Load from localStorage (migrated via normalize)
@@ -283,6 +290,58 @@ export default function TradeLogPanel() {
     }
   };
 
+  /** ===== PANIC SELL flow =====
+   * Calls /api/bot/panic-sell { key } (preferred), falls back to /api/bot/close-all.
+   */
+  const openPanic = () => {
+    setPanicMsg(null);
+    setPanicKey("");
+    setShowPanic(true);
+  };
+  const closePanic = () => {
+    if (!panicBusy) setShowPanic(false);
+  };
+  const confirmPanic = async () => {
+    if (panicKey.trim() !== PANIC_PASSKEY) {
+      setPanicMsg("❌ Incorrect passkey.");
+      return;
+    }
+    setPanicBusy(true);
+    setPanicMsg(null);
+    try {
+      // Primary endpoint
+      let res = await fetch("/api/bot/panic-sell", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: panicKey.trim() }),
+      });
+
+      // Fallback if primary not present
+      if (!res.ok) {
+        res = await fetch("/api/bot/close-all", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: panicKey.trim() }),
+        });
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !(data?.ok ?? true)) {
+        setPanicMsg("Panic sell failed. Check server logs.");
+      } else {
+        setPanicMsg("✅ Sent market-close for all positions.");
+        setTimeout(() => {
+          setShowPanic(false);
+          window.location.reload();
+        }, 700);
+      }
+    } catch {
+      setPanicMsg("Network error during panic sell.");
+    } finally {
+      setPanicBusy(false);
+    }
+  };
+
   return (
     <div className="p-4">
       {/* POSITIONS */}
@@ -326,8 +385,23 @@ export default function TradeLogPanel() {
         </table>
       )}
 
-      {/* TRADE LOG + RESET BUTTON */}
+      {/* TRADE LOG + ACTION BUTTONS */}
       <div className="relative">
+        {/* PANIC SELL (top-right) */}
+        <button
+          onClick={openPanic}
+          disabled={positions.length === 0}
+          className={`absolute top-2 right-40 z-50 rounded-lg px-3 py-1.5 text-sm font-semibold shadow
+            ${positions.length === 0
+              ? "bg-gray-300 text-gray-600 cursor-not-allowed"
+              : "bg-red-600 text-white hover:bg-red-700 active:scale-[.99]"}
+          `}
+          title={positions.length === 0 ? "No positions to close" : "Market close ALL positions"}
+        >
+          PANIC SELL
+        </button>
+
+        {/* existing Reset button */}
         <button
           onClick={openReset}
           className="absolute top-2 right-3 z-50 rounded-lg px-3 py-1.5 text-sm font-medium bg-rose-600 text-white hover:bg-rose-700 active:scale-[.99] shadow"
@@ -336,7 +410,7 @@ export default function TradeLogPanel() {
           Reset (admin)
         </button>
 
-        <h2 className="font-bold text-lg mb-2 pr-28">
+        <h2 className="font-bold text-lg mb-2 pr-44">
           Trade Log (last {WINDOW_DAYS} days)
         </h2>
 
@@ -400,7 +474,7 @@ export default function TradeLogPanel() {
         )}
       </div>
 
-      {/* PASSWORD MODAL */}
+      {/* PASSWORD MODAL (RESET) */}
       {showReset && (
         <div
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
@@ -451,6 +525,62 @@ export default function TradeLogPanel() {
 
             <div className="mt-3 text-xs text-slate-500">
               Hint: password is <span className="font-semibold">Fuck OFF</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PANIC SELL MODAL */}
+      {showPanic && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closePanic();
+          }}
+        >
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
+            <div className="text-lg font-semibold text-slate-800">
+              Panic Sell — Close ALL Positions
+            </div>
+            <p className="mt-1 text-sm text-slate-600">
+              Sends market orders to close every open position immediately.
+            </p>
+
+            <label className="block mt-4 text-sm text-slate-700">Passkey</label>
+            <input
+              type="password"
+              autoFocus
+              className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-red-500"
+              placeholder="Enter passkey (4 digits)"
+              value={panicKey}
+              onChange={(e) => setPanicKey(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && panicKey) confirmPanic();
+                if (e.key === "Escape") closePanic();
+              }}
+            />
+
+            {panicMsg && <div className="mt-3 text-sm">{panicMsg}</div>}
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                disabled={panicBusy}
+                onClick={closePanic}
+                className="rounded-xl px-3 py-1.5 text-sm font-medium border border-slate-300 text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={panicBusy || panicKey.length === 0}
+                onClick={confirmPanic}
+                className="rounded-xl px-3 py-1.5 text-sm font-semibold bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
+              >
+                {panicBusy ? "Sending…" : "Confirm Panic Sell"}
+              </button>
+            </div>
+
+            <div className="mt-3 text-xs text-slate-500">
+              Hint: passkey is <span className="font-semibold">{PANIC_PASSKEY}</span>
             </div>
           </div>
         </div>
