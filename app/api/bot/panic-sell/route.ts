@@ -6,22 +6,27 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 /**
- * ENV required on the server (Vercel → Settings → Environment Variables):
- * - PANIC_PASSKEY=9340
- * - ALPACA_KEY=YOUR_KEY
- * - ALPACA_SECRET=YOUR_SECRET
- * - ALPACA_BASE_URL=https://paper-api.alpaca.markets  (or https://api.alpaca.markets for live)
+ * Expected env (any of these will work):
+ * - PANIC_PASSKEY                (use 9340)
+ * - ALPACA_KEY | ALPACA_API_KEY | ALPACA_KEY_ID
+ * - ALPACA_SECRET | ALPACA_API_SECRET | ALPACA_SECRET_KEY   <-- now supports your name
+ * - ALPACA_BASE_URL (https://paper-api.alpaca.markets or https://api.alpaca.markets)
  */
 
 const PANIC_PASSKEY = process.env.PANIC_PASSKEY || "9340";
+
 const ALPACA_KEY =
   process.env.ALPACA_KEY ||
   process.env.ALPACA_API_KEY ||
+  process.env.ALPACA_KEY_ID ||
   "";
+
 const ALPACA_SECRET =
   process.env.ALPACA_SECRET ||
   process.env.ALPACA_API_SECRET ||
+  process.env.ALPACA_SECRET_KEY || // <-- support your current name
   "";
+
 const ALPACA_BASE = process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets";
 
 function json(data: any, status = 200) {
@@ -46,7 +51,6 @@ async function cancelAllOpenOrders() {
   try {
     const r = await alpacaFetch("/v2/orders", { method: "DELETE" });
     const body = await r.text().catch(() => "");
-    // 204/207 are normal for mass-cancel
     if (!r.ok && r.status !== 207 && r.status !== 204) {
       console.error("Alpaca cancel orders failed:", r.status, body);
       return { ok: false, error: `Alpaca cancel orders failed: ${r.status}` };
@@ -94,7 +98,7 @@ export async function POST(req: Request) {
     }
 
     if (!ALPACA_KEY || !ALPACA_SECRET) {
-      return json({ ok: false, error: "Missing Alpaca credentials (ALPACA_KEY / ALPACA_SECRET)." }, 500);
+      return json({ ok: false, error: "Missing Alpaca credentials (key/secret)." }, 500);
     }
 
     const cancelRes = await cancelAllOpenOrders();
