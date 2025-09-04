@@ -273,6 +273,126 @@ function ymdET(d: Date) {
 }
 
 /* =========================================================
+   Panic Sell button (asks for passkey 9340 and calls API)
+   ========================================================= */
+function PanicSellButton({ disabled }: { disabled: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [key, setKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const PASSKEY = "9340";
+
+  const confirm = async () => {
+    if (key.trim() !== PASSKEY) {
+      setMsg("❌ Incorrect passkey.");
+      return;
+    }
+    setBusy(true);
+    setMsg(null);
+    try {
+      let res = await fetch("/api/bot/panic-sell", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: key.trim() }),
+      });
+      if (!res.ok) {
+        // optional fallback
+        res = await fetch("/api/bot/close-all", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: key.trim() }),
+        });
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !(data?.ok ?? true)) {
+        setMsg("Panic sell failed. Check server logs.");
+      } else {
+        setMsg("✅ Sent market-close for all positions.");
+        setTimeout(() => {
+          setOpen(false);
+          window.location.reload();
+        }, 700);
+      }
+    } catch {
+      setMsg("Network error during panic sell.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        onClick={() => setOpen(true)}
+        disabled={disabled}
+        className={`rounded-lg px-3 py-1 text-sm font-semibold shadow
+          ${
+            disabled
+              ? "bg-gray-300 text-gray-600 cursor-not-allowed"
+              : "bg-red-600 text-white hover:bg-red-700 active:scale-[.99]"
+          }
+        `}
+        title={disabled ? "No open position to close" : "Market close ALL positions"}
+      >
+        PANIC SELL
+      </button>
+
+      {open && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !busy) setOpen(false);
+          }}
+        >
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
+            <div className="text-lg font-semibold text-slate-800">Panic Sell — Close ALL Positions</div>
+            <p className="mt-1 text-sm text-slate-600">Sends market orders to flatten every open position.</p>
+
+            <label className="block mt-4 text-sm text-slate-700">Passkey</label>
+            <input
+              type="password"
+              autoFocus
+              className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-red-500"
+              placeholder="Enter passkey (4 digits)"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && key) confirm();
+                if (e.key === "Escape" && !busy) setOpen(false);
+              }}
+            />
+
+            {msg && <div className="mt-3 text-sm">{msg}</div>}
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                disabled={busy}
+                onClick={() => setOpen(false)}
+                className="rounded-xl px-3 py-1.5 text-sm font-medium border border-slate-300 text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={busy || key.length === 0}
+                onClick={confirm}
+                className="rounded-xl px-3 py-1.5 text-sm font-semibold bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
+              >
+                {busy ? "Sending…" : "Confirm Panic Sell"}
+              </button>
+            </div>
+
+            <div className="mt-3 text-xs text-slate-500">
+              Hint: passkey is <span className="font-semibold">{PASSKEY}</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+/* =========================================================
    Page — static grid (no dragging) with dynamic background
    ========================================================= */
 export default function Home() {
@@ -570,7 +690,7 @@ export default function Home() {
             />
           </div>
 
-          {/* Trade Log — original opaque */}
+          {/* Trade Log — original opaque, now with PanicSellButton in header */}
           <div>
             <TradeLog tradeData={tradeData} />
           </div>
@@ -644,7 +764,7 @@ export default function Home() {
 }
 
 /* =========================================================
-   Subpanels (OPAQUE — unchanged)
+   Subpanels (OPAQUE — TopGainers unchanged)
    ========================================================= */
 function TopGainers({
   loading,
@@ -746,9 +866,23 @@ function TopGainers({
   );
 }
 
+/* =========================================================
+   Trade Log — now includes PanicSellButton in header
+   ========================================================= */
 function TradeLog({ tradeData }: { tradeData: TradePayload | null }) {
+  const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
+
   return (
-    <Panel title="Trade Log" color="orange" dense>
+    <Panel
+      title="Trade Log"
+      color="orange"
+      dense
+      right={
+        <div className="flex items-center gap-2">
+          <PanicSellButton disabled={!hasOpenPos} />
+        </div>
+      }
+    >
       {!tradeData?.trades?.length ? (
         <p className="text-gray-500 text-sm">No trades yet.</p>
       ) : (
@@ -791,6 +925,9 @@ function TradeLog({ tradeData }: { tradeData: TradePayload | null }) {
   );
 }
 
+/* =========================================================
+   AI Recommendation + Bot Status (unchanged)
+   ========================================================= */
 function AIRecommendation({
   botData,
   alpaca,
