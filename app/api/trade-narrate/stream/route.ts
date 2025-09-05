@@ -28,8 +28,24 @@ const FLOAT_MIN_PCT_PER_MIN = 0.0025; // 0.25%
 const MIN_DOLLAR_VOL = 200_000;
 
 // Stream pacing
-const TICK_MS = 20_000; // ~every 20s
-const MAX_SCAN_MINUTES = 15; // safety
+const TICK_MS = 20_000;             // ~every 20s
+const MAX_SCAN_MINUTES = 15;        // safety
+const DETAIL_EVERY_N_TICKS = 3;     // talk less: full detail every 3 ticks
+
+/* ───────────────────── “Human” cadence ───────────────────── */
+const THINK_MIN_MS = 450;
+const THINK_MAX_MS = 1200;
+const td = new TextEncoder();
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const think = (ms?: number) =>
+  sleep(ms ?? (THINK_MIN_MS + Math.random() * (THINK_MAX_MS - THINK_MIN_MS)));
+
+async function say(controller: ReadableStreamDefaultController, text: string, msAfter = 0, preThink = true) {
+  if (preThink) await think();                 // think before we talk (feels human)
+  controller.enqueue(td.encode(text));
+  if (msAfter > 0) await sleep(msAfter);       // optional linger after speaking
+}
 
 /* ───────────────────── ET time helpers ───────────────────── */
 function nowET(): Date {
@@ -70,31 +86,28 @@ function inForceWindowET() {
   const d = nowET();
   return d.getHours() === 9 && (d.getMinutes() === 45 || d.getMinutes() === 46);
 }
+function isExactly930ET() {
+  const d = nowET();
+  return d.getHours() === 9 && d.getMinutes() === 30;
+}
 
 /* ───────────────────── small utils ───────────────────── */
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-const td = new TextEncoder();
 
 /* ───────────────────── Casual persona helpers ───────────────────── */
 const persona = {
-  emojis: ["🚀", "🔥", "📈", "🧃", "☕️", "🤝", "🧠", "💪", "🦅", "🎯"],
-  greetings: [
-    "good morninggg ☕️",
-    "gm gm! coffee’s warm, tape’s hot 🔥",
-    "morning, team — let’s dance with the market 💃🕺",
-  ],
+  emojis: ["🚀", "📈", "☕️", "🤝", "🧠", "💪", "🦅", "🎯"],
   quips: [
-    "If spreads widen, we don’t chase — we sip coffee and smirk. ☕️",
-    "Volume talks. We listen. Then we act. 🎧",
+    "If spreads widen, we don’t chase — we sip coffee. ☕️",
+    "Volume talks, we listen, then act.",
     "Above VWAP? Buyers said ‘dibs’.",
-    "Opening range highs are just doors waiting to be kicked in. 🚪💥",
-    "Liquidity check: no kiddie pool today. We want the lap lane. 🏊",
+    "Opening range highs are just doors. 🚪",
     "Tape says ‘maybe’. I say ‘prove it’.",
   ],
   forceNotes: [
     "Force window = seatbelts on, risk guards first. 🛡️",
-    "If still flat into :45, I’ll lean on the AI like it owes me lunch. 🥪",
+    "If still flat into :45, I’ll lean on the AI — tight checks only. 🧠",
   ],
 };
 const pick = <T,>(arr: T[]) => arr[Math.floor(Math.random() * arr.length)];
@@ -111,10 +124,6 @@ function getBaseUrl(req: Request) {
   const proto = (req.headers.get("x-forwarded-proto") || "http").split(",")[0].trim();
   const host = (req.headers.get("x-forwarded-host") || req.headers.get("host") || "").split(",")[0].trim();
   return `${proto}://${host}`;
-}
-async function say(controller: ReadableStreamDefaultController, text: string, ms = 0) {
-  controller.enqueue(td.encode(text));
-  if (ms > 0) await new Promise((r) => setTimeout(r, ms));
 }
 
 /* ───────────────────── Market data helpers ───────────────────── */
@@ -163,8 +172,7 @@ function computeSessionVWAP(candles: Candle[], todayYMD: string) {
     return isSameETDay(d, todayYMD) && mins >= 9 * 60 + 30;
   });
   if (!session.length) return null;
-  let pvSum = 0,
-    volSum = 0;
+  let pvSum = 0, volSum = 0;
   for (const c of session) {
     const typical = (c.high + c.low + c.close) / 3;
     pvSum += typical * c.volume;
@@ -384,56 +392,56 @@ async function readSignalsForNarration(base: string, symbol: string): Promise<Si
 /* ───────────────────── Route ───────────────────── */
 export async function POST(req: NextRequest) {
   try {
-    // Optional: allow a custom opening line/thesis, but we auto-drive narration.
     const { note } = await req.json().catch(() => ({ note: "" }));
-
     const base = getBaseUrl(req);
 
     const stream = new ReadableStream({
       start: async (controller) => {
         try {
+          // Opening line with time + *only* say "good morninggg" at 09:30 ET
           const t = hhmmssET();
-          const greet = inScanWindowET() ? pick(persona.greetings) : "hello";
-          await say(
-            controller,
-            `(${t} ET) ${greet} — let’s trade smart and have a little fun ${pick(persona.emojis)}\n`
-          );
+          const greeting = isExactly930ET()
+            ? "good morninggg ☕️"
+            : (inScanWindowET() ? "hey — keeping it chill, watching the open." : "hey — I’ll jump in at 09:30 ET.");
+          await say(controller, `(${t} ET) ${greeting}\n`);
 
-          // If we are before 9:30, set context and exit quickly.
+          // If we are before 9:30 or outside early window: let them know and end early
           if (!inScanWindowET() && !inForceWindowET()) {
-            await say(
-              controller,
-              `Live commentary kicks in 09:30–09:45 ET. I’ll save the jokes till the bell rings. 🛎️\n`
-            );
+            await say(controller, `Live commentary runs 09:30–09:45 ET. I’ll save the words till the bell. 🛎️\n`);
             controller.close();
             return;
           }
 
-          if (note && typeof note === "string") {
-            await say(controller, `Note received: “${note.trim()}”. If it fits the setup, I’m in. 🤝\n`);
+          if (note && typeof note === "string" && note.trim()) {
+            await say(controller, `Noted: “${note.trim()}”. If it fits the setup, we’ll work it in. 🤝\n`);
           }
 
-          // SCAN LOOP: talk continuously until 09:45
+          // SCAN LOOP: talk less, think more
           let scanTicks = 0;
           let announcedTopOnce = false;
 
           while (inScanWindowET() && scanTicks < Math.ceil((MAX_SCAN_MINUTES * 60_000) / TICK_MS)) {
             scanTicks++;
 
+            // Only do a full breakdown every N ticks to avoid sounding robotic
+            const doDetailed = scanTicks % DETAIL_EVERY_N_TICKS === 1;
+
             const snap = await getSnapshot(base);
             const top = (snap?.stocks || []).slice(0, 8);
+
             if (!top.length) {
-              await say(controller, `Waiting for the top gainers list to populate… ${pick(persona.emojis)}\n`, TICK_MS);
+              if (doDetailed) await say(controller, `Waiting for top gainers to populate… ${pick(persona.emojis)}\n`);
+              await sleep(TICK_MS);
               continue;
             }
 
-            if (!announcedTopOnce) {
+            if (!announcedTopOnce && doDetailed) {
               const names = top.map((s) => s.ticker).join(", ");
-              await say(controller, `Scanning top 8 gainers: ${names}. ${pick(persona.emojis)}${riff()}`);
+              await say(controller, `Scanning top 8: ${names}. ${pick(persona.emojis)}${riff()}`);
               announcedTopOnce = true;
             }
 
-            // Ask the AI for the two picks among top 8
+            // Ask the AI for two picks among top 8 (silent if not detailed)
             let picks: string[] = [];
             try {
               const r = await fetch(`${base}/api/recommendation`, {
@@ -449,71 +457,69 @@ export async function POST(req: NextRequest) {
             } catch {}
 
             if (!picks.length) {
-              await say(controller, `AI hasn’t locked two names yet. Keeping an eye on the tape… ${pick(persona.emojis)}\n`, TICK_MS);
+              if (doDetailed) {
+                await say(controller, `AI hasn’t locked two names yet. Watching the tape… ${pick(persona.emojis)}\n`);
+              }
+              await sleep(TICK_MS);
               continue;
             }
 
-            if (picks.length === 1) {
-              await say(controller, `AI primary pick: ${picks[0]}. Secondary is still loading… 🧠\n`);
-            } else {
-              await say(controller, `AI short-list: ${picks[0]} (primary) and ${picks[1]} (secondary). Nice. ${pick(persona.emojis)}\n`);
-            }
-
-            // Explain the “why” for each pick in plain English
-            for (const sym of picks) {
-              const read = await readSignalsForNarration(base, sym);
-              if (!read.ok) {
-                await say(controller, `• ${sym}: no fresh intraday bars yet; skipping analysis for now. 🧃\n`);
-                continue;
-              }
-
-              const parts: string[] = [];
-              parts.push(`• ${sym}: $${read.price.toFixed(2)} — `);
-
-              // Quick checklist
-              parts.push(
-                `price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "too wide"}${
-                  read.spreadNote || ""
-                }`
-              );
-
-              const liqStr = `liq ${read.liq.ok ? "OK" : "light"} (need ≥ ${read.liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min)`;
-              parts.push(`, ${liqStr}.`);
-
-              // Levels + signals
-              const levels: string[] = [];
-              if (read.orHigh != null) levels.push(`ORH ${read.orHigh.toFixed(2)}`);
-              if (read.vwap != null) levels.push(`VWAP ${read.vwap.toFixed(2)}`);
-              if (levels.length) parts.push(` Levels: ${levels.join(", ")}.`);
-
-              const sigs: string[] = [];
-              if (read.aboveVWAP) sigs.push("above VWAP");
-              if (read.breakORH) sigs.push("pushing OR high");
-              if (read.nearOR) sigs.push(`near OR (${(read.NEAR_OR_PCT * 100).toFixed(2)}% band)`);
-              if (read.vwapRecl) sigs.push(`VWAP reclaim (${(read.VWAP_RECLAIM_BAND * 100).toFixed(2)}% hold)`);
-              if (read.volMult != null) sigs.push(`vol pulse ${read.volMult.toFixed(2)}× (need ≥ ${read.VOL_MULT_MIN.toFixed(2)}×)`);
-              if (sigs.length) parts.push(` Signals: ${sigs.join(", ")}.`);
-
-              // Decision phrasing
-              if (read.priceOK && read.spreadOK && read.liq.ok && read.armedMomentum) {
-                parts.push(
-                  ` Read: **momentum armed** (above VWAP + ${read.signalCount} confirms). If we pick it, I’m comfortable hitting the button. 🚀`
-                );
+            if (doDetailed) {
+              if (picks.length === 1) {
+                await say(controller, `Primary: ${picks[0]}. Secondary loading… 🧠\n`);
               } else {
-                const needs: string[] = [];
-                if (!read.priceOK) needs.push("price in band");
-                if (!read.spreadOK) needs.push("tighter spread");
-                if (!read.liq.ok) needs.push("more liquidity");
-                if (!(read.aboveVWAP && read.signalCount >= 2)) needs.push("above VWAP + ≥2 signals");
-                if (needs.length) parts.push(` Needs: ${needs.join(", ")}. No FOMO — we let the setup come to us. 😎`);
+                await say(controller, `Short-list: ${picks[0]} (primary), ${picks[1]} (secondary). ${pick(persona.emojis)}\n`);
               }
-
-              await say(controller, parts.join(""), 0);
-              await say(controller, ` ${pick(persona.emojis)}${riff()}`);
             }
 
-            // Soft pacing between updates
-            await say(controller, "", TICK_MS);
+            // Only do the long English breakdown on detailed ticks
+            if (doDetailed) {
+              for (const sym of picks) {
+                const read = await readSignalsForNarration(base, sym);
+                if (!read.ok) {
+                  await say(controller, `• ${sym}: no fresh intraday bars yet; skipping for now. 🧃\n`);
+                  continue;
+                }
+
+                const parts: string[] = [];
+                parts.push(`• ${sym}: $${read.price.toFixed(2)} — `);
+                parts.push(
+                  `price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "wide"}${read.spreadNote || ""}`
+                );
+
+                const liqStr = `liq ${read.liq.ok ? "OK" : "light"} (need ≥ ${read.liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min)`;
+                parts.push(`, ${liqStr}.`);
+
+                const levels: string[] = [];
+                if (read.orHigh != null) levels.push(`ORH ${read.orHigh.toFixed(2)}`);
+                if (read.vwap != null) levels.push(`VWAP ${read.vwap.toFixed(2)}`);
+                if (levels.length) parts.push(` Levels: ${levels.join(", ")}.`);
+
+                const sigs: string[] = [];
+                if (read.aboveVWAP) sigs.push("above VWAP");
+                if (read.breakORH) sigs.push("pushing OR high");
+                if (read.nearOR) sigs.push(`near OR (${(read.NEAR_OR_PCT * 100).toFixed(2)}% band)`);
+                if (read.vwapRecl) sigs.push(`VWAP reclaim (${(read.VWAP_RECLAIM_BAND * 100).toFixed(2)}% hold)`);
+                if (read.volMult != null) sigs.push(`vol pulse ${read.volMult.toFixed(2)}× (need ≥ ${read.VOL_MULT_MIN.toFixed(2)}×)`);
+                if (sigs.length) parts.push(` Signals: ${sigs.join(", ")}.`);
+
+                if (read.priceOK && read.spreadOK && read.liq.ok && read.armedMomentum) {
+                  parts.push(` Read: momentum armed (above VWAP + ${read.signalCount} confirms). Comfortable to act. 🚀`);
+                } else {
+                  const needs: string[] = [];
+                  if (!read.priceOK) needs.push("price in band");
+                  if (!read.spreadOK) needs.push("tighter spread");
+                  if (!read.liq.ok) needs.push("more liquidity");
+                  if (!(read.aboveVWAP && read.signalCount >= 2)) needs.push("above VWAP + ≥2 signals");
+                  if (needs.length) parts.push(` Needs: ${needs.join(", ")}. No FOMO — let it come to us. 😎`);
+                }
+
+                await say(controller, parts.join("") + ` ${pick(persona.emojis)}${riff()}`);
+              }
+            }
+
+            // Soft pacing between updates (silent most ticks)
+            await sleep(TICK_MS);
           }
 
           // Force window narration (09:45–09:46)
@@ -526,7 +532,7 @@ export async function POST(req: NextRequest) {
             );
           }
 
-          await say(controller, `(${hhmmssET()} ET) Early window done. Trade clean, drink water, respect stops. 💧🎯\n`);
+          await say(controller, `(${hhmmssET()} ET) Early window done. Trade clean, hydrate, respect stops. 💧🎯\n`);
           controller.close();
         } catch {
           controller.enqueue(td.encode("Narration error.\n"));
