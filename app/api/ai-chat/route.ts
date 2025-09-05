@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // app/api/ai-chat/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,8 +22,8 @@ function secondSundayUTC(year: number, monthIndex: number) {
 }
 function isDST_US_Eastern(utc: Date): boolean {
   const y = utc.getUTCFullYear();
-  const start = Date.UTC(y, 2, secondSundayUTC(y, 2), 7, 0, 0); // 2nd Sun Mar @ 07:00 UTC
-  const end = Date.UTC(y, 10, firstSundayUTC(y, 10), 6, 0, 0);  // 1st Sun Nov @ 06:00 UTC
+  const start = Date.UTC(y, 2, secondSundayUTC(y, 2), 7, 0, 0); // 2nd Sun Mar @ 07:00 UTC (2a ET)
+  const end = Date.UTC(y, 10, firstSundayUTC(y, 10), 6, 0, 0);  // 1st Sun Nov @ 06:00 UTC (2a ET)
   const t = utc.getTime();
   return t >= start && t < end;
 }
@@ -49,6 +50,63 @@ function endOfETDayUTC(utcInstant: Date): Date {
   return new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
 }
 
+/** Parse ET date range from message. Returns [startUTC, endUTC] inclusive + label. */
+function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Date; endUTC: Date; label: string } {
+  const lower = msg.toLowerCase();
+
+  const on = lower.match(/\b(on\s+)?(\d{4})[-/](\d{2})[-/](\d{2})\b/);
+  if (on) {
+    const Y = Number(on[2]), M = Number(on[3]), D = Number(on[4]);
+    const anchor = new Date(Date.UTC(Y, M - 1, D, 12));
+    return { startUTC: startOfETDayUTC(anchor), endUTC: endOfETDayUTC(anchor), label: `${Y}-${String(M).padStart(2,"0")}-${String(D).padStart(2,"0")}` };
+  }
+
+  const between = lower.match(/\bbetween\s+(\d{4})[-/](\d{2})[-/](\d{2})\s+(and|to)\s+(\d{4})[-/](\d{2})[-/](\d{2})\b/);
+  if (between) {
+    const Y1 = Number(between[1]), M1 = Number(between[2]), D1 = Number(between[3]);
+    const Y2 = Number(between[5]), M2 = Number(between[6]), D2 = Number(between[7]);
+    const a = new Date(Date.UTC(Y1, M1 - 1, D1, 12));
+    const b = new Date(Date.UTC(Y2, M2 - 1, D2, 12));
+    return { startUTC: startOfETDayUTC(a), endUTC: endOfETDayUTC(b), label: `${Y1}-${String(M1).padStart(2,"0")}-${String(D1).padStart(2,"0")} → ${Y2}-${String(M2).padStart(2,"0")}-${String(D2).padStart(2,"0")}` };
+  }
+
+  const lastX = lower.match(/\blast\s+(\d{1,2})\s*(day|days|week|weeks)\b/);
+  if (lastX) {
+    const n = Number(lastX[1]);
+    const unit = lastX[2].startsWith("week") ? "week" : "day";
+    const days = unit === "week" ? n * 7 : n;
+    const end = endOfETDayUTC(nowUTC);
+    const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000 + 1);
+    return { startUTC: start, endUTC: end, label: `last ${n} ${unit}${n>1?"s":""}` };
+  }
+
+  if (/\bthis week\b/.test(lower)) {
+    const todayStart = startOfETDayUTC(nowUTC);
+    const etAnchor = new Date(todayStart.getTime() + 12 * 60 * 60 * 1000);
+    const dow = new Date(etAnchor).getUTCDay(); // 0 Sun
+    const daysFromMon = (dow + 6) % 7; // Mon=0
+    const start = new Date(todayStart.getTime() - daysFromMon * 24 * 60 * 60 * 1000);
+    const end = endOfETDayUTC(nowUTC);
+    return { startUTC: start, endUTC: end, label: "this week" };
+  }
+
+  if (/\bthis month\b/.test(lower)) {
+    const parts = toETParts(nowUTC);
+    const [Y, M] = parts.ymd.split("-").map(Number);
+    const start = startOfETDayUTC(new Date(Date.UTC(Y, M - 1, 1, 12)));
+    const firstNext = new Date(Date.UTC(Y, M, 1, 12));
+    const lastDay = new Date(firstNext.getTime() - 24 * 60 * 60 * 1000);
+    return { startUTC: start, endUTC: endOfETDayUTC(lastDay), label: "this month" };
+  }
+
+  if (/\byesterday\b/.test(lower)) {
+    const todayStart = startOfETDayUTC(nowUTC);
+    return { startUTC: new Date(todayStart.getTime() - 24 * 60 * 60 * 1000), endUTC: new Date(todayStart.getTime() - 1), label: "yesterday" };
+  }
+
+  return { startUTC: startOfETDayUTC(nowUTC), endUTC: endOfETDayUTC(nowUTC), label: "today" };
+}
+
 /* ──────────────────────────────────────────────────────────
    Types (DB-aligned with your schema)
    ────────────────────────────────────────────────────────── */
@@ -61,7 +119,6 @@ type DbTrade = {
   at: Date;
   filledAt?: Date | null;
   filledPrice?: any | null;
-  // reason?: string | null; // optional future field
 };
 type DbPos = {
   id: number;
@@ -128,10 +185,8 @@ const money = (n: number) => (n >= 0 ? `+$${n.toFixed(2)}` : `-$${Math.abs(n).to
    Human tone helpers
    ────────────────────────────────────────────────────────── */
 const tone = {
-  open: (s: string) => `Okay — ${s}`,
   flat: () => "I’m flat right now.",
-  holding: (pos: DbPos) =>
-    `Currently holding ${pos.shares} ${pos.ticker} @ $${asNumber(pos.entryPrice).toFixed(2)}.`,
+  holding: (pos: DbPos) => `Currently holding ${pos.shares} ${pos.ticker} @ $${asNumber(pos.entryPrice).toFixed(2)}.`,
   fun: (s: string) => `Alrighty — ${s} 🙂`,
 };
 
@@ -149,31 +204,17 @@ type Intent =
   | "status"
   | "help";
 
-function extractTicker(msg: string): string | null {
-  // Grab $VEEE or bare VEEE; avoid obvious words like WHAT/SELL
-  const dollar = msg.toUpperCase().match(/\$([A-Z]{1,5})(?:\.[A-Z]{1,2})?\b/);
-  if (dollar?.[1]) return dollar[1];
-  const m = msg.toUpperCase().match(/\b([A-Z]{1,5})(?:\.[A-Z]{1,2})?\b/);
-  const cand = m?.[1] || null;
-  const blacklist = new Set(["WHAT","YOU","SELL","SOLD","PRICE","BUY","BOUGHT","ENTRY","EXIT","AVERAGE","COST","IT","WE","DID","AT","WHERE"]);
-  return cand && !blacklist.has(cand) ? cand : null;
-}
-
 function parseIntent(q: string): Intent {
   const m = q.toLowerCase();
 
-  // SELL / EXIT PRICE (very liberal)
-  if (
-    /\b(exit|sell|sold|selled|close|closed|get out|got out|take profit|tp)\b/.test(m) &&
-    /\b(price|avg|average|at|fill|fills?)\b/.test(m)
-  ) return "sell_price";
+  // SELL / EXIT PRICE
+  if (/\b(exit|sell|sold|selled|close|closed|get out|got out|take profit|tp)\b/.test(m) &&
+      /\b(price|avg|average|at|fill|fills?)\b/.test(m)) return "sell_price";
 
-  // ENTRY / BUY PRICE (very liberal)
-  if (
-    (/\b(buy|bought|enter|entered|entry|get in|got in|added|add)\b/.test(m) &&
-     /\b(price|avg|average|cost|fill|fills?)\b/.test(m)) ||
-    /\b(average cost|avg cost|avg entry|average entry)\b/.test(m)
-  ) return "entry_price";
+  // ENTRY / BUY PRICE
+  if ((/\b(buy|bought|enter|entered|entry|get in|got in|added|add)\b/.test(m) &&
+       /\b(price|avg|average|cost|fill|fills?)\b/.test(m)) ||
+      /\b(average cost|avg cost|avg entry|average entry)\b/.test(m)) return "entry_price";
 
   // WHY TRADE
   if (/(why).*(trade|traded|buy|bought|sell|sold|enter|entry|took|take|long|short)/.test(m)) return "why_trade";
@@ -186,103 +227,49 @@ function parseIntent(q: string): Intent {
   return "status";
 }
 
-/** Parse ET date range from message. Returns [startUTC, endUTC] inclusive + label. */
-function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Date; endUTC: Date; label: string } {
-  const lower = msg.toLowerCase();
-
-  const on = lower.match(/\b(on\s+)?(\d{4})[-/](\d{2})[-/](\d{2})\b/);
-  if (on) {
-    const Y = Number(on[2]), M = Number(on[3]), D = Number(on[4]);
-    const anchor = new Date(Date.UTC(Y, M - 1, D, 12));
-    const start = startOfETDayUTC(anchor);
-    const end = endOfETDayUTC(anchor);
-    return { startUTC: start, endUTC: end, label: `${Y}-${String(M).padStart(2,"0")}-${String(D).padStart(2,"0")}` };
-  }
-
-  const between = lower.match(/\bbetween\s+(\d{4})[-/](\d{2})[-/](\d{2})\s+(and|to)\s+(\d{4})[-/](\d{2})[-/](\d{2})\b/);
-  if (between) {
-    const Y1 = Number(between[1]), M1 = Number(between[2]), D1 = Number(between[3]);
-    const Y2 = Number(between[5]), M2 = Number(between[6]), D2 = Number(between[7]);
-    const a = new Date(Date.UTC(Y1, M1 - 1, D1, 12));
-    const b = new Date(Date.UTC(Y2, M2 - 1, D2, 12));
-    const start = startOfETDayUTC(a);
-    const end = endOfETDayUTC(b);
-    return { startUTC: start, endUTC: end, label: `${Y1}-${String(M1).padStart(2,"0")}-${String(D1).padStart(2,"0")} → ${Y2}-${String(M2).padStart(2,"0")}-${String(D2).padStart(2,"0")}` };
-  }
-
-  const lastX = lower.match(/\blast\s+(\d{1,2})\s*(day|days|week|weeks)\b/);
-  if (lastX) {
-    const n = Number(lastX[1]);
-    const unit = lastX[2].startsWith("week") ? "week" : "day";
-    const days = unit === "week" ? n * 7 : n;
-    const end = endOfETDayUTC(nowUTC);
-    const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000 + 1);
-    return { startUTC: start, endUTC: end, label: `last ${n} ${unit}${n>1?"s":""}` };
-  }
-
-  if (/\bthis week\b/.test(lower)) {
-    const todayStart = startOfETDayUTC(nowUTC);
-    const etAnchor = new Date(todayStart.getTime() + 12 * 60 * 60 * 1000);
-    const dow = new Date(etAnchor).getUTCDay(); // 0 Sun
-    const daysFromMon = (dow + 6) % 7; // Mon=0
-    const start = new Date(todayStart.getTime() - daysFromMon * 24 * 60 * 60 * 1000);
-    const end = endOfETDayUTC(nowUTC);
-    return { startUTC: start, endUTC: end, label: "this week" };
-  }
-
-  if (/\bthis month\b/.test(lower)) {
-    const parts = toETParts(nowUTC);
-    const [Y, M] = parts.ymd.split("-").map(Number);
-    const start = startOfETDayUTC(new Date(Date.UTC(Y, M - 1, 1, 12)));
-    const firstNext = new Date(Date.UTC(Y, M, 1, 12));
-    const lastDay = new Date(firstNext.getTime() - 24 * 60 * 60 * 1000);
-    const end = endOfETDayUTC(lastDay);
-    return { startUTC: start, endUTC: end, label: "this month" };
-  }
-
-  if (/\byesterday\b/.test(lower)) {
-    const todayStart = startOfETDayUTC(nowUTC);
-    const yStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
-    const yEnd = new Date(todayStart.getTime() - 1);
-    return { startUTC: yStart, endUTC: yEnd, label: "yesterday" };
-  }
-
-  return { startUTC: startOfETDayUTC(nowUTC), endUTC: endOfETDayUTC(nowUTC), label: "today" };
-}
-
 /* ──────────────────────────────────────────────────────────
-   Data fetchers (schema-aligned)
+   Robust ticker extraction
    ────────────────────────────────────────────────────────── */
-async function fetchTradesInRange(startUTC: Date, endUTC: Date): Promise<DbTrade[]> {
-  const trades = (await prisma.trade.findMany({
-    where: { at: { gte: startUTC, lte: endUTC } },
-    orderBy: { id: "asc" },
-  })) as unknown as DbTrade[];
-  return trades;
+const STOPWORDS = new Set([
+  "WHY","WHAT","WHEN","WHERE","WHO","HOW",
+  "TODAY","YESTERDAY","THIS","WEEK","MONTH","YEAR",
+  "DID","DO","WE","YOU","IT","AT","IN","ON","WITH",
+  "TRADE","TRADED","BUY","BOUGHT","SELL","SOLD","ENTRY","EXIT",
+  "PRICE","AVERAGE","AVG","COST","FILL","FILLS","OPEN","POSITION"
+]);
+function extractCandidates(msg: string) {
+  const text = msg ?? "";
+  const dollar = [...text.matchAll(/\$([A-Za-z]{1,5})(?:\.[A-Za-z]{1,2})?\b/g)]
+    .map(m => m[1].toUpperCase())
+    .filter(t => !STOPWORDS.has(t));
+  const bare = [...text.matchAll(/\b([A-Za-z]{1,5})(?:\.[A-Za-z]{1,2})?\b/g)]
+    .map(m => m[1].toUpperCase())
+    .filter(t => !STOPWORDS.has(t) && !dollar.includes(t));
+  return { dollar, bare };
 }
-async function fetchOpenPosition(): Promise<DbPos | null> {
-  return (await prisma.position.findFirst({
-    where: { open: true },
-    orderBy: { id: "desc" },
-  })) as unknown as DbPos | null;
-}
-async function fetchLatestRecommendationForTickerInWindow(
-  ticker: string,
-  startUTC: Date,
-  endUTC: Date
-): Promise<DbReco | null> {
-  const rows = (await prisma.recommendation.findMany({
-    where: {
-      ticker: ticker.toUpperCase(),
-      at: {
-        gte: new Date(startUTC.getTime() - 12 * 60 * 60 * 1000),
-        lte: new Date(endUTC.getTime() + 12 * 60 * 60 * 1000),
-      },
-    },
-    orderBy: { at: "desc" },
-    take: 1,
-  })) as unknown as DbReco[];
-  return rows?.[0] ?? null;
+function chooseTickerFromContext(
+  msg: string,
+  trades: DbTrade[],
+  opts: { requireTraded?: boolean } = { requireTraded: true }
+): string | null {
+  const traded = Array.from(new Set(trades.map(r => r.ticker.toUpperCase())));
+  const tradedSet = new Set(traded);
+  const { dollar, bare } = extractCandidates(msg);
+
+  const pickFrom = (arr: string[]) => {
+    for (const t of arr) {
+      if (!opts.requireTraded) return t;
+      if (tradedSet.has(t)) return t;
+    }
+    return null;
+  };
+
+  const p1 = pickFrom(dollar);
+  if (p1) return p1;
+  const p2 = pickFrom(bare);
+  if (p2) return p2;
+  if (opts.requireTraded && traded.length === 1) return traded[0];
+  return null;
 }
 
 /* ──────────────────────────────────────────────────────────
@@ -309,33 +296,22 @@ async function fetchCandles1m(base: string, symbol: string, limit = 360): Promis
     const j = await res.json();
     const arr = Array.isArray(j?.candles) ? j.candles : [];
     return arr.map((c: any) => ({
-      date: c.date,
-      open: Number(c.open),
-      high: Number(c.high),
-      low: Number(c.low),
-      close: Number(c.close),
-      volume: Number(c.volume),
+      date: c.date, open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close), volume: Number(c.volume),
     }));
   } catch {
     return [];
   }
 }
-
 async function fetchQuoteLite(base: string, symbol: string): Promise<QuoteLite> {
   try {
     const res = await fetch(`${base}/api/fmp/quote?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
     const j = await res.json();
     const row = (Array.isArray(j) ? j[0] : j) || {};
-    return {
-      price: Number(row.price),
-      avgVolume: Number(row.avgVolume || row.avgVolume10Day || row.averageVolume),
-      marketCap: Number(row.marketCap),
-    };
+    return { price: Number(row.price), avgVolume: Number(row.avgVolume || row.avgVolume10Day || row.averageVolume), marketCap: Number(row.marketCap) };
   } catch {
     return {};
   }
 }
-
 async function fetchFloatShares(base: string, symbol: string): Promise<number | null> {
   try {
     const r = await fetch(`${base}/api/fmp/float?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
@@ -359,7 +335,6 @@ async function fetchFloatShares(base: string, symbol: string): Promise<number | 
   } catch {}
   return null;
 }
-
 function toET(dateIso: string) {
   return new Date(new Date(dateIso).toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
@@ -414,7 +389,7 @@ function computeRelVol5(candles: Candle[], ymd: string, cutoffET: Date, N = 5) {
   return last.volume / avgPrior;
 }
 
-/* VWAP slope (compare current vwap vs vwap 3 minutes earlier) */
+/* VWAP slope (current vwap vs vwap 3 minutes earlier) */
 function computeVWAPSlope(candles: Candle[], ymd: string, cutoffET: Date, backMinutes = 3) {
   const backCut = new Date(cutoffET.getTime() - backMinutes * 60_000);
   const v1 = computeVWAPUpTo(candles, ymd, cutoffET);
@@ -423,7 +398,7 @@ function computeVWAPSlope(candles: Candle[], ymd: string, cutoffET: Date, backMi
   return v1 - v0; // positive = up slope
 }
 
-/* Trend check (last 3 closes making higher highs/lows) */
+/* Trend check (last 3 closes) */
 function last3Trend(candles: Candle[], ymd: string, cutoffET: Date) {
   const day = candles.filter((c) => isSameETDay(toET(c.date), ymd) && toET(c.date).getTime() <= cutoffET.getTime());
   const w = day.slice(-3);
@@ -433,12 +408,8 @@ function last3Trend(candles: Candle[], ymd: string, cutoffET: Date) {
   return { higherCloses, higherLows };
 }
 
-/* “Why we traded” — rich explanation built around the entry candle */
-async function buildWhyTradeDeep(
-  base: string,
-  symbol: string,
-  entryUTC: Date
-): Promise<string | null> {
+/* “Why we traded” — deep explanation built around entry candle */
+async function buildWhyTradeDeep(base: string, symbol: string, entryUTC: Date): Promise<string | null> {
   const ymd = yyyyMmDdETFromUTC(entryUTC);
   const candles = await fetchCandles1m(base, symbol, 360);
   if (!candles.length) return null;
@@ -460,7 +431,6 @@ async function buildWhyTradeDeep(
   const nearOrBreak =
     or ? (last.close > or.high ? "breaking OR high" : (last.close >= or.high * 0.995 ? "testing OR high" : "")) : "";
 
-  // Spread check (best-effort)
   let spreadNote = "";
   try {
     const tight = await spreadGuardOK(symbol, 0.005);
@@ -469,7 +439,6 @@ async function buildWhyTradeDeep(
     spreadNote = "spread check unavailable";
   }
 
-  // Risk anchors
   const stopAnchor =
     vwap != null && last.low >= vwap * 0.995
       ? { kind: "VWAP hold", level: vwap }
@@ -507,13 +476,10 @@ async function buildWhyTradeDeep(
     if (fnum < 20_000_000) liq.push("low float — can move fast");
     else if (fnum < 60_000_000) liq.push("moderate float");
   }
-  if (Number.isFinite(Number(quote.avgVolume)) && quote.avgVolume! > 0) {
-    liq.push(`avg volume ~${Math.round(quote.avgVolume!).toLocaleString()}`);
-  }
+  if (Number.isFinite(Number(quote.avgVolume)) && quote.avgVolume! > 0) liq.push(`avg volume ~${Math.round(quote.avgVolume!).toLocaleString()}`);
   if (Number.isFinite(Number(quote.marketCap)) && quote.marketCap! > 0) {
     const mc = quote.marketCap!;
-    const mcStr = mc < 300e6 ? "small-cap" : mc < 2e9 ? "mid-cap" : "large-cap";
-    liq.push(mcStr);
+    liq.push(mc < 300e6 ? "small-cap" : mc < 2e9 ? "mid-cap" : "large-cap");
   }
   if (liq.length) bits.push(liq.join(", "));
   if (spreadNote) bits.push(spreadNote);
@@ -523,13 +489,10 @@ async function buildWhyTradeDeep(
 
   if (stopAnchor && Number.isFinite(stopAnchor.level)) {
     const riskPS = Math.max(0, last.close - stopAnchor.level);
-    const rr =
-      Number.isFinite(target) && target > last.close && riskPS > 0
-        ? (target - last.close) / riskPS
-        : null;
+    const rr = Number.isFinite(target) && target > last.close && riskPS > 0 ? (target - last.close) / riskPS : null;
     lines.push(
       `Risk frame: stop ~${stopAnchor.kind} ($${stopAnchor.level.toFixed(2)}), ` +
-      `risk/Share ≈ $${riskPS.toFixed(2)}${rr != null ? `, R:R ≈ ${rr.toFixed(2)}x to ${target === dayHighSoFar ? "day high" : "OR high"}` : ""}.`
+      `risk/share ≈ $${riskPS.toFixed(2)}${rr != null ? `, R:R ≈ ${rr.toFixed(2)}× to ${target === dayHighSoFar ? "day high" : "OR high"}` : ""}.`
     );
   }
 
@@ -563,13 +526,6 @@ function priceOf(tr: DbTrade) {
   const p = tr.filledPrice != null ? asNumber(tr.filledPrice) : asNumber(tr.price);
   return Number.isFinite(p) ? p : asNumber(tr.price);
 }
-function chooseTickerFromContext(q: string, trades: DbTrade[]): string | null {
-  let t = extractTicker(q);
-  const traded = Array.from(new Set(trades.map(r => r.ticker.toUpperCase())));
-  if (t && traded.includes(t.toUpperCase())) return t.toUpperCase();
-  if (!t && traded.length === 1) return traded[0];
-  return t ? t.toUpperCase() : null;
-}
 
 /* ──────────────────────────────────────────────────────────
    POST (main chat)
@@ -582,22 +538,28 @@ export async function POST(req: Request) {
 
     const intent = parseIntent(msg);
     const { startUTC, endUTC, label } = parseDateRangeETFromMessage(msg, nowUTC);
-    const [tradesInRange, openPos] = await Promise.all([
-      fetchTradesInRange(startUTC, endUTC),
-      fetchOpenPosition(),
-    ]);
+
+    // Pull once; keep TS simple
+    const tradesInRange = await prisma.trade.findMany({
+      where: { at: { gte: startUTC, lte: endUTC } },
+      orderBy: { id: "asc" },
+    }) as unknown as DbTrade[];
+    const openPos = await prisma.position.findFirst({
+      where: { open: true },
+      orderBy: { id: "desc" },
+    }) as unknown as DbPos | null;
 
     if (intent === "help") {
       return NextResponse.json({
         reply:
-          "Here’s what I can do:\n" +
-          "- “What did we trade today / yesterday / last 5 days?”\n" +
-          "- “What’s my P&L today / this week / this month?”\n" +
-          "- “Are we holding anything?”\n" +
-          "- “Why did we trade ABCD?”\n" +
-          "- “What price did we **sell/exit** ABCD?” (fills + avg)\n" +
-          "- “What price did we **buy/enter** ABCD?” (fills + avg)\n" +
-          "- “Why did the AI pick ABCD?”",
+          "I’ve got you. Try:\n" +
+          "- What did we trade today / yesterday / last 5 days?\n" +
+          "- What’s my P&L today / this week / this month?\n" +
+          "- Are we holding anything?\n" +
+          "- Why did we trade ABCD?\n" +
+          "- What price did we sell/exit ABCD?\n" +
+          "- What price did we buy/enter ABCD?\n" +
+          "- Why did the AI pick ABCD?",
       });
     }
 
@@ -622,15 +584,13 @@ export async function POST(req: Request) {
       return NextResponse.json({ reply: tone.fun(reply) });
     }
 
-    /* ───────── SELL PRICE: exits (fills + weighted avg + per-ticker realized) ───────── */
+    /* ───────── SELL PRICE ───────── */
     if (intent === "sell_price") {
-      const ticker = chooseTickerFromContext(msg, tradesInRange);
+      const ticker = chooseTickerFromContext(msg, tradesInRange, { requireTraded: true });
       if (!ticker) {
         const tradedTickers = Array.from(new Set(tradesInRange.map(t => t.ticker.toUpperCase())));
         if (tradedTickers.length > 1) {
-          return NextResponse.json({
-            reply: tone.fun(`got a few names ${label}: ${tradedTickers.join(", ")}. Which one should I pull exits for?`),
-          });
+          return NextResponse.json({ reply: tone.fun(`got a few names ${label}: ${tradedTickers.join(", ")}. Which exits do you want?`) });
         }
         return NextResponse.json({ reply: tone.fun(`no trades ${label}, so no exits to report.`) });
       }
@@ -644,9 +604,7 @@ export async function POST(req: Request) {
         if (openPos?.open && openPos.ticker.toUpperCase() === ticker) {
           return NextResponse.json({ reply: tone.fun(`haven’t sold ${ticker} yet — still holding.`) });
         }
-        return NextResponse.json({
-          reply: tone.fun(`no sell fills for ${ticker} ${label}. Try “yesterday” or “last 5 days” if it was earlier.`),
-        });
+        return NextResponse.json({ reply: tone.fun(`no sell fills for ${ticker} ${label}. Try “yesterday” or “last 5 days”.`) });
       }
 
       const totalSold = sells.reduce((s, r) => s + r.shares, 0);
@@ -668,35 +626,30 @@ export async function POST(req: Request) {
       return NextResponse.json({ reply: lines.join("\n") });
     }
 
-    /* ───────── ENTRY PRICE: buys (fills + weighted avg; if holding, show live entry) ───────── */
+    /* ───────── ENTRY PRICE ───────── */
     if (intent === "entry_price") {
-      const ticker = chooseTickerFromContext(msg, tradesInRange) || (openPos?.open ? openPos.ticker.toUpperCase() : null);
+      const ticker = chooseTickerFromContext(msg, tradesInRange, { requireTraded: true })
+        || (openPos?.open ? openPos.ticker.toUpperCase() : null);
+
       if (!ticker) {
         const tradedTickers = Array.from(new Set(tradesInRange.map(t => t.ticker.toUpperCase())));
         if (tradedTickers.length > 1) {
-          return NextResponse.json({
-            reply: tone.fun(`I’ve got multiple names ${label}: ${tradedTickers.join(", ")}. Which entry do you want?`),
-          });
+          return NextResponse.json({ reply: tone.fun(`I’ve got multiple names ${label}: ${tradedTickers.join(", ")}. Which entry do you want?`) });
         }
         return NextResponse.json({ reply: tone.fun(`no trades ${label} yet — nothing to enter.`) });
       }
 
-      // Prefer current open position entry if it matches
       if (openPos?.open && openPos.ticker.toUpperCase() === ticker) {
         const et = toETParts(new Date(openPos.entryAt));
         const price = asNumber(openPos.entryPrice).toFixed(2);
-        return NextResponse.json({
-          reply: tone.fun(`current ${ticker} entry: $${price} (${et.ymd} ${et.hms} ET).`),
-        });
+        return NextResponse.json({ reply: tone.fun(`current ${ticker} entry: $${price} (${et.ymd} ${et.hms} ET).`) });
       }
 
       const rowsForTicker = tradesInRange.filter(t => t.ticker.toUpperCase() === ticker);
       const buys = rowsForTicker.filter(t => String(t.side).toUpperCase() === "BUY");
 
       if (!rowsForTicker.length || !buys.length) {
-        return NextResponse.json({
-          reply: tone.fun(`no buy fills for ${ticker} ${label}. If it was earlier, try “yesterday” or “last 5 days”.`),
-        });
+        return NextResponse.json({ reply: tone.fun(`no buy fills for ${ticker} ${label}. If it was earlier, try “yesterday” or “last 5 days”.`) });
       }
 
       const totBought = buys.reduce((s, r) => s + r.shares, 0);
@@ -711,16 +664,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ reply: lines.join("\n") });
     }
 
-    /* ───────── WHY TRADE: friendly + deep explanation ───────── */
+    /* ───────── WHY TRADE ───────── */
     if (intent === "why_trade") {
       const tradedTickers = Array.from(new Set(tradesInRange.map(t => t.ticker.toUpperCase())));
-      let ticker = chooseTickerFromContext(msg, tradesInRange);
+      let ticker = chooseTickerFromContext(msg, tradesInRange, { requireTraded: true });
       if (!ticker) {
         if (tradedTickers.length === 1) ticker = tradedTickers[0];
         else if (tradedTickers.length > 1) {
-          return NextResponse.json({
-            reply: tone.fun(`I’ve got a few names ${label}: ${tradedTickers.join(", ")}. Which one do you want the why for?`),
-          });
+          return NextResponse.json({ reply: tone.fun(`I’ve got a few names ${label}: ${tradedTickers.join(", ")}. Which one do you want the why for?`) });
         } else {
           return NextResponse.json({ reply: tone.fun(`no trades ${label}, so there’s nothing to explain.`) });
         }
@@ -734,97 +685,82 @@ export async function POST(req: Request) {
       const side = String(entryTrade.side).toUpperCase();
       const priceStr = asNumber(entryTrade.price).toFixed(2);
 
-      // 1) optional future Trade.reason
-      let tradeReason: string | null = null as any;
-      try {
-        // const specific = await prisma.trade.findFirst({ where: { id: entryTrade.id }, select: { reason: true } });
-        // tradeReason = (specific?.reason || "").trim() || null;
-      } catch {}
+      // Optional future: Trade.reason column
+      let tradeReason: string | null = null;
+      // try { const row = await prisma.trade.findFirst({ where: { id: entryTrade.id }, select: { reason: true } }) as any; tradeReason = (row?.reason || "").trim() || null; } catch {}
 
-      // 2) saved AI pick explanation
-      const rec = await fetchLatestRecommendationForTickerInWindow(ticker, startUTC, endUTC);
-      let recExp = (rec?.explanation || "").trim() || null;
+      // Saved AI pick explanation (if you store it)
+      const recRows = await prisma.recommendation.findMany({
+        where: {
+          ticker,
+          at: { gte: new Date(startUTC.getTime() - 12 * 60 * 60 * 1000), lte: new Date(endUTC.getTime() + 12 * 60 * 60 * 1000) },
+        },
+        orderBy: { at: "desc" },
+        take: 1,
+      }) as unknown as DbReco[];
+      const recExp = (recRows?.[0]?.explanation || "").trim() || null;
 
-      // 3) deep heuristic at entry time
+      // Deep read from market structure at entry time
       const base = getBaseUrl(req);
       const deep = await buildWhyTradeDeep(base, ticker, new Date(entryTrade.at));
 
       const header =
-        `We ${side === "BUY" ? "entered" : "executed a " + side} ${ticker} ` +
-        `${label} around $${priceStr} (${whenET.ymd} ${whenET.hms} ET).`;
+        `We ${side === "BUY" ? "entered" : "executed a " + side} ${ticker} ${label} around $${priceStr} (${whenET.ymd} ${whenET.hms} ET).`;
 
       const reasonBlock =
-        tradeReason
-          ? `Reason: ${tradeReason}`
-          : recExp
-          ? `Reason (from the AI pick): ${recExp}`
-          : deep
-          ? deep
-          : "I didn’t capture a thesis at the time, but I’ll log one on future entries.";
+        tradeReason ? `Reason: ${tradeReason}` :
+        recExp ? `Reason (from the AI pick): ${recExp}` :
+        deep ?? "I didn’t capture a thesis at the time, but I’ll log one on future entries.";
 
       return NextResponse.json({ reply: `${header}\n${reasonBlock}` });
     }
 
+    /* ───────── WHY PICK (allow non-traded tickers) ───────── */
     if (intent === "why_pick") {
-      const ticker = chooseTickerFromContext(msg, tradesInRange);
+      const ticker = chooseTickerFromContext(msg, tradesInRange, { requireTraded: false });
       if (!ticker) {
-        return NextResponse.json({
-          reply: tone.fun("tell me the ticker (e.g., “Why did the AI pick ABCD today?”) and I’ll pull it up."),
-        });
+        return NextResponse.json({ reply: tone.fun("tell me the ticker (e.g., “Why did the AI pick ABCD today?”) and I’ll pull it up.") });
       }
-      const rec = await fetchLatestRecommendationForTickerInWindow(ticker, startUTC, endUTC);
-      if (rec) {
-        const whenET = toETParts(new Date(rec.at));
-        const price = asNumber(rec.price).toFixed(2);
-        const exp = (rec.explanation || "").trim();
-        if (exp) {
-          return NextResponse.json({
-            reply: tone.fun(
-              `AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET). Reason: ${exp}`
-            ),
-          });
-        }
-        return NextResponse.json({
-          reply: tone.fun(
-            `AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET), but no explanation was saved.`
-          ),
-        });
+      const rec = await prisma.recommendation.findMany({
+        where: { ticker, at: { gte: new Date(startUTC.getTime() - 12 * 60 * 60 * 1000), lte: new Date(endUTC.getTime() + 12 * 60 * 60 * 1000) } },
+        orderBy: { at: "desc" },
+        take: 1,
+      }) as unknown as DbReco[];
+      const row = rec?.[0];
+      if (row) {
+        const whenET = toETParts(new Date(row.at));
+        const price = asNumber(row.price).toFixed(2);
+        const exp = (row.explanation || "").trim();
+        if (exp) return NextResponse.json({ reply: tone.fun(`AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET). Reason: ${exp}`) });
+        return NextResponse.json({ reply: tone.fun(`AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET), but no explanation was saved.`) });
       }
-      return NextResponse.json({
-        reply: tone.fun(
-          `couldn’t find a saved recommendation for ${ticker} ${label}. Make sure the /api/recommendation route stores the explanation.`
-        ),
-      });
+      return NextResponse.json({ reply: tone.fun(`couldn’t find a saved recommendation for ${ticker} ${label}. Make sure /api/recommendation stores the explanation.`) });
     }
 
     // Default status (friendly)
     const realized = realizedFIFO(tradesInRange);
     const traded = summarizeTrades(tradesInRange);
     const parts: string[] = [];
-
     parts.push(openPos?.open ? tone.holding(openPos) : tone.flat());
     if (traded === "No trades in that range.") parts.push(`No trades ${label}.`);
     else parts.push(`Trades ${label}: ${traded}.`);
     if (tradesInRange.length) parts.push(`Realized P&L ${label}: ${money(realized)}.`);
-
     return NextResponse.json({ reply: tone.fun(parts.join(" ")) });
+
   } catch (e: any) {
-    return NextResponse.json(
-      { reply: `Sorry — I couldn’t process that. ${e?.message || "Unknown error."}` },
-      { status: 200 }
-    );
+    return NextResponse.json({ reply: `Sorry — I couldn’t process that. ${e?.message || "Unknown error."}` }, { status: 200 });
   }
 }
 
 /* ──────────────────────────────────────────────────────────
-   GET ?debug=1 – view last trades in ET (uses Trade.at)
+   GET ?debug=1 – view last trades in ET
    ────────────────────────────────────────────────────────── */
 export async function GET(req: Request) {
   const url = new URL(req.url);
   if (url.searchParams.get("debug") !== "1") {
     return NextResponse.json({ reply: "Send a POST with { message }." });
   }
-  const trades = (await prisma.trade.findMany({ orderBy: { id: "desc" }, take: 20 })) as unknown as DbTrade[];
+  const trades = await prisma.trade.findMany({ orderBy: { id: "desc" }, take: 20 }) as unknown as DbTrade[];
   const rows = trades.map((t) => {
     const et = toETParts(new Date(t.at));
     return {
