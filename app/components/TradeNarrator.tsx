@@ -4,11 +4,11 @@
 import { useEffect, useRef, useState } from "react";
 
 type NarrateInput = {
-  symbol: string;
+  symbol: string;     // optional context for your UI; API doesn’t need it
   price?: number;
   float?: number;
   relVol?: number;
-  thesis?: string;
+  thesis?: string;    // sent to API as `note`
 };
 
 type Props = {
@@ -31,12 +31,13 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const speakUtterance = useRef<SpeechSynthesisUtterance | null>(null);
 
-  // ET helpers
+  // ── ET helpers ──────────────────────────────────────────────
   function nowET() {
     return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   }
   function in0930to0945() {
-    const d = nowET(); const m = d.getHours() * 60 + d.getMinutes();
+    const d = nowET();
+    const m = d.getHours() * 60 + d.getMinutes();
     return m >= 9 * 60 + 30 && m < 9 * 60 + 45; // [09:30, 09:45)
   }
   function nextDelayMs() {
@@ -50,7 +51,7 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
     };
   }, []);
 
-  // Auto-run when key changes (your original behavior)
+  // Auto-run when key changes (original behavior)
   useEffect(() => {
     if (autoRunKey == null) return;
     generate(true); // also speak
@@ -100,7 +101,8 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
       const res = await fetch("/api/trade-narrate/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input), // symbol, thesis, etc.
+        // ⬇️ The only functional change: send thesis as `note` (what the API expects)
+        body: JSON.stringify({ note: input.thesis ?? "" }),
       });
       if (!res.ok || !res.body) throw new Error(`API ${res.status}`);
 
@@ -115,9 +117,7 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
         full += chunk;
         setText((prev) => {
           const next = prev + chunk;
-          queueMicrotask(() =>
-            scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
-          );
+          queueMicrotask(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }));
           return next;
         });
       }
@@ -167,11 +167,12 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
     <div className={`rounded-2xl border bg-white shadow-sm p-4 md:p-6 ${className || ""}`}>
       <div className="flex items-center justify-between gap-3">
         <div className="text-sm text-gray-600">
-          <span className="font-semibold text-gray-900">AI Trade Narrator</span> · {input.symbol}
+          <span className="font-semibold text-gray-900">AI Trade Narrator</span>
+          {input?.symbol ? <> · {input.symbol}</> : null}
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setAutoActive(v => !v)}
+            onClick={() => setAutoActive((v) => !v)}
             className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
             title="Auto think-aloud between 09:30–09:45 ET"
           >
@@ -209,7 +210,7 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
         {!text && status === "loading" && (
           <div className="text-gray-600">
             <span className="animate-pulse">
-              AI thinking… scanning float, rel vol, VWAP, premarket levels, and OR.
+              AI thinking… scanning float, relative volume, VWAP, and opening range.
             </span>
           </div>
         )}
@@ -223,7 +224,7 @@ export default function TradeNarrator({ input, autoRunKey, className }: Props) {
       </div>
 
       <div className="mt-3 text-xs text-gray-500">
-        Tip: pass <code>float</code>, <code>relVol</code>, or a short <code>thesis</code> for sharper explanations.
+        Tip: set a short <code>thesis</code> in <code>input</code> (e.g., “favor low float & tight spreads”).
       </div>
     </div>
   );

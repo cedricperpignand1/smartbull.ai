@@ -1,3 +1,4 @@
+// components/Navbar.tsx
 "use client";
 
 import { useRouter } from "next/navigation";
@@ -19,10 +20,29 @@ export default function Navbar() {
   const [narratorOpen, setNarratorOpen] = useState(false);
   const [botTick, setBotTick] = useState<BotTick | null>(null);
 
+  // key used to force TradeNarrator to speak once when we auto-open
+  const [autoKick, setAutoKick] = useState<string | undefined>(undefined);
+
   const popRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
 
-  // Clock
+  /* ── ET helpers ───────────────────────────────────────────── */
+  function nowET() {
+    return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  }
+  function inWindow0930to0945() {
+    const d = nowET();
+    const m = d.getHours() * 60 + d.getMinutes();
+    return m >= 9 * 60 + 30 && m < 9 * 60 + 45; // [09:30, 09:45)
+  }
+  function msUntil(h: number, min: number, s = 0) {
+    const d = nowET();
+    const t = new Date(d);
+    t.setHours(h, min, s, 0);
+    return Math.max(0, t.getTime() - d.getTime());
+  }
+
+  /* ── Clock ────────────────────────────────────────────────── */
   useEffect(() => {
     const tick = () =>
       setTime(
@@ -37,7 +57,41 @@ export default function Navbar() {
     return () => clearInterval(id);
   }, []);
 
-  // Poll bot tick when narrator dropdown is open
+  /* ── AUTO-OPEN / AUTO-CLOSE narrator for 09:30–09:45 ET ───── */
+  useEffect(() => {
+    let openTimer: number | null = null;
+    let closeTimer: number | null = null;
+
+    const armOpenClose = () => {
+      // if already in window → open now
+      if (inWindow0930to0945()) {
+        setNarratorOpen(true);
+        setAutoKick(`auto:${Date.now()}`); // trigger one immediate narration+speech
+      } else {
+        // schedule open exactly at 09:30 ET
+        const msToOpen = msUntil(9, 30, 0);
+        openTimer = window.setTimeout(() => {
+          setNarratorOpen(true);
+          setAutoKick(`auto:${Date.now()}`); // trigger narration on open
+        }, msToOpen);
+      }
+
+      // schedule close at 09:45 ET (remove this if you want it to remain open)
+      const msToClose = msUntil(9, 45, 0);
+      closeTimer = window.setTimeout(() => {
+        setNarratorOpen(false);
+      }, msToClose);
+    };
+
+    armOpenClose();
+
+    return () => {
+      if (openTimer) clearTimeout(openTimer);
+      if (closeTimer) clearTimeout(closeTimer);
+    };
+  }, []);
+
+  /* ── Poll bot tick only when narrator is open ─────────────── */
   useEffect(() => {
     if (!narratorOpen) return;
     let cancelled = false;
@@ -46,7 +100,9 @@ export default function Navbar() {
         const r = await fetch("/api/bot/tick", { cache: "no-store" });
         const j = await r.json();
         if (!cancelled) setBotTick(j);
-      } catch {}
+      } catch {
+        // ignore
+      }
     };
     run();
     const id = setInterval(run, 10_000);
@@ -56,7 +112,7 @@ export default function Navbar() {
     };
   }, [narratorOpen]);
 
-  // Close narrator dropdown on outside click / ESC
+  /* ── Close narrator dropdown on outside click / ESC ───────── */
   useEffect(() => {
     if (!narratorOpen) return;
     const onDocClick = (e: MouseEvent) => {
@@ -74,7 +130,7 @@ export default function Navbar() {
     };
   }, [narratorOpen]);
 
-  // Narrator defaults
+  /* ── Narrator defaults (same as yours) ────────────────────── */
   const narratorSymbol = botTick?.position?.ticker ?? botTick?.lastRec?.ticker ?? "TBD";
   const narratorPrice =
     botTick?.position?.entryPrice ??
@@ -162,10 +218,13 @@ export default function Navbar() {
                 <div className="rounded-2xl border border-zinc-200 bg-white shadow-lg p-3">
                   <TradeNarrator
                     className="w-full"
-                    autoRunKey={autoKey}
+                    // 👇 autoRunKey changes will trigger a narration with speech.
+                    // First, use live pick/position key if present; otherwise use the one-time autoKick set at 09:30.
+                    autoRunKey={autoKey ?? autoKick}
                     input={{
                       symbol: narratorSymbol,
-                      price: typeof narratorPrice === "number" ? narratorPrice : undefined,
+                      price:
+                        typeof narratorPrice === "number" ? narratorPrice : undefined,
                       thesis: narratorThesis,
                     }}
                   />
