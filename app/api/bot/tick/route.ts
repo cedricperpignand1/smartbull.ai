@@ -123,6 +123,14 @@ function isMandatoryExitET() {
   return mins >= (15 * 60 + 50);
 }
 
+/* >>>>>>>>>>>>>>> NEW: constant 0.70% spread window helper <<<<<<<<<<<<<<< */
+function inWindow930to945ET() {
+  const d = nowET();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  // 09:30 (570) through 09:45 (585) inclusive
+  return mins >= 9 * 60 + 30 && mins <= 9 * 60 + 45;
+}
+
 /* -------------------------- buy-the-dip -------------------------- */
 const DIP_MIN_PCT = 0.08;
 const DIP_MAX_PCT = 0.20;
@@ -409,7 +417,15 @@ function passesBalancedLiquidityGuard(lastClose: number, lastVolume: number, flo
   const dollarsOK = dollarVol >= MIN_DOLLAR_VOL;
   return { ok: sharesOK && dollarsOK, minSharesReq, dollarVol };
 }
+
+/* >>>>>>>>>>>>>>> REPLACED: dynamic spread function <<<<<<<<<<<<<<< */
 function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
+  // Hard rule: from 09:30:00 to 09:45:59 ET, always allow up to 0.70%
+  if (inWindow930to945ET()) {
+    return 0.007; // 0.70%
+  }
+
+  // --- Original behavior outside that window ---
   const toPct = (v: number) => Math.max(0.001, Math.min(0.02, v));
   let base =
     phase === "force"
@@ -420,8 +436,10 @@ function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" |
           if (mins <= 9 * 60 + 39) return 0.006;
           return 0.005;
         })();
+
   const p = Number(price);
   if (Number.isFinite(p)) {
+    // Keeping these caps as they were (they don't tighten current bases)
     if (p < 2) base = Math.min(base, 0.012);
     else if (p < 5) base = Math.min(base, 0.008);
   }
