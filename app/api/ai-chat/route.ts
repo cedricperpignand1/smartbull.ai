@@ -5,6 +5,7 @@ export const revalidate = 0;
 
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { spreadGuardOK } from "@/lib/alpaca";
 
 /* ──────────────────────────────────────────────────────────
    US/Eastern helpers (no ICU required)
@@ -60,7 +61,7 @@ type DbTrade = {
   at: Date;
   filledAt?: Date | null;
   filledPrice?: any | null;
-  // reason?: string | null; // <— add later if you want to save per-trade notes
+  // reason?: string | null; // <— optional in the future
 };
 type DbPos = {
   id: number;
@@ -90,6 +91,10 @@ function asNumber(x: any): number {
   if (typeof x === "string") return Number(x);
   if (typeof x === "object" && "toNumber" in x) return (x as any).toNumber();
   return Number(x);
+}
+function pct(a: number, b: number) {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null;
+  return (a - b) / b;
 }
 function realizedFIFO(tradesAsc: DbTrade[]): number {
   const lots: Lot[] = [];
@@ -128,26 +133,14 @@ const tone = {
 /* ──────────────────────────────────────────────────────────
    Intent + NLU
    ────────────────────────────────────────────────────────── */
-type Intent =
-  | "what_traded"
-  | "pnl"
-  | "in_position"
-  | "why_trade"
-  | "why_pick"
-  | "status"
-  | "help";
-
+type Intent = "what_traded" | "pnl" | "in_position" | "why_trade" | "why_pick" | "status" | "help";
 function extractTicker(msg: string): string | null {
   const m = msg.toUpperCase().match(/\b([A-Z]{1,5})(?:\.[A-Z]{1,2})?\b/);
   return m?.[1] || null;
 }
-
 function parseIntent(q: string): Intent {
   const m = q.toLowerCase();
-
-  // broadened "why" detection: handles "why you traded veee", "why buy veee", etc.
   if (/(why).*(trade|traded|buy|bought|sell|sold|enter|entry|took|take|long|short)/.test(m)) return "why_trade";
-
   if (/(what|which).*(trade|trades|traded|tickers?)/.test(m)) return "what_traded";
   if (/((did|do).*(make|made|lose).*(money|profit|p&?l)|p&?l|green|red)/.test(m)) return "pnl";
   if (/(are|am|you).*(in|holding).*(position)|open position/.test(m)) return "in_position";
@@ -256,7 +249,7 @@ async function fetchLatestRecommendationForTickerInWindow(
 }
 
 /* ──────────────────────────────────────────────────────────
-   Internal API helpers (for fallback “why”)
+   Internal API + market helpers (for rich “why”)
    ────────────────────────────────────────────────────────── */
 function getBaseUrl(req: Request) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
@@ -267,8 +260,9 @@ function getBaseUrl(req: Request) {
 }
 
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
+type QuoteLite = { price?: number | null; avgVolume?: number | null; marketCap?: number | null };
 
-async function fetchCandles1m(base: string, symbol: string, limit = 240): Promise<Candle[]> {
+async function fetchCandles1m(base: string, symbol: string, limit = 300): Promise<Candle[]> {
   try {
     const res = await fetch(
       `${base}/api/fmp/candles?symbol=${encodeURIComponent(symbol)}&interval=1min&limit=${limit}`,
@@ -290,21 +284,59 @@ async function fetchCandles1m(base: string, symbol: string, limit = 240): Promis
   }
 }
 
+async function fetchQuoteLite(base: string, symbol: string): Promise<QuoteLite> {
+  try {
+    const res = await fetch(`${base}/api/fmp/quote?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    const j = await res.json();
+    const row = (Array.isArray(j) ? j[0] : j) || {};
+    return {
+      price: Number(row.price),
+      avgVolume: Number(row.avgVolume || row.avgVolume10Day || row.averageVolume),
+      marketCap: Number(row.marketCap),
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function fetchFloatShares(base: string, symbol: string): Promise<number | null> {
+  try {
+    const r = await fetch(`${base}/api/fmp/float?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    if (r.ok) {
+      const j = await r.json();
+      const f = Number(j?.float ?? j?.floatShares ?? j?.freeFloat);
+      if (Number.isFinite(f) && f > 0) return f;
+    }
+  } catch {}
+  try {
+    const r2 = await fetch(`${base}/api/fmp/profile?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    if (r2.ok) {
+      const j2 = await r2.json();
+      const arr = Array.isArray(j2) ? j2 : Array.isArray(j2?.profile) ? j2.profile : [];
+      const row = arr[0] || j2 || {};
+      const f = Number(row.floatShares ?? row.sharesFloat ?? row.freeFloat);
+      if (Number.isFinite(f) && f > 0) return f;
+      const so = Number(row.sharesOutstanding ?? row.mktCapShares);
+      if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
+    }
+  } catch {}
+  return null;
+}
+
 function toET(dateIso: string) {
   return new Date(new Date(dateIso).toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
-
 function isSameETDay(d: Date, ymd: string) {
   const mo = String(d.getMonth() + 1).padStart(2, "0");
   const da = String(d.getDate()).padStart(2, "0");
   return `${d.getFullYear()}-${mo}-${da}` === ymd;
 }
-
 function yyyyMmDdETFromUTC(utc: Date) {
   const parts = toETParts(utc);
   return parts.ymd;
 }
 
+/* Opening range 9:30–9:33 ET */
 function computeOpeningRange(candles: Candle[], ymd: string) {
   const win = candles.filter((c) => {
     const d = toET(c.date);
@@ -316,12 +348,13 @@ function computeOpeningRange(candles: Candle[], ymd: string) {
   return { high, low };
 }
 
-function computeSessionVWAPUpTo(candles: Candle[], ymd: string, cutoffET: Date) {
+/* VWAP from 9:30 up to cutoff */
+function computeVWAPUpTo(candles: Candle[], ymd: string, cutoffET: Date) {
   const session = candles.filter((c) => {
     const d = toET(c.date);
     const mins = d.getHours() * 60 + d.getMinutes();
-    const cutoff = cutoffET.getHours() * 60 + cutoffET.getMinutes();
-    return isSameETDay(d, ymd) && mins >= 9 * 60 + 30 && mins <= cutoff;
+    const cut = cutoffET.getHours() * 60 + cutoffET.getMinutes();
+    return isSameETDay(d, ymd) && mins >= 9 * 60 + 30 && mins <= cut;
   });
   if (!session.length) return null;
   let pv = 0, vol = 0;
@@ -333,50 +366,156 @@ function computeSessionVWAPUpTo(candles: Candle[], ymd: string, cutoffET: Date) 
   return vol > 0 ? pv / vol : null;
 }
 
-function computeVolumePulseLastN(candles: Candle[], ymd: string, N = 5, cutoffET?: Date) {
-  const day = candles.filter((c) => isSameETDay(toET(c.date), ymd));
-  if (!day.length) return null;
-  let upTo = day;
-  if (cutoffET) {
-    const cutoff = cutoffET.getTime();
-    upTo = day.filter((c) => toET(c.date).getTime() <= cutoff);
-  }
-  if (upTo.length < N + 1) return null;
-  const last = upTo[upTo.length - 1];
-  const prior = upTo.slice(-1 - N, -1);
+/* 5-min relative volume at cutoff */
+function computeRelVol5(candles: Candle[], ymd: string, cutoffET: Date, N = 5) {
+  const day = candles.filter((c) => isSameETDay(toET(c.date), ymd) && toET(c.date).getTime() <= cutoffET.getTime());
+  if (day.length < N + 1) return null;
+  const last = day[day.length - 1];
+  const prior = day.slice(-1 - N, -1);
   const avgPrior = prior.reduce((s, c) => s + c.volume, 0) / N;
-  if (!avgPrior) return { mult: null as number | null };
-  return { mult: last.volume / avgPrior };
+  if (!avgPrior) return null;
+  return last.volume / avgPrior;
 }
 
-/* Builds a plain-English “why we traded” using candles around entry time */
-async function buildWhyTradeHeuristic(
+/* VWAP slope (compare current vwap vs vwap 3 minutes earlier) */
+function computeVWAPSlope(candles: Candle[], ymd: string, cutoffET: Date, backMinutes = 3) {
+  const cutMs = cutoffET.getTime();
+  const backCut = new Date(cutoffET.getTime() - backMinutes * 60_000);
+  const v1 = computeVWAPUpTo(candles, ymd, cutoffET);
+  const v0 = computeVWAPUpTo(candles, ymd, backCut);
+  if (v1 == null || v0 == null) return null;
+  return v1 - v0; // positive = up slope
+}
+
+/* Trend check (last 3 closes making higher highs/lows) */
+function last3Trend(candles: Candle[], ymd: string, cutoffET: Date) {
+  const day = candles.filter((c) => isSameETDay(toET(c.date), ymd) && toET(c.date).getTime() <= cutoffET.getTime());
+  const w = day.slice(-3);
+  if (w.length < 3) return null;
+  const higherCloses = w[2].close > w[1].close && w[1].close > w[0].close;
+  const higherLows = w[2].low >= w[1].low && w[1].low >= w[0].low;
+  return { higherCloses, higherLows };
+}
+
+/* “Why we traded” — rich explanation built around the entry candle */
+async function buildWhyTradeDeep(
   base: string,
   symbol: string,
   entryUTC: Date
 ): Promise<string | null> {
   const ymd = yyyyMmDdETFromUTC(entryUTC);
-  const candles = await fetchCandles1m(base, symbol, 300);
+  const candles = await fetchCandles1m(base, symbol, 360);
   if (!candles.length) return null;
 
-  // find the candle at/just before entry time (ET)
   const entryET = new Date(new Date(entryUTC).toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const upTo = candles
-    .filter((c) => toET(c.date).getTime() <= entryET.getTime() && isSameETDay(toET(c.date), ymd));
+  const upTo = candles.filter((c) => isSameETDay(toET(c.date), ymd) && toET(c.date).getTime() <= entryET.getTime());
   if (!upTo.length) return null;
   const last = upTo[upTo.length - 1];
 
+  const quote = await fetchQuoteLite(base, symbol);
+  const float = await fetchFloatShares(base, symbol).catch(() => null);
+
   const or = computeOpeningRange(candles, ymd);
-  const vwap = computeSessionVWAPUpTo(candles, ymd, entryET);
-  const vol = computeVolumePulseLastN(candles, ymd, 5, entryET);
+  const vwap = computeVWAPUpTo(candles, ymd, entryET);
+  const vwapSlope = computeVWAPSlope(candles, ymd, entryET, 3);
+  const rvol5 = computeRelVol5(candles, ymd, entryET, 5);
+  const trend = last3Trend(candles, ymd, entryET);
+
+  const nearOrBreak =
+    or ? (last.close > or.high ? "breaking OR high" : (last.close >= or.high * 0.995 ? "testing OR high" : "")) : "";
+
+  // Spread check (best-effort)
+  let spreadNote = "";
+  try {
+    const tight = await spreadGuardOK(symbol, 0.005); // 0.5% guard
+    spreadNote = tight ? "spread looked tight" : "spread was a bit wide";
+  } catch {
+    spreadNote = "spread check unavailable";
+  }
+
+  // Risk anchors
+  const stopAnchor =
+    vwap != null && last.low >= vwap * 0.995
+      ? { kind: "VWAP hold", level: vwap }
+      : or
+      ? { kind: "OR low", level: or.low }
+      : null;
+
+  const dayHighSoFar = Math.max(...upTo.map((c) => c.high));
+  const target = Math.max(dayHighSoFar, or?.high ?? -Infinity);
 
   const bits: string[] = [];
-  if (vwap != null && last.close >= vwap) bits.push("price was riding above VWAP");
-  if (or && last.close >= or.high * 0.995) bits.push("pressing the opening-range high");
-  if (vol?.mult != null) bits.push(`volume was ${vol.mult.toFixed(2)}× the prior 5-min avg`);
-  if (!bits.length) return null;
 
-  return `We took it as ${bits.join(", ")}.`;
+  // Structure & momentum
+  if (vwap != null) {
+    const dist = pct(last.close, vwap);
+    const slopeStr = vwapSlope == null ? "" : vwapSlope > 0 ? "up-sloping" : vwapSlope < 0 ? "down-sloping" : "flat";
+    bits.push(
+      `price was ${dist != null ? `${(dist * 100).toFixed(2)}%` : ""} above VWAP (${slopeStr})`
+    );
+  }
+  if (nearOrBreak) bits.push(nearOrBreak);
+  if (trend?.higherCloses || trend?.higherLows) {
+    const tbits: string[] = [];
+    if (trend.higherCloses) tbits.push("higher closes");
+    if (trend.higherLows) tbits.push("rising lows");
+    bits.push(`intraday trend showed ${tbits.join(" & ")}`);
+  }
+
+  // Volume
+  if (rvol5 != null) {
+    const rStr =
+      rvol5 >= 1.2 ? `${rvol5.toFixed(2)}× (elevated)` :
+      rvol5 >= 0.9 ? `${rvol5.toFixed(2)}× (normal-ish)` :
+      `${rvol5.toFixed(2)}× (light)`;
+    bits.push(`5-min relative volume ${rStr}`);
+  }
+
+  // Liquidity / float
+  const liq: string[] = [];
+  if (Number.isFinite(Number(float)) && (float as number) > 0) {
+    const f = float as number;
+    if (f < 20_000_000) liq.push("low float — can move fast");
+    else if (f < 60_000_000) liq.push("moderate float");
+  }
+  if (Number.isFinite(Number(quote.avgVolume)) && quote.avgVolume! > 0) {
+    liq.push(`avg volume ~${Math.round(quote.avgVolume!).toLocaleString()}`);
+  }
+  if (Number.isFinite(Number(quote.marketCap)) && quote.marketCap! > 0) {
+    const mc = quote.marketCap!;
+    const mcStr = mc < 300e6 ? "small-cap" : mc < 2e9 ? "mid-cap" : "large-cap";
+    liq.push(mcStr);
+  }
+  if (liq.length) bits.push(liq.join(", "));
+
+  // Spread note (optional)
+  if (spreadNote) bits.push(spreadNote);
+
+  // Build narrative
+  const lines: string[] = [];
+  lines.push(
+    `Setup read: ${bits.length ? bits.join("; ") : "no strong signals captured at entry time"}`
+  );
+
+  // Risk/target framing
+  if (stopAnchor && Number.isFinite(stopAnchor.level)) {
+    const riskPS = Math.max(0, last.close - stopAnchor.level);
+    const rr =
+      Number.isFinite(target) && target > last.close && riskPS > 0
+        ? (target - last.close) / riskPS
+        : null;
+    lines.push(
+      `Risk frame: stop ~${stopAnchor.kind} ($${stopAnchor.level.toFixed(2)}), ` +
+      `risk/Share ≈ $${riskPS.toFixed(2)}${rr != null ? `, R:R ≈ ${rr.toFixed(2)}x to ${target === dayHighSoFar ? "day high" : "OR high"}` : ""}.`
+    );
+  }
+
+  // If volume was light, acknowledge it explicitly
+  if (rvol5 != null && rvol5 < 0.9) {
+    lines.push(`Note: volume was lighter than average at entry; we kept expectations modest and respected the stop.`);
+  }
+
+  return lines.join("\n");
 }
 
 /* ──────────────────────────────────────────────────────────
@@ -448,7 +587,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ reply });
     }
 
-    /* ───────── why_trade: friendly + explanation fallback ───────── */
+    /* ───────── why_trade: friendly + deep explanation ───────── */
     if (intent === "why_trade") {
       const tradedTickers = Array.from(new Set(tradesInRange.map(t => t.ticker.toUpperCase())));
       let ticker = extractTicker(msg);
@@ -471,43 +610,42 @@ export async function POST(req: Request) {
       const relevant = tradesInRange.filter(t => t.ticker.toUpperCase() === ticker!.toUpperCase());
       if (!relevant.length) return NextResponse.json({ reply: tone.open(`didn’t see ${ticker!.toUpperCase()} ${label}.`) });
 
-      const first = relevant[0];
-      const whenET = toETParts(new Date(first.at));
-      const side = String(first.side).toUpperCase();
-      const priceStr = asNumber(first.price).toFixed(2);
+      // Prefer first BUY as the entry, else fallback to first trade
+      const entryTrade = relevant.find(t => String(t.side).toUpperCase() === "BUY") || relevant[0];
+      const whenET = toETParts(new Date(entryTrade.at));
+      const side = String(entryTrade.side).toUpperCase();
+      const priceStr = asNumber(entryTrade.price).toFixed(2);
 
-      // 1) Prefer per-trade reason if you add it in the future
+      // 1) If you later add Trade.reason, we’ll show it
       let tradeReason: string | null = null as any;
       try {
         // Uncomment after adding `reason String?` to Trade model:
-        // const specific = await prisma.trade.findFirst({ where: { id: first.id }, select: { reason: true } });
+        // const specific = await prisma.trade.findFirst({ where: { id: entryTrade.id }, select: { reason: true } });
         // tradeReason = (specific?.reason || "").trim() || null;
       } catch {}
 
-      // 2) Use saved AI pick explanation if present
+      // 2) Saved AI pick explanation (from your recommendation route)
       const rec = await fetchLatestRecommendationForTickerInWindow(ticker!, startUTC, endUTC);
       let recExp = (rec?.explanation || "").trim() || null;
 
-      // 3) Fallback heuristic from candles around entry time
+      // 3) Deep heuristic (candles, vwap/OR, trend, rel vol, float/liquidity, risk/target)
       const base = getBaseUrl(req);
-      let heuristic = await buildWhyTradeHeuristic(base, ticker!, new Date(first.at));
+      const deep = await buildWhyTradeDeep(base, ticker!, new Date(entryTrade.at));
 
       const header =
         `We ${side === "BUY" ? "entered" : "executed a " + side} ${ticker!.toUpperCase()} ` +
         `${label} around $${priceStr} (${whenET.ymd} ${whenET.hms} ET).`;
 
-      const reason =
-        tradeReason ||
-        (recExp ? `Reason: ${recExp}` : heuristic);
+      const reasonBlock =
+        tradeReason
+          ? `Reason: ${tradeReason}`
+          : recExp
+          ? `Reason (from the AI pick): ${recExp}`
+          : deep
+          ? deep
+          : "I didn’t capture a thesis at the time, but I’ll log one on future entries.";
 
-      if (reason) {
-        return NextResponse.json({ reply: `${header}\n${reason}` });
-      }
-      return NextResponse.json({
-        reply:
-          `${header}\nI didn’t find a saved thesis. If you want bullet-proof reasons on every fill, add a nullable ` +
-          `'reason' field to Trade and save a short note on entry — I’ll surface it here automatically.`,
-      });
+      return NextResponse.json({ reply: `${header}\n${reasonBlock}` });
     }
 
     if (intent === "why_pick") {
