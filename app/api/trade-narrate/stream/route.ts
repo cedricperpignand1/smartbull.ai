@@ -76,6 +76,35 @@ const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const td = new TextEncoder();
 
+/* ───────────────────── Casual persona helpers ───────────────────── */
+const persona = {
+  emojis: ["🚀", "🔥", "📈", "🧃", "☕️", "🤝", "🧠", "💪", "🦅", "🎯"],
+  greetings: [
+    "good morninggg ☕️",
+    "gm gm! coffee’s warm, tape’s hot 🔥",
+    "morning, team — let’s dance with the market 💃🕺",
+  ],
+  quips: [
+    "If spreads widen, we don’t chase — we sip coffee and smirk. ☕️",
+    "Volume talks. We listen. Then we act. 🎧",
+    "Above VWAP? Buyers said ‘dibs’.",
+    "Opening range highs are just doors waiting to be kicked in. 🚪💥",
+    "Liquidity check: no kiddie pool today. We want the lap lane. 🏊",
+    "Tape says ‘maybe’. I say ‘prove it’.",
+  ],
+  forceNotes: [
+    "Force window = seatbelts on, risk guards first. 🛡️",
+    "If still flat into :45, I’ll lean on the AI like it owes me lunch. 🥪",
+  ],
+};
+const pick = <T,>(arr: T[]) => arr[Math.floor(Math.random() * arr.length)];
+let riffCounter = 0;
+function riff() {
+  riffCounter++;
+  if (riffCounter % 2 === 0) return ` ${pick(persona.quips)}\n`;
+  return "\n";
+}
+
 function getBaseUrl(req: Request) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
   if (envBase) return envBase.replace(/\/+$/, "");
@@ -364,18 +393,24 @@ export async function POST(req: NextRequest) {
       start: async (controller) => {
         try {
           const t = hhmmssET();
-          const greet = inScanWindowET() ? "good morninggg" : "hello";
-          await say(controller, `(${t} ET) ${greet} — let's trade smart.\n`);
+          const greet = inScanWindowET() ? pick(persona.greetings) : "hello";
+          await say(
+            controller,
+            `(${t} ET) ${greet} — let’s trade smart and have a little fun ${pick(persona.emojis)}\n`
+          );
 
           // If we are before 9:30, set context and exit quickly.
           if (!inScanWindowET() && !inForceWindowET()) {
-            await say(controller, `I’ll start live commentary between 09:30–09:45 ET. Check back at the open.\n`);
+            await say(
+              controller,
+              `Live commentary kicks in 09:30–09:45 ET. I’ll save the jokes till the bell rings. 🛎️\n`
+            );
             controller.close();
             return;
           }
 
           if (note && typeof note === "string") {
-            await say(controller, `Note received: “${note.trim()}”. I’ll consider it if it aligns with a clean setup.\n`);
+            await say(controller, `Note received: “${note.trim()}”. If it fits the setup, I’m in. 🤝\n`);
           }
 
           // SCAN LOOP: talk continuously until 09:45
@@ -388,13 +423,13 @@ export async function POST(req: NextRequest) {
             const snap = await getSnapshot(base);
             const top = (snap?.stocks || []).slice(0, 8);
             if (!top.length) {
-              await say(controller, `Waiting for the top gainers list to populate...\n`, TICK_MS);
+              await say(controller, `Waiting for the top gainers list to populate… ${pick(persona.emojis)}\n`, TICK_MS);
               continue;
             }
 
             if (!announcedTopOnce) {
               const names = top.map((s) => s.ticker).join(", ");
-              await say(controller, `Scanning top 8 gainers: ${names}.\n`);
+              await say(controller, `Scanning top 8 gainers: ${names}. ${pick(persona.emojis)}${riff()}`);
               announcedTopOnce = true;
             }
 
@@ -414,21 +449,21 @@ export async function POST(req: NextRequest) {
             } catch {}
 
             if (!picks.length) {
-              await say(controller, `AI hasn’t locked two names yet. Keeping an eye on the tape...\n`, TICK_MS);
+              await say(controller, `AI hasn’t locked two names yet. Keeping an eye on the tape… ${pick(persona.emojis)}\n`, TICK_MS);
               continue;
             }
 
             if (picks.length === 1) {
-              await say(controller, `AI primary pick: ${picks[0]}. Secondary is still loading...\n`);
+              await say(controller, `AI primary pick: ${picks[0]}. Secondary is still loading… 🧠\n`);
             } else {
-              await say(controller, `AI short-list: ${picks[0]} (primary) and ${picks[1]} (secondary).\n`);
+              await say(controller, `AI short-list: ${picks[0]} (primary) and ${picks[1]} (secondary). Nice. ${pick(persona.emojis)}\n`);
             }
 
             // Explain the “why” for each pick in plain English
             for (const sym of picks) {
               const read = await readSignalsForNarration(base, sym);
               if (!read.ok) {
-                await say(controller, `• ${sym}: no fresh intraday bars yet; skipping analysis for now.\n`);
+                await say(controller, `• ${sym}: no fresh intraday bars yet; skipping analysis for now. 🧃\n`);
                 continue;
               }
 
@@ -436,7 +471,11 @@ export async function POST(req: NextRequest) {
               parts.push(`• ${sym}: $${read.price.toFixed(2)} — `);
 
               // Quick checklist
-              parts.push(`price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "too wide"}${read.spreadNote || ""}`);
+              parts.push(
+                `price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "too wide"}${
+                  read.spreadNote || ""
+                }`
+              );
 
               const liqStr = `liq ${read.liq.ok ? "OK" : "light"} (need ≥ ${read.liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min)`;
               parts.push(`, ${liqStr}.`);
@@ -453,23 +492,24 @@ export async function POST(req: NextRequest) {
               if (read.nearOR) sigs.push(`near OR (${(read.NEAR_OR_PCT * 100).toFixed(2)}% band)`);
               if (read.vwapRecl) sigs.push(`VWAP reclaim (${(read.VWAP_RECLAIM_BAND * 100).toFixed(2)}% hold)`);
               if (read.volMult != null) sigs.push(`vol pulse ${read.volMult.toFixed(2)}× (need ≥ ${read.VOL_MULT_MIN.toFixed(2)}×)`);
-
               if (sigs.length) parts.push(` Signals: ${sigs.join(", ")}.`);
 
               // Decision phrasing
               if (read.priceOK && read.spreadOK && read.liq.ok && read.armedMomentum) {
-                parts.push(` Read: **momentum armed** (above VWAP + ${read.signalCount} confirms). This is tradable if it’s the chosen one.`);
+                parts.push(
+                  ` Read: **momentum armed** (above VWAP + ${read.signalCount} confirms). If we pick it, I’m comfortable hitting the button. 🚀`
+                );
               } else {
                 const needs: string[] = [];
                 if (!read.priceOK) needs.push("price in band");
                 if (!read.spreadOK) needs.push("tighter spread");
                 if (!read.liq.ok) needs.push("more liquidity");
                 if (!(read.aboveVWAP && read.signalCount >= 2)) needs.push("above VWAP + ≥2 signals");
-                if (needs.length) parts.push(` Needs: ${needs.join(", ")}.`);
+                if (needs.length) parts.push(` Needs: ${needs.join(", ")}. No FOMO — we let the setup come to us. 😎`);
               }
 
               await say(controller, parts.join(""), 0);
-              await say(controller, `\n`);
+              await say(controller, ` ${pick(persona.emojis)}${riff()}`);
             }
 
             // Soft pacing between updates
@@ -480,11 +520,13 @@ export async function POST(req: NextRequest) {
           if (inForceWindowET()) {
             await say(
               controller,
-              `(${hhmmssET()} ET) Force window. If still flat, I’ll lean on the AI pick with safety checks only (price band & spread). No liquidity rule here.\n`
+              `(${hhmmssET()} ET) Force window. If we’re still flat, I’ll lean on the AI with safety checks only (price band & spread). ${pick(
+                persona.forceNotes
+              )}\n`
             );
           }
 
-          await say(controller, `(${hhmmssET()} ET) Early window commentary complete.\n`);
+          await say(controller, `(${hhmmssET()} ET) Early window done. Trade clean, drink water, respect stops. 💧🎯\n`);
           controller.close();
         } catch {
           controller.enqueue(td.encode("Narration error.\n"));
