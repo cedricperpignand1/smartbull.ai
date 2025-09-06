@@ -57,7 +57,7 @@ function Panel({
   }[color];
 
   return (
-    <div className="h-full flex flex-col bg-white rounded-2xl border border-gray-200 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
+    <div className="min-h-0 flex flex-col bg-white rounded-2xl border border-gray-200 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
       <div className="px-4 py-2.5 flex items-center justify-between border-b border-gray-200 bg-white">
         <span className={`inline-flex items-center px-3 py-1 rounded-md text-xs font-semibold text-white ${chip}`}>
           {title}
@@ -97,14 +97,15 @@ function GlassPanel({
   }[color];
 
   return (
-    <div className="h-full flex flex-col rounded-3xl overflow-hidden bg-white/28 backdrop-blur-xl ring-1 ring-white/40 shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
+    <div className="min-h-0 flex flex-col rounded-3xl overflow-hidden bg-white/28 backdrop-blur-xl ring-1 ring-white/40 shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
       <div className="px-4 py-3 flex items-center justify-between">
         <span className={`inline-flex items-center px-3 py-1 rounded-lg text-[11px] font-semibold text-white bg-gradient-to-br ${chip}`}>
           {title}
         </span>
         {right}
       </div>
-      <div className={`flex-1 overflow-auto ${dense ? "p-3" : "px-4 pb-5 pt-2"}`}>{children}</div>
+      {/* avoid double scroll: let children (ChatBox) handle its own scroll */}
+      <div className={`flex-1 overflow-hidden ${dense ? "p-3" : "px-4 pb-5 pt-2"}`}>{children}</div>
     </div>
   );
 }
@@ -274,11 +275,12 @@ function ChatBox() {
   }
 
   return (
-    <div className="h-full flex flex-col">
+    // ⬇️ Constrain the chat to the viewport and enable scrolling
+    <div className="flex flex-col min-h-0 max-h-[70vh]">
       <div
         ref={scrollRef}
         className="
-          flex-1 overflow-auto rounded-3xl p-4 md:p-5 space-y-3
+          flex-1 min-h-0 overflow-y-auto rounded-3xl p-4 md:p-5 space-y-3
           bg-white/45 backdrop-blur-2xl ring-1 ring-white/50
           shadow-[0_20px_60px_rgba(0,0,0,0.20)]
         "
@@ -736,23 +738,23 @@ export default function Home() {
     >
       <Navbar />
 
-      <div className="flex-1 px-4 pt-20 pb-6">
+      <div className="flex-1 px-4 pt-20 pb-6 min-h-0">
         {/* Floating narrator ABOVE everything, with generous space below */}
         <div className="mb-10 md:mb-14">
           <FloatingNarrator />
         </div>
 
         {/* === TOP-LEVEL GRID: 3 columns, no row spanning === */}
-        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1">
+        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1 min-h-0">
           {/* LEFT: AI Chat */}
-          <div>
+          <div className="min-h-0">
             <GlassPanel title="AI Chat" color="cyan" dense>
               <ChatBox />
             </GlassPanel>
           </div>
 
           {/* MIDDLE: Top Gainers */}
-          <div>
+          <div className="min-h-0">
             <TopGainers
               loading={loading}
               errorMessage={errorMessage}
@@ -765,9 +767,9 @@ export default function Home() {
           </div>
 
           {/* RIGHT: NESTED GRID => Chart on top, AI Rec + Bot Status directly under it */}
-          <div className="grid gap-5">
+          <div className="grid gap-5 min-h-0">
             {/* Chart */}
-            <div className="relative">
+            <div className="relative min-h-0">
               <TradeChartPanel height={720} />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
@@ -775,7 +777,7 @@ export default function Home() {
             </div>
 
             {/* Bottom pair (NO GAP issue anymore) */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch min-h-0">
               <AIRecommendation
                 botData={botData}
                 alpaca={alpaca}
