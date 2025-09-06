@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useLayoutEffect } from "react";
 import dynamic from "next/dynamic";
 import { useSession } from "next-auth/react";
 import Navbar from "../components/Navbar";
@@ -57,7 +57,7 @@ function Panel({
   }[color];
 
   return (
-    <div className="min-h-0 flex flex-col bg-white rounded-2xl border border-gray-200 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
+    <div className="h-full flex flex-col bg-white rounded-2xl border border-gray-200 shadow-[0_8px_24px_rgba(0,0,0,0.06)] overflow-hidden">
       <div className="px-4 py-2.5 flex items-center justify-between border-b border-gray-200 bg-white">
         <span className={`inline-flex items-center px-3 py-1 rounded-md text-xs font-semibold text-white ${chip}`}>
           {title}
@@ -97,15 +97,14 @@ function GlassPanel({
   }[color];
 
   return (
-    <div className="min-h-0 flex flex-col rounded-3xl overflow-hidden bg-white/28 backdrop-blur-xl ring-1 ring-white/40 shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
+    <div className="h-full flex flex-col rounded-3xl overflow-hidden bg-white/28 backdrop-blur-xl ring-1 ring-white/40 shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
       <div className="px-4 py-3 flex items-center justify-between">
         <span className={`inline-flex items-center px-3 py-1 rounded-lg text-[11px] font-semibold text-white bg-gradient-to-br ${chip}`}>
           {title}
         </span>
         {right}
       </div>
-      {/* avoid double scroll: let children (ChatBox) handle its own scroll */}
-      <div className={`flex-1 overflow-hidden ${dense ? "p-3" : "px-4 pb-5 pt-2"}`}>{children}</div>
+      <div className={`flex-1 overflow-auto ${dense ? "p-3" : "px-4 pb-5 pt-2"}`}>{children}</div>
     </div>
   );
 }
@@ -226,7 +225,7 @@ function FloatingNarrator() {
       {/* Large, readable captions */}
       <div
         className="
-          max-w-[min(82vw,1100px)]
+          max-w=[min(82vw,1100px)]
           text-white text-[18px] md:text-[20px] leading-7 font-semibold
           bg-black/35 rounded-xl px-4 py-1.5
           backdrop-blur-sm select-none
@@ -245,7 +244,21 @@ function ChatBox() {
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // NEW: lock the chat box height to its initial rendered height
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [lockedHeight, setLockedHeight] = useState<number | null>(null);
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // measure once, right after mount, to keep the original size
+  useLayoutEffect(() => {
+    if (wrapRef.current && lockedHeight == null) {
+      const h = wrapRef.current.offsetHeight;
+      if (h > 0) setLockedHeight(h);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -275,8 +288,11 @@ function ChatBox() {
   }
 
   return (
-    // ⬇️ Constrain the chat to the viewport and enable scrolling
-    <div className="flex flex-col min-h-0 max-h-[70vh]">
+    <div
+      ref={wrapRef}
+      className="flex flex-col"
+      style={lockedHeight != null ? { height: lockedHeight } : undefined}
+    >
       <div
         ref={scrollRef}
         className="
@@ -738,23 +754,23 @@ export default function Home() {
     >
       <Navbar />
 
-      <div className="flex-1 px-4 pt-20 pb-6 min-h-0">
+      <div className="flex-1 px-4 pt-20 pb-6">
         {/* Floating narrator ABOVE everything, with generous space below */}
         <div className="mb-10 md:mb-14">
           <FloatingNarrator />
         </div>
 
         {/* === TOP-LEVEL GRID: 3 columns, no row spanning === */}
-        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1 min-h-0">
+        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1">
           {/* LEFT: AI Chat */}
-          <div className="min-h-0">
+          <div>
             <GlassPanel title="AI Chat" color="cyan" dense>
               <ChatBox />
             </GlassPanel>
           </div>
 
           {/* MIDDLE: Top Gainers */}
-          <div className="min-h-0">
+          <div>
             <TopGainers
               loading={loading}
               errorMessage={errorMessage}
@@ -767,9 +783,9 @@ export default function Home() {
           </div>
 
           {/* RIGHT: NESTED GRID => Chart on top, AI Rec + Bot Status directly under it */}
-          <div className="grid gap-5 min-h-0">
+          <div className="grid gap-5">
             {/* Chart */}
-            <div className="relative min-h-0">
+            <div className="relative">
               <TradeChartPanel height={720} />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
@@ -777,7 +793,7 @@ export default function Home() {
             </div>
 
             {/* Bottom pair (NO GAP issue anymore) */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch min-h-0">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch">
               <AIRecommendation
                 botData={botData}
                 alpaca={alpaca}
