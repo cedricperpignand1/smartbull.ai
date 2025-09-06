@@ -14,14 +14,14 @@ const TradeChartPanel = dynamic<{ height?: number; symbolWhenFlat?: string }>(
 );
 
 /* =========================================================
-   Simple ET time + market open checker
+   ET helpers
    ========================================================= */
 function nowET(): Date {
   return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
 function isMarketOpenET(d = nowET()): boolean {
-  const day = d.getDay(); // 0=Sun, 6=Sat
-  if (day === 0 || day === 6) return false; // weekends
+  const day = d.getDay();
+  if (day === 0 || day === 6) return false;
   const h = d.getHours();
   const m = d.getMinutes();
   const afterOpen = h > 9 || (h === 9 && m >= 30);
@@ -105,6 +105,134 @@ function GlassPanel({
         {right}
       </div>
       <div className={`flex-1 overflow-auto ${dense ? "p-3" : "px-4 pb-5 pt-2"}`}>{children}</div>
+    </div>
+  );
+}
+
+/* =========================================================
+   Floating Narrator (mic + captions)
+   ========================================================= */
+function FloatingNarrator() {
+  const [speaking, setSpeaking] = useState(false);
+  const [caption, setCaption] = useState<string>("Narrator idle. Tap the mic to start.");
+  const controllerRef = useRef<AbortController | null>(null);
+  const pendingRef = useRef<string>("");
+
+  const isActive = () =>
+    speaking ||
+    !!controllerRef.current ||
+    (typeof window !== "undefined" &&
+      !!window.speechSynthesis &&
+      (window.speechSynthesis.speaking || window.speechSynthesis.pending));
+
+  const speakSentence = (sentence: string) => {
+    if (!window.speechSynthesis) return;
+    const s = sentence.trim();
+    if (!s || s.length < 2) return;
+    const u = new SpeechSynthesisUtterance(s);
+    u.rate = 1.02;
+    u.pitch = 1.0;
+    u.volume = 1.0;
+    u.onstart = () => {
+      setCaption(s);
+      setSpeaking(true);
+    };
+    u.onend = () => {
+      setTimeout(() => {
+        const still = window.speechSynthesis.speaking || window.speechSynthesis.pending;
+        if (!still && !controllerRef.current) setSpeaking(false);
+      }, 60);
+    };
+    window.speechSynthesis.speak(u);
+  };
+
+  const stopAll = () => {
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    try {
+      window.speechSynthesis?.cancel();
+    } catch {}
+    setSpeaking(false);
+    setCaption("Narration stopped.");
+  };
+
+  const start = async () => {
+    if (controllerRef.current) return;
+    try { window.speechSynthesis?.getVoices(); } catch {}
+
+    const ac = new AbortController();
+    controllerRef.current = ac;
+    pendingRef.current = "";
+    setCaption("Listening to tape…");
+
+    try {
+      const res = await fetch("/api/trade-narrate/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+        signal: ac.signal,
+      });
+      if (!res.body) throw new Error("No stream");
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+
+      setSpeaking(true);
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = dec.decode(value, { stream: true });
+        pendingRef.current += chunk;
+
+        const parts = pendingRef.current.split(/(?<=[\.\?!])\s+|\n+/g);
+        pendingRef.current = parts.pop() ?? "";
+
+        for (const s of parts) speakSentence(s);
+      }
+    } catch {
+      // aborted or network issue
+    } finally {
+      controllerRef.current = null;
+      const tail = (pendingRef.current || "").trim();
+      if (tail) speakSentence(tail);
+      pendingRef.current = "";
+      if (!window.speechSynthesis?.speaking) setSpeaking(false);
+    }
+  };
+
+  const toggle = () => (isActive() ? stopAll() : start());
+  const active = isActive();
+
+  return (
+    <div className="w-full flex items-center gap-5 px-1">
+      {/* Bigger, bright green mic */}
+      <button
+        onClick={toggle}
+        aria-label={active ? "Stop Narrator" : "Start Narrator"}
+        className={[
+          "relative inline-flex items-center justify-center h-16 w-16 rounded-full transition",
+          active
+            ? "bg-emerald-500 text-white shadow-[0_0_0_14px_rgba(16,185,129,0.35)] animate-pulse"
+            : "bg-white/30 ring-1 ring-white/50 text-white hover:bg-white/40",
+        ].join(" ")}
+        title={active ? "Stop Narrator" : "Start Narrator"}
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" className="h-8 w-8">
+          <path d="M12 14a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V20H8v2h8v-2h-3v-2.08A7 7 0 0 0 19 11h-2z" />
+        </svg>
+      </button>
+
+      {/* Large, readable captions */}
+      <div
+        className="
+          max-w-[min(82vw,1100px)]
+          text-white text-[18px] md:text-[20px] leading-7 font-semibold
+          bg-black/35 rounded-xl px-4 py-1.5
+          backdrop-blur-sm select-none
+        "
+      >
+        {caption}
+      </div>
     </div>
   );
 }
@@ -394,7 +522,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
 }
 
 /* =========================================================
-   Page
+   Page (NEW layout: nested grid in the RIGHT column)
    ========================================================= */
 export default function Home() {
   const { data: session, status } = useSession();
@@ -432,10 +560,7 @@ export default function Home() {
 
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const [chartVisible, setChartVisible] = useState(false);
-
   const [agentResult, setAgentResult] = useState<string | null>(null);
-  const [agentBuyPrice, setAgentBuyPrice] = useState<string | null>(null);
-  const [agentSellPrice, setAgentSellPrice] = useState<string | null>(null);
 
   // Bot / trades
   const [botData, setBotData] = useState<any>(null);
@@ -549,13 +674,11 @@ export default function Home() {
     }
   };
 
-  // Chart helpers (modal kept intact)
+  // Chart modal helpers
   const handleStockClick = (ticker: string) => {
     setSelectedStock(ticker);
     setChartVisible(true);
     setAgentResult(null);
-    setAgentBuyPrice(null);
-    setAgentSellPrice(null);
   };
   const closeChart = () => {
     setChartVisible(false);
@@ -571,8 +694,6 @@ export default function Home() {
       });
       if (!res.ok) throw new Error("Failed to analyze chart");
       const data = await res.json();
-      setAgentBuyPrice(data.bestBuyPrice);
-      setAgentSellPrice(data.sellPrice);
       setAgentResult(
         `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice || "Not provided"}\n\n${data.reason}\n\nPrediction: ${
           data.prediction || "N/A"
@@ -581,46 +702,6 @@ export default function Home() {
     } catch {
       alert("Error analyzing the chart.");
     }
-  };
-  const handlePickFromChart = () => {
-    if (!selectedStock) return;
-    const saved = localStorage.getItem("pnlRows");
-    const rows = saved
-      ? JSON.parse(saved)
-      : [
-          { day: "Day 1", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
-          { day: "Day 2", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
-          { day: "Day 3", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
-          { day: "Day 4", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
-          { day: "Day 5", date: "", pick: "", price: "", priceToSell: "", invested: "", diff: "" },
-        ];
-
-    const today = new Date().toISOString().split("T")[0];
-    const updated = [...rows];
-    let filled = false;
-    for (let i = 0; i < updated.length; i++) {
-      if (!updated[i].pick) {
-        updated[i].pick = selectedStock;
-        updated[i].date = today;
-        if (agentBuyPrice) updated[i].price = parseFloat(agentBuyPrice);
-        if (agentSellPrice) updated[i].priceToSell = parseFloat(agentSellPrice);
-        filled = true;
-        break;
-      }
-    }
-    if (!filled) {
-      updated.push({
-        day: `Day ${updated.length + 1}`,
-        date: today,
-        pick: selectedStock,
-        price: agentBuyPrice ? parseFloat(agentBuyPrice) : "",
-        priceToSell: agentSellPrice ? parseFloat(agentSellPrice) : "",
-        invested: "",
-        diff: "",
-      });
-    }
-    localStorage.setItem("pnlRows", JSON.stringify(updated));
-    alert(`Added ${selectedStock} to your P&L with Buy: ${agentBuyPrice}, Sell: ${agentSellPrice}`);
   };
 
   // today's trades count
@@ -639,10 +720,8 @@ export default function Home() {
     return n;
   }, [statusTradesToday, tradeData]);
 
-  // open pos for PANIC button
   const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
 
-  /* ====== Layout ====== */
   return (
     <main
       className="min-h-screen w-full flex flex-col"
@@ -658,23 +737,22 @@ export default function Home() {
       <Navbar />
 
       <div className="flex-1 px-4 pt-20 pb-6">
-        <div
-          className="
-            grid gap-5
-            xl:grid-cols-[460px_minmax(720px,1fr)_960px]
-            xl:grid-rows-[auto_auto]
-            lg:grid-cols-1
-          "
-        >
-          {/* AI Chat */}
-          <div className="xl:row-span-2">
+        {/* Floating narrator ABOVE everything, with generous space below */}
+        <div className="mb-10 md:mb-14">
+          <FloatingNarrator />
+        </div>
+
+        {/* === TOP-LEVEL GRID: 3 columns, no row spanning === */}
+        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1">
+          {/* LEFT: AI Chat */}
+          <div>
             <GlassPanel title="AI Chat" color="cyan" dense>
               <ChatBox />
             </GlassPanel>
           </div>
 
-          {/* Top Gainers */}
-          <div className="xl:row-span-2">
+          {/* MIDDLE: Top Gainers */}
+          <div>
             <TopGainers
               loading={loading}
               errorMessage={errorMessage}
@@ -686,33 +764,35 @@ export default function Home() {
             />
           </div>
 
-          {/* Chart (replaces old Trade Log spot) + PANIC button in header area */}
-          <div className="relative">
-            <TradeChartPanel height={680} />
-            <div className="absolute right-4 top-3 z-10">
-              <PanicSellButton disabled={!hasOpenPos} />
+          {/* RIGHT: NESTED GRID => Chart on top, AI Rec + Bot Status directly under it */}
+          <div className="grid gap-5">
+            {/* Chart */}
+            <div className="relative">
+              <TradeChartPanel height={720} />
+              <div className="absolute right-4 top-3 z-10">
+                <PanicSellButton disabled={!hasOpenPos} />
+              </div>
             </div>
-          </div>
 
-          {/* AI Rec + Bot Status (second row, right column) */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 xl:min-h-[460px] items-stretch">
-            <AIRecommendation
-              botData={botData}
-              alpaca={alpaca}
-              analyzing={analyzing}
-              askAI={askAIRecommendation}
-              stocksCount={stocks.length}
-              recommendation={recommendation}
-            />
-            <BotStatus statusError={statusError} statusTick={statusTick} todayTradeCount={todayTradeCount} />
+            {/* Bottom pair (NO GAP issue anymore) */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch">
+              <AIRecommendation
+                botData={botData}
+                alpaca={alpaca}
+                analyzing={analyzing}
+                askAI={askAIRecommendation}
+                stocksCount={stocks.length}
+                recommendation={recommendation}
+              />
+              <BotStatus statusError={statusError} statusTick={statusTick} todayTradeCount={todayTradeCount} />
+            </div>
           </div>
         </div>
 
-        {/* Trade Log moved BELOW the grid (not inline) */}
+        {/* Trade Log below grid */}
         <div className="mt-5 w-full xl:max-w-[960px] xl:ml-auto">
-  <TradeLog tradeData={tradeData} slim />
-</div>
-
+          <TradeLog tradeData={tradeData} slim />
+        </div>
       </div>
 
       {/* Chart modal */}
@@ -746,11 +826,11 @@ export default function Home() {
                 />
               </div>
               <div className="flex gap-3 mt-3">
+                <Button onClick={closeChart} className="px-4 py-2 bg-slate-700 text-white rounded hover:bg-slate-800 transition">
+                  Close
+                </Button>
                 <Button onClick={handleAgent} className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition">
                   AI Agent
-                </Button>
-                <Button onClick={handlePickFromChart} className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition">
-                  Pick
                 </Button>
               </div>
               {agentResult && (
@@ -871,12 +951,7 @@ function TopGainers({
 
 function TradeLog({ tradeData, slim = false }: { tradeData: TradePayload | null; slim?: boolean }) {
   return (
-    <Panel
-      title="Trade Log"
-      color="orange"
-      dense
-      /* Panic button moved to chart header */
-    >
+    <Panel title="Trade Log" color="orange" dense>
       {!tradeData?.trades?.length ? (
         <p className="text-gray-500 text-sm">No trades yet.</p>
       ) : (
@@ -973,6 +1048,7 @@ function AIRecommendation({
               </>
             );
           })()}
+
         </div>
       )}
 
