@@ -1,10 +1,18 @@
-// app/api/trade-narrate/stream/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { NextRequest } from "next/server";
+import OpenAI from "openai";
 import { spreadGuardOK } from "@/lib/alpaca";
+
+/* ───────────────────── OpenAI config ───────────────────── */
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+const NARRATOR_MODEL = process.env.NARRATOR_MODEL?.trim() || "gpt-4o-mini";
+const NARRATOR_TEMP = Number(process.env.NARRATOR_TEMP ?? 0.6);
+const NARRATOR_MAX_TOKENS = Number(process.env.NARRATOR_MAX_TOKENS ?? 120);
 
 /* ───────────────────── Config (mirror bot) ───────────────────── */
 const PRICE_MIN = 1;
@@ -30,7 +38,7 @@ const MIN_DOLLAR_VOL = 200_000;
 // Stream pacing
 const TICK_MS = 20_000;             // ~every 20s
 const MAX_SCAN_MINUTES = 15;        // safety
-const DETAIL_EVERY_N_TICKS = 3;     // talk less: full detail every 3 ticks
+const DETAIL_EVERY_N_TICKS = 3;     // full detail every 3 ticks
 
 /* ───────────────────── “Human” cadence ───────────────────── */
 const THINK_MIN_MS = 450;
@@ -42,9 +50,9 @@ const think = (ms?: number) =>
   sleep(ms ?? (THINK_MIN_MS + Math.random() * (THINK_MAX_MS - THINK_MIN_MS)));
 
 async function say(controller: ReadableStreamDefaultController, text: string, msAfter = 0, preThink = true) {
-  if (preThink) await think();                 // think before we talk (feels human)
+  if (preThink) await think();
   controller.enqueue(td.encode(text));
-  if (msAfter > 0) await sleep(msAfter);       // optional linger after speaking
+  if (msAfter > 0) await sleep(msAfter);
 }
 
 /* ───────────────────── ET time helpers ───────────────────── */
@@ -275,7 +283,6 @@ function tokenizeTickers(txt: string): string[] {
 function parseTwoPicksFromResponse(rJson: any, allowed?: string[]): string[] {
   const allowSet = new Set((allowed || []).map((s) => s.toUpperCase()));
   const out: string[] = [];
-  // structured
   if (Array.isArray(rJson?.picks)) {
     for (const s of rJson.picks) {
       const u = String(s || "").toUpperCase();
@@ -283,14 +290,12 @@ function parseTwoPicksFromResponse(rJson: any, allowed?: string[]): string[] {
       if (out.length >= 2) return out;
     }
   }
-  // common fields
   const fields = [rJson?.ticker, rJson?.symbol, rJson?.pick, rJson?.Pick, rJson?.data?.ticker, rJson?.data?.symbol];
   for (const f of fields) {
     const u = typeof f === "string" ? f.toUpperCase() : "";
     if (/^[A-Z][A-Z0-9.\-]*$/.test(u) && (!allowSet.size || allowSet.has(u)) && !out.includes(u)) out.push(u);
     if (out.length >= 2) return out;
   }
-  // text scrape
   let txt = String(rJson?.recommendation ?? rJson?.text ?? rJson?.message ?? "");
   txt = txt.replace(/[*_`~]/g, "").replace(/^-+\s*/gm, "");
   const toks = tokenizeTickers(txt).filter((t) => !allowSet.size || allowSet.has(t));
@@ -325,7 +330,6 @@ type SignalReadOK = {
 };
 type SignalReadFail = { ok: false; reason: "no_day_candles" | "error" };
 
-/* Evaluate one symbol for a clear, English explanation */
 async function readSignalsForNarration(base: string, symbol: string): Promise<SignalReadOK | SignalReadFail> {
   try {
     const today = yyyyMmDdET();
@@ -350,9 +354,9 @@ async function readSignalsForNarration(base: string, symbol: string): Promise<Si
     const liq = passesBalancedLiquidityGuard(last.close, last.volume ?? 0, floatShares);
 
     // Levels + signals
-    const orRange = computeOpeningRange(candles, today);
-    const vwap = computeSessionVWAP(candles, today);
-    const vol = computeVolumePulse(candles, today, 5);
+    const orRange = computeOpeningRange(candles, yyyyMmDdET());
+    const vwap = computeSessionVWAP(candles, yyyyMmDdET());
+    const vol = computeVolumePulse(candles, yyyyMmDdET(), 5);
 
     const aboveVWAP = vwap != null && last.close >= vwap;
     const breakORH = !!(orRange && last.close > orRange.high);
@@ -389,6 +393,87 @@ async function readSignalsForNarration(base: string, symbol: string): Promise<Si
   }
 }
 
+/* ───────────────────── OpenAI narration helper ───────────────────── */
+/** Streams a short, polished narration built from your structured signals. */
+async function streamOpenAINarration(
+  controller: ReadableStreamDefaultController,
+  payload: {
+    symbol: string;
+    timeET: string;
+    read: SignalReadOK;
+    allowEmoji: boolean;
+  }
+) {
+  if (!process.env.OPENAI_API_KEY) {
+    // No key configured — quietly skip
+    return false;
+  }
+
+  const system = [
+    "You are a concise day-trading narrator for a scalping bot.",
+    "Goal: craft 1–2 short sentences that sound human and confident, but not promotional.",
+    "Always include the SYMBOL and last PRICE like: ABCD $3.42.",
+    "Mention only the most important signals (VWAP, opening range, volume pulse, spread, liquidity).",
+    "If setup is incomplete, say what’s missing succinctly (e.g., needs tighter spread, more liquidity, or VWAP reclaim).",
+    "No advice/disclaimers. Keep it crisp. Avoid filler. Max ~220 characters.",
+    "If allowEmoji=true, you may add at most one relevant emoji at the end; otherwise no emojis.",
+  ].join(" ");
+
+  const { symbol, timeET, read, allowEmoji } = payload;
+
+  const user = {
+    timeET,
+    symbol,
+    price: Number(read.price.toFixed(2)),
+    priceOK: read.priceOK,
+    spreadOK: read.spreadOK,
+    spreadNote: read.spreadNote,
+    liquidityOK: read.liq.ok,
+    minSharesRequired: read.liq.minSharesReq,
+    dollarVolMin: MIN_DOLLAR_VOL,
+    orHigh: read.orHigh,
+    vwap: read.vwap,
+    aboveVWAP: read.aboveVWAP,
+    breakORH: read.breakORH,
+    nearOR: read.nearOR,
+    vwapReclaim: read.vwapRecl,
+    volMult: read.volMult,
+    volNeeded: read.VOL_MULT_MIN,
+    signalCount: read.signalCount,
+    armedMomentum: read.armedMomentum,
+    allowEmoji,
+  };
+
+  try {
+    const stream = await openai.chat.completions.create({
+      model: NARRATOR_MODEL,
+      temperature: NARRATOR_TEMP,
+      max_tokens: NARRATOR_MAX_TOKENS,
+      stream: true,
+      messages: [
+        { role: "system", content: system },
+        {
+          role: "user",
+          content:
+            "Turn this JSON into 1–2 sentences. Return plaintext only:\n" +
+            JSON.stringify(user),
+        },
+      ],
+    });
+
+    // pipe tokens → client
+    for await (const part of stream) {
+      const delta = part.choices?.[0]?.delta?.content || "";
+      if (delta) controller.enqueue(td.encode(delta));
+    }
+    controller.enqueue(td.encode("\n"));
+    return true;
+  } catch {
+    // If OpenAI fails, we silently fall back to template narration
+    return false;
+  }
+}
+
 /* ───────────────────── Route ───────────────────── */
 export async function POST(req: NextRequest) {
   try {
@@ -405,7 +490,6 @@ export async function POST(req: NextRequest) {
             : (inScanWindowET() ? "hey — keeping it chill, watching the open." : "hey — I’ll jump in at 09:30 ET.");
           await say(controller, `(${t} ET) ${greeting}\n`);
 
-          // If we are before 9:30 or outside early window: let them know and end early
           if (!inScanWindowET() && !inForceWindowET()) {
             await say(controller, `Live commentary runs 09:30–09:45 ET. I’ll save the words till the bell. 🛎️\n`);
             controller.close();
@@ -416,14 +500,12 @@ export async function POST(req: NextRequest) {
             await say(controller, `Noted: “${note.trim()}”. If it fits the setup, we’ll work it in. 🤝\n`);
           }
 
-          // SCAN LOOP: talk less, think more
+          // SCAN LOOP
           let scanTicks = 0;
           let announcedTopOnce = false;
 
           while (inScanWindowET() && scanTicks < Math.ceil((MAX_SCAN_MINUTES * 60_000) / TICK_MS)) {
             scanTicks++;
-
-            // Only do a full breakdown every N ticks to avoid sounding robotic
             const doDetailed = scanTicks % DETAIL_EVERY_N_TICKS === 1;
 
             const snap = await getSnapshot(base);
@@ -441,7 +523,7 @@ export async function POST(req: NextRequest) {
               announcedTopOnce = true;
             }
 
-            // Ask the AI for two picks among top 8 (silent if not detailed)
+            // Ask your /api/recommendation for 1–2 symbols to narrate
             let picks: string[] = [];
             try {
               const r = await fetch(`${base}/api/recommendation`, {
@@ -472,7 +554,7 @@ export async function POST(req: NextRequest) {
               }
             }
 
-            // Only do the long English breakdown on detailed ticks
+            // Detailed narration with OpenAI (fallback to template)
             if (doDetailed) {
               for (const sym of picks) {
                 const read = await readSignalsForNarration(base, sym);
@@ -481,44 +563,52 @@ export async function POST(req: NextRequest) {
                   continue;
                 }
 
-                const parts: string[] = [];
-                parts.push(`• ${sym}: $${read.price.toFixed(2)} — `);
-                parts.push(
-                  `price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "wide"}${read.spreadNote || ""}`
-                );
+                // Try LLM narration first
+                const usedLLM = await streamOpenAINarration(controller, {
+                  symbol: sym,
+                  timeET: hhmmssET(),
+                  read,
+                  allowEmoji: true,
+                });
 
-                const liqStr = `liq ${read.liq.ok ? "OK" : "light"} (need ≥ ${read.liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min)`;
-                parts.push(`, ${liqStr}.`);
+                if (!usedLLM) {
+                  // Fallback to your concise template if model unavailable
+                  const parts: string[] = [];
+                  parts.push(`• ${sym}: $${read.price.toFixed(2)} — `);
+                  parts.push(
+                    `price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "wide"}${read.spreadNote || ""}`
+                  );
+                  const liqStr = `liq ${read.liq.ok ? "OK" : "light"} (need ≥ ${read.liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min)`;
+                  parts.push(`, ${liqStr}.`);
 
-                const levels: string[] = [];
-                if (read.orHigh != null) levels.push(`ORH ${read.orHigh.toFixed(2)}`);
-                if (read.vwap != null) levels.push(`VWAP ${read.vwap.toFixed(2)}`);
-                if (levels.length) parts.push(` Levels: ${levels.join(", ")}.`);
+                  const levels: string[] = [];
+                  if (read.orHigh != null) levels.push(`ORH ${read.orHigh.toFixed(2)}`);
+                  if (read.vwap != null) levels.push(`VWAP ${read.vwap.toFixed(2)}`);
+                  if (levels.length) parts.push(` Levels: ${levels.join(", ")}.`);
 
-                const sigs: string[] = [];
-                if (read.aboveVWAP) sigs.push("above VWAP");
-                if (read.breakORH) sigs.push("pushing OR high");
-                if (read.nearOR) sigs.push(`near OR (${(read.NEAR_OR_PCT * 100).toFixed(2)}% band)`);
-                if (read.vwapRecl) sigs.push(`VWAP reclaim (${(read.VWAP_RECLAIM_BAND * 100).toFixed(2)}% hold)`);
-                if (read.volMult != null) sigs.push(`vol pulse ${read.volMult.toFixed(2)}× (need ≥ ${read.VOL_MULT_MIN.toFixed(2)}×)`);
-                if (sigs.length) parts.push(` Signals: ${sigs.join(", ")}.`);
+                  const sigs: string[] = [];
+                  if (read.aboveVWAP) sigs.push("above VWAP");
+                  if (read.breakORH) sigs.push("pushing OR high");
+                  if (read.nearOR) sigs.push(`near OR (${(read.NEAR_OR_PCT * 100).toFixed(2)}% band)`);
+                  if (read.vwapRecl) sigs.push(`VWAP reclaim (${(read.VWAP_RECLAIM_BAND * 100).toFixed(2)}% hold)`);
+                  if (read.volMult != null) sigs.push(`vol pulse ${read.volMult.toFixed(2)}× (need ≥ ${read.VOL_MULT_MIN.toFixed(2)}×)`);
+                  if (sigs.length) parts.push(` Signals: ${sigs.join(", ")}.`);
 
-                if (read.priceOK && read.spreadOK && read.liq.ok && read.armedMomentum) {
-                  parts.push(` Read: momentum armed (above VWAP + ${read.signalCount} confirms). Comfortable to act. 🚀`);
-                } else {
-                  const needs: string[] = [];
-                  if (!read.priceOK) needs.push("price in band");
-                  if (!read.spreadOK) needs.push("tighter spread");
-                  if (!read.liq.ok) needs.push("more liquidity");
-                  if (!(read.aboveVWAP && read.signalCount >= 2)) needs.push("above VWAP + ≥2 signals");
-                  if (needs.length) parts.push(` Needs: ${needs.join(", ")}. No FOMO — let it come to us. 😎`);
+                  if (read.priceOK && read.spreadOK && read.liq.ok && read.armedMomentum) {
+                    parts.push(` Read: momentum armed (above VWAP + ${read.signalCount} confirms). Comfortable to act. 🚀`);
+                  } else {
+                    const needs: string[] = [];
+                    if (!read.priceOK) needs.push("price in band");
+                    if (!read.spreadOK) needs.push("tighter spread");
+                    if (!read.liq.ok) needs.push("more liquidity");
+                    if (!(read.aboveVWAP && read.signalCount >= 2)) needs.push("above VWAP + ≥2 signals");
+                    if (needs.length) parts.push(` Needs: ${needs.join(", ")}. No FOMO — let it come to us. 😎`);
+                  }
+                  await say(controller, parts.join("") + ` ${pick(persona.emojis)}${riff()}`);
                 }
-
-                await say(controller, parts.join("") + ` ${pick(persona.emojis)}${riff()}`);
               }
             }
 
-            // Soft pacing between updates (silent most ticks)
             await sleep(TICK_MS);
           }
 

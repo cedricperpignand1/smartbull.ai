@@ -5,8 +5,60 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
+import OpenAI from "openai";
 import { prisma } from "@/lib/prisma";
 import { spreadGuardOK } from "@/lib/alpaca";
+
+/* ──────────────────────────────────────────────────────────
+   OpenAI (optional; safe fallbacks if not configured)
+   ────────────────────────────────────────────────────────── */
+const openai =
+  process.env.OPENAI_API_KEY
+    ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    : null;
+
+const CHAT_MODEL = process.env.CHAT_MODEL?.trim() || "gpt-4o-mini";
+const CHAT_TEMP = Number(process.env.CHAT_TEMP ?? 0.6);
+const CHAT_MAX_TOKENS = Number(process.env.CHAT_MAX_TOKENS ?? 240);
+
+async function safeChat(messages: { role: "system" | "user" | "assistant"; content: string }[]) {
+  if (!openai) return null;
+  try {
+    const res = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      temperature: CHAT_TEMP,
+      max_tokens: CHAT_MAX_TOKENS,
+      messages,
+    });
+    return res.choices?.[0]?.message?.content?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function maybePolishReply(
+  draft: string,
+  facts?: any,
+  opts: { maxLen?: number } = {}
+) {
+  if (!openai) return draft;
+  const maxLen = opts.maxLen ?? 600;
+  // Avoid rewriting long/bulleted reports to preserve structure
+  const tooLong = draft.length > maxLen || draft.split("\n").length > 6;
+  if (tooLong) return draft;
+
+  const system =
+    "You are a concise trading assistant. Rewrite the user's draft answer into clearer, smoother English without adding new facts. Keep numbers and tickers exact. Prefer 1–3 short sentences. No advice or hype.";
+  const user =
+    (facts ? `Facts (JSON):\n${JSON.stringify(facts)}\n\n` : "") +
+    `Draft answer:\n${draft}\n\nReturn plaintext only.`;
+
+  const out = await safeChat([
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ]);
+  return out || draft;
+}
 
 /* ──────────────────────────────────────────────────────────
    US/Eastern helpers (no ICU required)
@@ -273,7 +325,7 @@ function chooseTickerFromContext(
 }
 
 /* ──────────────────────────────────────────────────────────
-   Internal API + market helpers (for rich “why”)
+   Internal API + market helpers (for live Q&A)
    ────────────────────────────────────────────────────────── */
 function getBaseUrl(req: Request) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
@@ -284,7 +336,7 @@ function getBaseUrl(req: Request) {
 }
 
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
-type QuoteLite = { price?: number | null; avgVolume?: number | null; marketCap?: number | null };
+type QuoteLite = { price?: number | null; avgVolume?: number | null; marketCap?: number | null; changesPercentage?: number | null };
 
 async function fetchCandles1m(base: string, symbol: string, limit = 360): Promise<Candle[]> {
   try {
@@ -307,7 +359,12 @@ async function fetchQuoteLite(base: string, symbol: string): Promise<QuoteLite> 
     const res = await fetch(`${base}/api/fmp/quote?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
     const j = await res.json();
     const row = (Array.isArray(j) ? j[0] : j) || {};
-    return { price: Number(row.price), avgVolume: Number(row.avgVolume || row.avgVolume10Day || row.averageVolume), marketCap: Number(row.marketCap) };
+    return {
+      price: Number(row.price),
+      avgVolume: Number(row.avgVolume || row.avgVolume10Day || row.averageVolume),
+      marketCap: Number(row.marketCap),
+      changesPercentage: Number(row.changesPercentage)
+    };
   } catch {
     return {};
   }
@@ -504,6 +561,65 @@ async function buildWhyTradeDeep(base: string, symbol: string, entryUTC: Date): 
 }
 
 /* ──────────────────────────────────────────────────────────
+   Live stock QA (facts + LLM; graceful fallback)
+   ────────────────────────────────────────────────────────── */
+async function buildLiveFactsForSymbol(base: string, symbol: string) {
+  const nowUTC = new Date();
+  const ymd = yyyyMmDdETFromUTC(nowUTC);
+  const nowET = new Date(new Date(nowUTC).toLocaleString("en-US", { timeZone: "America/New_York" }));
+
+  const [candles, quote, float] = await Promise.all([
+    fetchCandles1m(base, symbol, 360),
+    fetchQuoteLite(base, symbol),
+    fetchFloatShares(base, symbol),
+  ]);
+
+  const day = candles.filter((c) => isSameETDay(toET(c.date), ymd));
+  const last = day[day.length - 1];
+
+  const or = computeOpeningRange(candles, ymd);
+  const vwap = computeVWAPUpTo(candles, ymd, nowET);
+  const rvol5 = computeRelVol5(candles, ymd, nowET, 5);
+  const vwapSlope = computeVWAPSlope(candles, ymd, nowET, 3);
+  const trend = last3Trend(candles, ymd, nowET);
+
+  const aboveVWAP = vwap != null && last ? last.close >= vwap : null;
+  const dayHigh = day.length ? Math.max(...day.map(c => c.high)) : null;
+  const dayLow  = day.length ? Math.min(...day.map(c => c.low))  : null;
+
+  return {
+    symbol,
+    ymd,
+    price: last?.close ?? quote.price ?? null,
+    lastBarTimeET: last ? toET(last.date).toISOString() : null,
+    changePct: quote.changesPercentage ?? null,
+    vwap,
+    vwapSlope,
+    openingRange: or,
+    relVol5: rvol5,
+    trend,
+    aboveVWAP,
+    dayHigh, dayLow,
+    float,
+    avgVolume: quote.avgVolume ?? null,
+    marketCap: quote.marketCap ?? null,
+  };
+}
+
+async function answerStockQuestionWithLLM(userQuestion: string, facts: any) {
+  if (!openai) return null;
+  const system =
+    "You are a grounded trading copilot. Answer using ONLY the provided facts (JSON). " +
+    "If a detail isn't present, say you don't know yet. Be concise, neutral, and avoid advice. " +
+    "Include numeric levels like price/VWAP/OR when relevant. 1–4 short sentences max.";
+  const user = `Question: ${userQuestion}\n\nFacts (JSON):\n${JSON.stringify(facts)}`;
+  return await safeChat([
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ]);
+}
+
+/* ──────────────────────────────────────────────────────────
    Formatters & tiny helpers
    ────────────────────────────────────────────────────────── */
 function summarizeTrades(trades: DbTrade[]) {
@@ -550,38 +666,37 @@ export async function POST(req: Request) {
     }) as unknown as DbPos | null;
 
     if (intent === "help") {
-      return NextResponse.json({
-        reply:
-          "I’ve got you. Try:\n" +
-          "- What did we trade today / yesterday / last 5 days?\n" +
-          "- What’s my P&L today / this week / this month?\n" +
-          "- Are we holding anything?\n" +
-          "- Why did we trade ABCD?\n" +
-          "- What price did we sell/exit ABCD?\n" +
-          "- What price did we buy/enter ABCD?\n" +
-          "- Why did the AI pick ABCD?",
-      });
+      const reply =
+        "I’ve got you. Try:\n" +
+        "- What did we trade today / yesterday / last 5 days?\n" +
+        "- What’s my P&L today / this week / this month?\n" +
+        "- Are we holding anything?\n" +
+        "- Why did we trade ABCD?\n" +
+        "- What price did we sell/exit ABCD?\n" +
+        "- What price did we buy/enter ABCD?\n" +
+        "- Ask anything about a ticker (e.g., “Is $ABCD above VWAP?”)";
+      return NextResponse.json({ reply });
     }
 
     if (intent === "what_traded") {
       const summary = summarizeTrades(tradesInRange);
-      const reply = summary === "No trades in that range."
+      const draft = summary === "No trades in that range."
         ? tone.fun(`no trades ${label}.`)
         : tone.fun(`trades ${label}: ${summary}`);
-      return NextResponse.json({ reply });
+      return NextResponse.json({ reply: await maybePolishReply(draft) });
     }
 
     if (intent === "pnl") {
       const realized = realizedFIFO(tradesInRange);
-      if (!tradesInRange.length) {
-        return NextResponse.json({ reply: tone.fun(`no trades ${label}, so realized P&L is $0.00.`) });
-      }
-      return NextResponse.json({ reply: tone.fun(`realized P&L ${label}: ${money(realized)}.`) });
+      const draft = !tradesInRange.length
+        ? tone.fun(`no trades ${label}, so realized P&L is $0.00.`)
+        : tone.fun(`realized P&L ${label}: ${money(realized)}.`);
+      return NextResponse.json({ reply: await maybePolishReply(draft, { realized, label }) });
     }
 
     if (intent === "in_position") {
-      const reply = openPos?.open ? tone.holding(openPos) : tone.flat();
-      return NextResponse.json({ reply: tone.fun(reply) });
+      const draft = openPos?.open ? tone.holding(openPos) : tone.flat();
+      return NextResponse.json({ reply: await maybePolishReply(tone.fun(draft)) });
     }
 
     /* ───────── SELL PRICE ───────── */
@@ -623,6 +738,7 @@ export async function POST(req: Request) {
       }
       const symRealized = realizedForTicker(rowsForTicker, ticker);
       lines.push(`Realized on ${ticker} ${label}: ${money(symRealized)}.`);
+
       return NextResponse.json({ reply: lines.join("\n") });
     }
 
@@ -687,7 +803,6 @@ export async function POST(req: Request) {
 
       // Optional future: Trade.reason column
       let tradeReason: string | null = null;
-      // try { const row = await prisma.trade.findFirst({ where: { id: entryTrade.id }, select: { reason: true } }) as any; tradeReason = (row?.reason || "").trim() || null; } catch {}
 
       // Saved AI pick explanation (if you store it)
       const recRows = await prisma.recommendation.findMany({
@@ -700,7 +815,6 @@ export async function POST(req: Request) {
       }) as unknown as DbReco[];
       const recExp = (recRows?.[0]?.explanation || "").trim() || null;
 
-      // Deep read from market structure at entry time
       const base = getBaseUrl(req);
       const deep = await buildWhyTradeDeep(base, ticker, new Date(entryTrade.at));
 
@@ -712,7 +826,8 @@ export async function POST(req: Request) {
         recExp ? `Reason (from the AI pick): ${recExp}` :
         deep ?? "I didn’t capture a thesis at the time, but I’ll log one on future entries.";
 
-      return NextResponse.json({ reply: `${header}\n${reasonBlock}` });
+      const draft = `${header}\n${reasonBlock}`;
+      return NextResponse.json({ reply: await maybePolishReply(draft) });
     }
 
     /* ───────── WHY PICK (allow non-traded tickers) ───────── */
@@ -731,21 +846,47 @@ export async function POST(req: Request) {
         const whenET = toETParts(new Date(row.at));
         const price = asNumber(row.price).toFixed(2);
         const exp = (row.explanation || "").trim();
-        if (exp) return NextResponse.json({ reply: tone.fun(`AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET). Reason: ${exp}`) });
-        return NextResponse.json({ reply: tone.fun(`AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET), but no explanation was saved.`) });
+        const draft = exp
+          ? tone.fun(`AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET). Reason: ${exp}`)
+          : tone.fun(`AI picked ${ticker} ${label} around $${price} (${whenET.ymd} ${whenET.hms} ET), but no explanation was saved.`);
+        return NextResponse.json({ reply: await maybePolishReply(draft) });
       }
       return NextResponse.json({ reply: tone.fun(`couldn’t find a saved recommendation for ${ticker} ${label}. Make sure /api/recommendation stores the explanation.`) });
+    }
+
+    /* ───────── “Ask anything about $TICKER” (LLM on live facts) ───────── */
+    // If user mentioned a ticker (even if not traded), assemble live facts and ask LLM.
+    const base = getBaseUrl(req);
+    const freeTicker = chooseTickerFromContext(msg, tradesInRange, { requireTraded: false });
+    if (freeTicker) {
+      const facts = await buildLiveFactsForSymbol(base, freeTicker);
+      if (!facts.price && !facts.vwap && !facts.openingRange && !facts.relVol5) {
+        return NextResponse.json({ reply: tone.fun(`I couldn’t fetch fresh data for ${freeTicker} right now.`) });
+      }
+      const llm = await answerStockQuestionWithLLM(msg, facts);
+      if (llm) return NextResponse.json({ reply: llm });
+
+      // Fallback summary if LLM unavailable
+      const parts: string[] = [];
+      parts.push(`${facts.symbol}: ${facts.price != null ? `$${facts.price.toFixed?.(2) ?? facts.price}` : "price n/a"}.`);
+      if (facts.vwap != null) parts.push(`VWAP ${facts.vwap.toFixed(2)}${facts.aboveVWAP != null ? facts.aboveVWAP ? " (above)" : " (below)" : ""}.`);
+      if (facts.openingRange?.high != null) parts.push(`ORH ${facts.openingRange.high.toFixed(2)}.`);
+      if (facts.relVol5 != null) parts.push(`RelVol(5m) ${facts.relVol5.toFixed(2)}×.`);
+      if (facts.dayHigh != null && facts.dayLow != null) parts.push(`Day ${facts.dayLow.toFixed(2)}–${facts.dayHigh.toFixed(2)}.`);
+      if (facts.vwapSlope != null) parts.push(`VWAP slope ${facts.vwapSlope > 0 ? "up" : facts.vwapSlope < 0 ? "down" : "flat"}.`);
+      return NextResponse.json({ reply: parts.join(" ") });
     }
 
     // Default status (friendly)
     const realized = realizedFIFO(tradesInRange);
     const traded = summarizeTrades(tradesInRange);
-    const parts: string[] = [];
-    parts.push(openPos?.open ? tone.holding(openPos) : tone.flat());
-    if (traded === "No trades in that range.") parts.push(`No trades ${label}.`);
-    else parts.push(`Trades ${label}: ${traded}.`);
-    if (tradesInRange.length) parts.push(`Realized P&L ${label}: ${money(realized)}.`);
-    return NextResponse.json({ reply: tone.fun(parts.join(" ")) });
+    const pieces: string[] = [];
+    pieces.push(openPos?.open ? tone.holding(openPos) : tone.flat());
+    if (traded === "No trades in that range.") pieces.push(`No trades ${label}.`);
+    else pieces.push(`Trades ${label}: ${traded}.`);
+    if (tradesInRange.length) pieces.push(`Realized P&L ${label}: ${money(realized)}.`);
+    const draft = tone.fun(pieces.join(" "));
+    return NextResponse.json({ reply: await maybePolishReply(draft, { openPos, traded, realized, label }) });
 
   } catch (e: any) {
     return NextResponse.json({ reply: `Sorry — I couldn’t process that. ${e?.message || "Unknown error."}` }, { status: 200 });
