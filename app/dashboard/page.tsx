@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useLayoutEffect } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useSession } from "next-auth/react";
 import Navbar from "../components/Navbar";
@@ -104,7 +104,8 @@ function GlassPanel({
         </span>
         {right}
       </div>
-      <div className={`flex-1 overflow-auto ${dense ? "p-3" : "px-4 pb-5 pt-2"}`}>{children}</div>
+      {/* IMPORTANT: let child (ChatBox) fill and handle its own scroll */}
+      <div className={`${dense ? "p-3" : "px-4 pb-5 pt-2"} flex-1 min-h-0 overflow-hidden`}>{children}</div>
     </div>
   );
 }
@@ -247,17 +248,7 @@ function ChatBox() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const wrapRef = useRef<HTMLDivElement | null>(null);
-  const [lockedHeight, setLockedHeight] = useState<number | null>(null);
-
   const scrollRef = useRef<HTMLDivElement | null>(null);
-
-  // Lock height to initial rendered height (keeps exact same size, then scrolls)
-  useLayoutEffect(() => {
-    if (!wrapRef.current || lockedHeight != null) return;
-    const h = wrapRef.current.offsetHeight;
-    if (h > 0) setLockedHeight(h);
-  }, [lockedHeight]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -287,15 +278,13 @@ function ChatBox() {
   }
 
   return (
-    <div
-      ref={wrapRef}
-      className="h-full flex flex-col"
-      style={lockedHeight != null ? { height: lockedHeight } : undefined}
-    >
+    // Fill the panel completely
+    <div className="h-full min-h-0 flex flex-col">
+      {/* Messages area fills remaining space, scrolls internally */}
       <div
         ref={scrollRef}
         className="
-          flex-1 overflow-auto rounded-3xl p-4 md:p-5 space-y-3
+          flex-1 min-h-0 overflow-auto rounded-3xl p-4 md:p-5 space-y-3
           bg-white/45 backdrop-blur-2xl ring-1 ring-white/50
           shadow-[0_20px_60px_rgba(0,0,0,0.20)]
         "
@@ -325,6 +314,7 @@ function ChatBox() {
         ))}
       </div>
 
+      {/* Composer */}
       <div className="mt-3 flex items-center gap-2">
         <div className="flex-1 flex items-center gap-2 rounded-2xl pl-4 pr-3 bg-white/95 ring-1 ring-gray-300">
           <input
