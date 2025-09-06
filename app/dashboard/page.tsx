@@ -104,8 +104,8 @@ function GlassPanel({
         </span>
         {right}
       </div>
-      {/* IMPORTANT: let child (ChatBox) fill and handle its own scroll */}
-      <div className={`${dense ? "p-3" : "px-4 pb-5 pt-2"} flex-1 min-h-0 overflow-hidden`}>{children}</div>
+      {/* NOTE: pb-0 + min-h-0 + overflow-hidden lets ChatBox fill this area */}
+      <div className={`${dense ? "p-3" : "px-4 pt-2 pb-0"} flex-1 min-h-0 overflow-hidden`}>{children}</div>
     </div>
   );
 }
@@ -208,7 +208,6 @@ function FloatingNarrator() {
 
   return (
     <div className="w-full flex items-center gap-5 px-1">
-      {/* Bigger, bright green mic */}
       <button
         onClick={toggle}
         aria-label={active ? "Stop Narrator" : "Start Narrator"}
@@ -225,15 +224,7 @@ function FloatingNarrator() {
         </svg>
       </button>
 
-      {/* Large, readable captions */}
-      <div
-        className="
-          max-w-[min(82vw,1100px)]
-          text-white text-[18px] md:text-[20px] leading-7 font-semibold
-          bg-black/35 rounded-xl px-4 py-1.5
-          backdrop-blur-sm select-none
-        "
-      >
+      <div className="max-w-[min(82vw,1100px)] text-white text-[18px] md:text-[20px] leading-7 font-semibold bg-black/35 rounded-xl px-4 py-1.5 backdrop-blur-sm select-none">
         {caption}
       </div>
     </div>
@@ -247,7 +238,6 @@ function ChatBox() {
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -278,9 +268,7 @@ function ChatBox() {
   }
 
   return (
-    // Fill the panel completely
     <div className="h-full min-h-0 flex flex-col">
-      {/* Messages area fills remaining space, scrolls internally */}
       <div
         ref={scrollRef}
         className="
@@ -314,7 +302,6 @@ function ChatBox() {
         ))}
       </div>
 
-      {/* Composer */}
       <div className="mt-3 flex items-center gap-2">
         <div className="flex-1 flex items-center gap-2 rounded-2xl pl-4 pr-3 bg-white/95 ring-1 ring-gray-300">
           <input
@@ -746,15 +733,14 @@ export default function Home() {
       <Navbar />
 
       <div className="flex-1 px-4 pt-20 pb-6">
-        {/* Floating narrator ABOVE everything, with generous space below */}
         <div className="mb-10 md:mb-14">
           <FloatingNarrator />
         </div>
 
-        {/* === TOP-LEVEL GRID: 3 columns, no row spanning === */}
-        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1">
+        {/* Make grid items stretch; left cell gets h-full so panel can fill */}
+        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1 items-stretch">
           {/* LEFT: AI Chat */}
-          <div>
+          <div className="h-full">
             <GlassPanel title="AI Chat" color="cyan" dense>
               <ChatBox />
             </GlassPanel>
@@ -775,7 +761,6 @@ export default function Home() {
 
           {/* RIGHT: NESTED GRID => Chart on top, AI Rec + Bot Status directly under it */}
           <div className="grid gap-5">
-            {/* Chart */}
             <div className="relative">
               <TradeChartPanel height={720} />
               <div className="absolute right-4 top-3 z-10">
@@ -783,7 +768,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Bottom pair (NO GAP issue anymore) */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch">
               <AIRecommendation
                 botData={botData}
@@ -798,13 +782,11 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Trade Log below grid */}
         <div className="mt-5 w-full xl:max-w-[960px] xl:ml-auto">
           <TradeLog tradeData={tradeData} slim />
         </div>
       </div>
 
-      {/* Chart modal */}
       {chartVisible && selectedStock && (
         <div
           className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
