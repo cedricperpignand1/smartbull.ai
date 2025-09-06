@@ -55,6 +55,12 @@ function isMarketHoursET(nowUTC = new Date()) {
   // 9:30–16:00 ET
   return mins >= 9 * 60 + 30 && mins <= 16 * 60;
 }
+/** Before/at 4:00pm ET for *today* */
+function isBeforeETClose(nowUTC = new Date()) {
+  const et = toET(nowUTC);
+  const mins = et.getHours() * 60 + et.getMinutes();
+  return mins <= 16 * 60;
+}
 
 /** Cumulative session VWAP (from 9:30 ET forward) */
 function computeSessionVWAP(candles: Candle[], dayYMD: string) {
@@ -115,26 +121,8 @@ function useOpenPosition(pollMsWhileOpen = 20000) {
   return pos;
 }
 
-/** Last traded symbol (when flat). */
-function useLastTradedSymbol() {
-  const [sym, setSym] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const j = await fetchJSON<{ ticker: string | null }>("/api/trades/last");
-        if (alive) setSym(j?.ticker ?? null);
-      } catch {}
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
-  return sym;
-}
-
 /** Today’s trades for a symbol (for exit markers/avg). */
-function useTodayTrades(symbol: string | null, pollMsWhenOpen = 30000) {
+function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
   const visible = useVisibility();
   const [rows, setRows] = useState<TradeWire[] | null>(null);
 
@@ -157,15 +145,15 @@ function useTodayTrades(symbol: string | null, pollMsWhenOpen = 30000) {
     if (!symbol) return;
     if (!visible) return;
     if (!isMarketHoursET()) return;
-    const id = setInterval(load, pollMsWhenOpen);
+    const id = setInterval(load, pollMsWhenActive);
     return () => clearInterval(id);
-  }, [symbol, visible, pollMsWhenOpen]);
+  }, [symbol, visible, pollMsWhenActive]);
 
   return rows;
 }
 
-/** 1m candles: open position → poll fast; flat → poll slowly (only in hours); both pause when hidden. */
-function useCandles1m(symbol: string | null, hasOpen: boolean, pollMsOpen = 30000, pollMsFlat = 120000, limit = 240) {
+/** 1m candles: poll fast when “active” (open or sticky), slow when not; pause when hidden/outside hours. */
+function useCandles1m(symbol: string | null, isActiveFast: boolean, pollMsFast = 30000, pollMsSlow = 120000, limit = 240) {
   const visible = useVisibility();
   const [candles, setCandles] = useState<Candle[] | null>(null);
 
@@ -193,10 +181,10 @@ function useCandles1m(symbol: string | null, hasOpen: boolean, pollMsOpen = 3000
     if (!visible) return;
     if (!isMarketHoursET()) return;
 
-    const ms = hasOpen ? pollMsOpen : pollMsFlat;
+    const ms = isActiveFast ? pollMsFast : pollMsSlow;
     const id = setInterval(load, ms);
     return () => clearInterval(id);
-  }, [symbol, hasOpen, visible, pollMsOpen, pollMsFlat]);
+  }, [symbol, isActiveFast, visible, pollMsFast, pollMsSlow]);
 
   return { candles };
 }
@@ -204,20 +192,71 @@ function useCandles1m(symbol: string | null, hasOpen: boolean, pollMsOpen = 3000
 /* ───────────────── Main component ───────────────── */
 export default function TradeChartPanel({
   height = 360,
-  symbolWhenFlat, // optional override to show a watchlist symbol when flat
+  symbolWhenFlat, // optional fallback when there's never been an entry today
 }: {
   height?: number;
   symbolWhenFlat?: string;
 }) {
   const pos = useOpenPosition(20000);
-  const lastSymbol = useLastTradedSymbol();
 
-  // which symbol to display
+  // ── Sticky-until-close state (persists for the day in sessionStorage)
+  const dayYMD = useMemo(() => yyyyMmDdET(new Date()), []);
+  const [stickySymbol, setStickySymbol] = useState<string | null>(null);
+  const [stickyDay, setStickyDay] = useState<string | null>(null);
+
+  // restore sticky from this tab’s session, if same ET day & before close
+  useEffect(() => {
+    try {
+      const s = sessionStorage.getItem("chartSticky");
+      if (s) {
+        const obj = JSON.parse(s);
+        if (obj?.symbol && obj?.day === dayYMD && isBeforeETClose()) {
+          setStickySymbol(obj.symbol);
+          setStickyDay(obj.day);
+        }
+      }
+    } catch {}
+  }, [dayYMD]);
+
+  // when we FIRST observe an open position today, start sticky until 16:00 ET
   const hasOpen = !!pos?.open && !!pos?.ticker;
-  const symbol: string | null = hasOpen ? (pos!.ticker as string) : (symbolWhenFlat ?? lastSymbol ?? null);
+  useEffect(() => {
+    if (!hasOpen) return;
+    const t = String(pos!.ticker);
+    setStickySymbol(t);
+    setStickyDay(dayYMD);
+    try {
+      sessionStorage.setItem("chartSticky", JSON.stringify({ symbol: t, day: dayYMD }));
+    } catch {}
+  }, [hasOpen, pos?.ticker, dayYMD]);
+
+  // after 4:00pm ET, drop sticky and clean storage
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!isBeforeETClose() && stickySymbol) {
+        setStickySymbol(null);
+        setStickyDay(null);
+        try { sessionStorage.removeItem("chartSticky"); } catch {}
+      }
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [stickySymbol]);
+
+  // which symbol to display:
+  //  - if open → current position
+  //  - else if sticky for today & before 4pm → that ticker
+  //  - else, optional fallback (symbolWhenFlat), otherwise empty (placeholder)
+  const stickyActive = !!stickySymbol && stickyDay === dayYMD && isBeforeETClose();
+  const symbol: string | null = hasOpen
+    ? (pos!.ticker as string)
+    : stickyActive
+    ? stickySymbol
+    : symbolWhenFlat
+    ? symbolWhenFlat
+    : null;
 
   // data
-  const { candles } = useCandles1m(symbol, hasOpen, 30000, 120000, 240);
+  const { candles } = useCandles1m(symbol, hasOpen || stickyActive, 30000, 120000, 240);
   const todayTrades = useTodayTrades(symbol, 30000);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -226,8 +265,6 @@ export default function TradeChartPanel({
   const vwapSeriesRef = useRef<any>(null);
   const priceLinesRef = useRef<any[]>([]);
   const [hover, setHover] = useState<{ price?: number; o?: number; h?: number; l?: number; c?: number; vwap?: number } | null>(null);
-
-  const dayYMD = useMemo(() => yyyyMmDdET(new Date()), []);
 
   // Create chart (compat shim v4/v5)
   useEffect(() => {
@@ -316,7 +353,7 @@ export default function TradeChartPanel({
     const chart = chartRef.current;
     if (!cs || !vs || !chart) return;
 
-    // clear all price lines each update (we rebuild below)
+    // clear old price lines
     for (const pl of priceLinesRef.current) { try { cs.removePriceLine(pl); } catch {} }
     priceLinesRef.current = [];
 
@@ -336,16 +373,16 @@ export default function TradeChartPanel({
     }));
     cs.setData(seriesData);
 
-    const vwap = computeSessionVWAP(candles, dayYMD);
+    const vwap = computeSessionVWAP(candles, yyyyMmDdET(new Date()));
     vs.setData(vwap);
 
     chart.timeScale().fitContent();
 
-    // Entry/SL/TP lines & marker
-    const entryPrice = pos?.entryPrice ?? null;
-    const stopLoss = pos?.stopLoss ?? null;
-    const takeProfit = pos?.takeProfit ?? null;
-    const entryAt = pos?.entryAt ? toSec(pos.entryAt) : null;
+    // Entry/SL/TP lines & marker (only while actually open)
+    const entryPrice = hasOpen ? (pos?.entryPrice ?? null) : null;
+    const stopLoss = hasOpen ? (pos?.stopLoss ?? null) : null;
+    const takeProfit = hasOpen ? (pos?.takeProfit ?? null) : null;
+    const entryAt = hasOpen && pos?.entryAt ? toSec(pos.entryAt) : null;
 
     let markerTime = entryAt;
     if (entryAt && seriesData.length) {
@@ -405,11 +442,11 @@ export default function TradeChartPanel({
     }
 
     cs.setMarkers(markers);
-  }, [candles, dayYMD, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.entryAt, todayTrades]);
+  }, [candles, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.entryAt, todayTrades, hasOpen]);
 
-  // compute R:R in legend from hover price (assume long)
+  // compute R:R in legend from hover price (assume long) – only meaningful while open
   const rr = useMemo(() => {
-    if (!pos?.entryPrice || !pos?.stopLoss) return null;
+    if (!hasOpen || !pos?.entryPrice || !pos?.stopLoss) return null;
     const risk = Math.abs(pos.entryPrice - pos.stopLoss);
     if (risk <= 0) return null;
     const p = hover?.price ?? undefined;
@@ -418,9 +455,9 @@ export default function TradeChartPanel({
     const rToStop = (p - pos.stopLoss) / risk;
     const rToTP = tp != null ? (tp - p) / risk : undefined;
     return { rToStop, rToTP };
-  }, [hover?.price, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit]);
+  }, [hover?.price, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, hasOpen]);
 
-  const showChart = !!symbol; // show when we have a symbol (open or flat+override/last)
+  const showChart = !!symbol; // show when we have a symbol (open OR sticky OR fallback)
   const headerLeft = showChart ? `${symbol} • 1-min • VWAP` : "1-min Chart";
 
   return (
@@ -444,6 +481,8 @@ export default function TradeChartPanel({
                 </>
               )}
             </div>
+          ) : stickyActive ? (
+            <div className="text-xs text-slate-400 italic">Position closed — showing last chart until 4:00 PM ET.</div>
           ) : null}
         </div>
 
