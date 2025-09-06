@@ -1,10 +1,17 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { useSession } from "next-auth/react";
 import Navbar from "../components/Navbar";
 import { Button } from "../components/ui/button";
 import { useBotPoll } from "../components/useBotPoll";
+
+// lazy chart (no SSR)
+const TradeChartPanel = dynamic<{ height?: number; symbolWhenFlat?: string }>(
+  () => import("../components/TradeChartPanel"),
+  { ssr: false }
+);
 
 /* =========================================================
    Simple ET time + market open checker
@@ -272,7 +279,7 @@ function ymdET(d: Date) {
 }
 
 /* =========================================================
-   Panic Sell button (asks passkey 9340; shows real server errors)
+   Panic Sell button
    ========================================================= */
 function PanicSellButton({ disabled }: { disabled: boolean }) {
   const [open, setOpen] = useState(false);
@@ -296,7 +303,6 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
         body: JSON.stringify({ key: key.trim() }),
       });
 
-      // surface detailed errors from server/Alpaca
       let data: any = {};
       try { data = await res.json(); } catch {}
 
@@ -378,7 +384,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
             </div>
 
             <div className="mt-3 text-xs text-slate-500">
-              Hint: passkey is <span className="font-semibold">{PASSKEY}</span>
+              Hint: passkey is <span className="font-semibold">9340</span>
             </div>
           </div>
         </div>
@@ -543,7 +549,7 @@ export default function Home() {
     }
   };
 
-  // Chart helpers
+  // Chart helpers (modal kept intact)
   const handleStockClick = (ticker: string) => {
     setSelectedStock(ticker);
     setChartVisible(true);
@@ -633,6 +639,9 @@ export default function Home() {
     return n;
   }, [statusTradesToday, tradeData]);
 
+  // open pos for PANIC button
+  const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
+
   /* ====== Layout ====== */
   return (
     <main
@@ -653,7 +662,7 @@ export default function Home() {
           className="
             grid gap-5
             xl:grid-cols-[460px_minmax(720px,1fr)_960px]
-            xl:grid-rows-[minmax(520px,1fr)_minmax(240px,320px)]
+            xl:grid-rows-[auto_auto]
             lg:grid-cols-1
           "
         >
@@ -677,13 +686,16 @@ export default function Home() {
             />
           </div>
 
-          {/* Trade Log (with PANIC SELL) */}
-          <div>
-            <TradeLog tradeData={tradeData} />
+          {/* Chart (replaces old Trade Log spot) + PANIC button in header area */}
+          <div className="relative">
+            <TradeChartPanel height={680} />
+            <div className="absolute right-4 top-3 z-10">
+              <PanicSellButton disabled={!hasOpenPos} />
+            </div>
           </div>
 
-          {/* AI Rec + Bot Status */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+          {/* AI Rec + Bot Status (second row, right column) */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 xl:min-h-[460px] items-stretch">
             <AIRecommendation
               botData={botData}
               alpaca={alpaca}
@@ -695,6 +707,12 @@ export default function Home() {
             <BotStatus statusError={statusError} statusTick={statusTick} todayTradeCount={todayTradeCount} />
           </div>
         </div>
+
+        {/* Trade Log moved BELOW the grid (not inline) */}
+        <div className="mt-5 w-full xl:max-w-[960px] xl:ml-auto">
+  <TradeLog tradeData={tradeData} slim />
+</div>
+
       </div>
 
       {/* Chart modal */}
@@ -851,24 +869,18 @@ function TopGainers({
   );
 }
 
-function TradeLog({ tradeData }: { tradeData: TradePayload | null }) {
-  const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
-
+function TradeLog({ tradeData, slim = false }: { tradeData: TradePayload | null; slim?: boolean }) {
   return (
     <Panel
       title="Trade Log"
       color="orange"
       dense
-      right={
-        <div className="flex items-center gap-2">
-          <PanicSellButton disabled={!hasOpenPos} />
-        </div>
-      }
+      /* Panic button moved to chart header */
     >
       {!tradeData?.trades?.length ? (
         <p className="text-gray-500 text-sm">No trades yet.</p>
       ) : (
-        <div className="h-full overflow-auto">
+        <div className={slim ? "overflow-auto max-h-56" : "h-full overflow-auto"}>
           <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
             <thead>
               <tr className="bg-black text-white">
