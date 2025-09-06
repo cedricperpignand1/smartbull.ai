@@ -158,7 +158,9 @@ function FloatingNarrator() {
 
   const start = async () => {
     if (controllerRef.current) return;
-    try { window.speechSynthesis?.getVoices(); } catch {}
+    try {
+      window.speechSynthesis?.getVoices();
+    } catch {}
 
     const ac = new AbortController();
     controllerRef.current = ac;
@@ -225,7 +227,7 @@ function FloatingNarrator() {
       {/* Large, readable captions */}
       <div
         className="
-          max-w=[min(82vw,1100px)]
+          max-w-[min(82vw,1100px)]
           text-white text-[18px] md:text-[20px] leading-7 font-semibold
           bg-black/35 rounded-xl px-4 py-1.5
           backdrop-blur-sm select-none
@@ -245,20 +247,17 @@ function ChatBox() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // NEW: lock the chat box height to its initial rendered height
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [lockedHeight, setLockedHeight] = useState<number | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // measure once, right after mount, to keep the original size
+  // Lock height to initial rendered height (keeps exact same size, then scrolls)
   useLayoutEffect(() => {
-    if (wrapRef.current && lockedHeight == null) {
-      const h = wrapRef.current.offsetHeight;
-      if (h > 0) setLockedHeight(h);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!wrapRef.current || lockedHeight != null) return;
+    const h = wrapRef.current.offsetHeight;
+    if (h > 0) setLockedHeight(h);
+  }, [lockedHeight]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -290,13 +289,13 @@ function ChatBox() {
   return (
     <div
       ref={wrapRef}
-      className="flex flex-col"
+      className="h-full flex flex-col"
       style={lockedHeight != null ? { height: lockedHeight } : undefined}
     >
       <div
         ref={scrollRef}
         className="
-          flex-1 min-h-0 overflow-y-auto rounded-3xl p-4 md:p-5 space-y-3
+          flex-1 overflow-auto rounded-3xl p-4 md:p-5 space-y-3
           bg-white/45 backdrop-blur-2xl ring-1 ring-white/50
           shadow-[0_20px_60px_rgba(0,0,0,0.20)]
         "
@@ -450,7 +449,9 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
       });
 
       let data: any = {};
-      try { data = await res.json(); } catch {}
+      try {
+        data = await res.json();
+      } catch {}
 
       if (!res.ok || !(data?.ok ?? false)) {
         const reason =
