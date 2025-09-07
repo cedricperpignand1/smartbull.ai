@@ -132,7 +132,7 @@ function inWindow930to945ET() {
 }
 
 /* -------------------------- buy-the-dip -------------------------- */
-const DIP_MIN_PCT = 0.08;
+const DIP_MIN_PCT = 0.07;
 const DIP_MAX_PCT = 0.20;
 const DIP_CONFIRM_EITHER = true;
 

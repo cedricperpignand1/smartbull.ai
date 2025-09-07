@@ -1008,7 +1008,12 @@ function AIRecommendation({
         {analyzing ? "Analyzing..." : "Ask AI"}
       </Button>
 
-      {recommendation && <div className="mt-3 text-sm whitespace-pre-wrap">{recommendation}</div>}
+      {recommendation && (
+  <div className="mt-3 text-sm whitespace-pre-wrap max-h-48 overflow-y-auto pr-2">
+    {recommendation}
+  </div>
+)}
+
       <div className="mt-2 text-xs text-gray-500">
         Server ET: {botData?.serverTimeET ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "…"}
       </div>
