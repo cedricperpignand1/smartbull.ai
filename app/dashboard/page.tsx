@@ -31,6 +31,13 @@ function isMarketOpenET(d = nowET()): boolean {
   const beforeClose = h < 16;
   return afterOpen && beforeClose;
 }
+// >>> NEW: narrator time window (weekdays, 9:30–9:45 ET)
+function inNarrationWindowET(d = nowET()): boolean {
+  const day = d.getDay();
+  if (day === 0 || day === 6) return false; // Sun/Sat
+  const mins = d.getHours() * 60 + d.getMinutes();
+  return mins >= 9 * 60 + 30 && mins < 9 * 60 + 45; // [09:30, 09:45)
+}
 
 /* =========================================================
    OPAQUE Panel
@@ -162,7 +169,9 @@ function FloatingNarrator() {
 
   const start = async () => {
     if (controllerRef.current) return;
-    try { window.speechSynthesis?.getVoices(); } catch {}
+    try {
+      window.speechSynthesis?.getVoices();
+    } catch {}
 
     const ac = new AbortController();
     controllerRef.current = ac;
@@ -206,6 +215,38 @@ function FloatingNarrator() {
 
   const toggle = () => (isActive() ? stopAll() : start());
   const active = isActive();
+
+  // >>> NEW: auto-start/stop window (9:30–9:45 ET on weekdays) + visibility guard
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const tick = () => {
+      const visible = document.visibilityState === "visible";
+      const inWin = inNarrationWindowET();
+
+      // Start when we enter the 9:30–9:45 ET window (and tab is visible)
+      if (inWin && visible && !isActive()) {
+        start();
+      }
+
+      // Stop when we leave the window or tab becomes hidden
+      if ((!inWin || !visible) && isActive()) {
+        stopAll();
+      }
+    };
+
+    // Run once on mount in case we're already inside the window
+    tick();
+
+    const id = setInterval(tick, 5000); // check every 5s
+    const onVis = () => tick();
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   return (
     <div className="w-full flex items-center gap-5 px-1">
@@ -429,7 +470,9 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
       });
 
       let data: any = {};
-      try { data = await res.json(); } catch {}
+      try {
+        data = await res.json();
+      } catch {}
 
       if (!res.ok || !(data?.ok ?? false)) {
         const reason =
@@ -823,7 +866,8 @@ function TopGainers({
       right={
         <div className="flex items-center gap-2">
           <span className="px-2 py-1 rounded-md text-xs font-semibold bg-gray-900 text-white/90">
-            {dataSource || "FMP (stream)"}
+            {dataSource || "FMP (stream)"
+            }
           </span>
           <Button
             onClick={onAskAI}
@@ -1009,10 +1053,10 @@ function AIRecommendation({
       </Button>
 
       {recommendation && (
-  <div className="mt-3 text-sm whitespace-pre-wrap max-h-48 overflow-y-auto pr-2">
-    {recommendation}
-  </div>
-)}
+        <div className="mt-3 text-sm whitespace-pre-wrap max-h-48 overflow-y-auto pr-2">
+          {recommendation}
+        </div>
+      )}
 
       <div className="mt-2 text-xs text-gray-500">
         Server ET: {botData?.serverTimeET ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "…"}
