@@ -17,7 +17,9 @@ const TradeChartPanel = dynamic<{ height?: number; symbolWhenFlat?: string }>(
 );
 
 // TradingView chart (for the modal on Top Gainers click)
-const TradingViewChart = dynamic(() => import("../components/TradingViewChart"), {
+const TradingViewChart = dynamic<
+  { symbol: string; height?: number; theme?: "light" | "dark"; interval?: "1" | "3" | "5" | "15" | "30" | "60" | "120" | "240" | "D"; timezone?: string }
+>(() => import("../components/TradingViewChart").then((m) => m.default), {
   ssr: false,
 });
 
@@ -475,7 +477,10 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
 
       if (!res.ok || !(data?.ok ?? false)) {
         const reason =
-          data?.error || data?.message || (typeof data === "string" ? data : "") || `HTTP ${res.status}`;
+          data?.error ||
+          data?.message ||
+          (typeof data === "string" ? data : "") ||
+          `HTTP ${res.status}`;
         setMsg(`Panic sell failed: ${reason}`);
         return;
       }
@@ -594,6 +599,7 @@ export default function Home() {
   const [recommendation, setRecommendation] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
 
+  // Modal (TradingView) state — used only for the modal
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const [chartVisible, setChartVisible] = useState(false);
   const [agentResult, setAgentResult] = useState<string | null>(null);
@@ -710,7 +716,11 @@ export default function Home() {
     }
   };
 
-  // Chart modal helpers
+  /* ===========================
+     Chart behaviors (DECOUPLED)
+     =========================== */
+
+  // Clicking a top gainer only controls the TradingView modal
   const handleStockClick = (ticker: string) => {
     setSelectedStock(ticker);
     setChartVisible(true);
@@ -721,6 +731,14 @@ export default function Home() {
     setSelectedStock(null);
     setAgentResult(null);
   };
+
+  // The positions chart should reflect ONLY an actual open position.
+  // If there is an open position, show that ticker; otherwise undefined.
+  const posChartSymbol = useMemo(
+    () => (tradeData?.openPos?.ticker ? String(tradeData.openPos.ticker).toUpperCase() : undefined),
+    [tradeData?.openPos?.ticker]
+  );
+
   const handleAgent = async () => {
     try {
       const res = await fetch("/api/chart-analyze", {
@@ -742,7 +760,8 @@ export default function Home() {
 
   // today's trades count
   const todayTradeCount = useMemo(() => {
-    if (Array.isArray(statusTradesToday)) return statusTradesToday.length;
+    const fromStatus = Array.isArray(statusTradesToday) ? statusTradesToday.length : null;
+    if (fromStatus != null) return fromStatus;
     const all = tradeData?.trades || [];
     if (!all.length) return 0;
     const todayKey = ymdET(new Date());
@@ -801,8 +820,8 @@ export default function Home() {
           {/* RIGHT: Positions chart (TradeChartPanel) + status cards */}
           <div className="grid gap-5">
             <div className="relative">
-              {/* Feed selected symbol (optional) to show same on positions panel */}
-              <TradeChartPanel height={720} symbolWhenFlat={selectedStock ?? undefined} />
+              {/* IMPORTANT: decoupled from Top Gainers clicks */}
+              <TradeChartPanel height={720} symbolWhenFlat={posChartSymbol} />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
               </div>
@@ -847,8 +866,7 @@ export default function Home() {
             </div>
 
             <div className="h-[680px]">
-              {/* Force remount on ticker; TradingViewChart handles size & symbol prefix */}
-              <TradingViewChart key={selectedStock} symbol={selectedStock} />
+              <TradingViewChart key={selectedStock} symbol={selectedStock} height={680} />
             </div>
 
             <div className="px-4 py-3 border-t bg-slate-50 flex items-center gap-3">
