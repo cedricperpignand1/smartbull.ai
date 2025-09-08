@@ -19,7 +19,7 @@ import {
 } from "@/lib/alpaca";
 
 // ✅ Cached FMP helpers
-import { fmpQuoteCached } from "../../../../lib/fmpCached";
+import { fmpQuoteCached } from "../../../../lib/fmpCached"
 
 /* -------------------------- small helpers -------------------------- */
 type SnapStock = {
@@ -95,9 +95,14 @@ const PRICE_MAX = 70;
 const FRESHNESS_MS = 30_000;
 const REQUIRE_AI_PICK = true;
 
-const MIN_SHARES_ABS = 8_000;
-const FLOAT_MIN_PCT_PER_MIN = 0.0025;
-const MIN_DOLLAR_VOL = 200_000;
+/* ====================== RELAXED LIQUIDITY: tuned for low-floats ====================== */
+// Lower absolute floor so cheap/low-float names can pass
+const MIN_SHARES_ABS = 3_000;
+// Lower per-minute float requirement to 0.10% of float
+const FLOAT_MIN_PCT_PER_MIN = 0.001;
+// Lower dollar-volume floor so sub-$10 names can qualify realistically
+const MIN_DOLLAR_VOL = 75_000;
+/* ===================================================================================== */
 
 /* -------------------------- time windows -------------------------- */
 function inPreScanWindow() {
@@ -404,25 +409,75 @@ async function fetchFloatShares(
   }
   return null;
 }
-function passesBalancedLiquidityGuard(lastClose: number, lastVolume: number, floatShares: number | null) {
-  const dollarVol = lastClose * lastVolume;
+
+/* ====================== RELAXED LIQUIDITY CHECK (new helpers) ====================== */
+function lastNBarsOfDay(candles: Candle[], todayYMD: string, n: number): Candle[] {
+  const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
+  if (!day.length) return [];
+  return day.slice(-n);
+}
+function sumVolAndDollars(bars: Candle[], priceHint?: number | null) {
+  let vol = 0;
+  let dollars = 0;
+  for (const b of bars) {
+    vol += Number(b.volume) || 0;
+    const px = Number.isFinite(Number(b.close)) ? Number(b.close) : Number(priceHint ?? 0);
+    if (px > 0) dollars += (Number(b.volume) || 0) * px;
+  }
+  return { vol, dollars };
+}
+/**
+ * New relaxed liquidity:
+ * - Gate A (1-min): shares >= minSharesReq AND dollarVol >= MIN_DOLLAR_VOL
+ * - Gate B (3-min rolling): shares >= 2*minSharesReq AND dollars >= 2*MIN_DOLLAR_VOL
+ * - Gate C (momentum assist): volPulse >= VOL_MULT_MIN (same as momentum gate)
+ * Pass if at least **2 of the 3** are true.
+ */
+function passesRelaxedLiquidity(
+  todayYMD: string,
+  candles: Candle[],
+  lastClose: number,
+  floatShares: number | null,
+  volPulseMult: number | null,
+  volPulseMin: number
+) {
+  // compute minShares requirement from float or absolute floor
   let minSharesReq = MIN_SHARES_ABS;
   if (Number.isFinite(Number(floatShares)) && floatShares! > 0) {
     const byFloat = Math.floor(floatShares! * FLOAT_MIN_PCT_PER_MIN);
     minSharesReq = Math.max(MIN_SHARES_ABS, byFloat);
   } else {
-    minSharesReq = 10_000;
+    minSharesReq = Math.max(3_000, MIN_SHARES_ABS);
   }
-  const sharesOK = lastVolume >= minSharesReq;
-  const dollarsOK = dollarVol >= MIN_DOLLAR_VOL;
-  return { ok: sharesOK && dollarsOK, minSharesReq, dollarVol };
+
+  const last1 = lastNBarsOfDay(candles, todayYMD, 1);
+  const last3 = lastNBarsOfDay(candles, todayYMD, 3);
+
+  const one = sumVolAndDollars(last1, lastClose);
+  const three = sumVolAndDollars(last3, lastClose);
+
+  const gateA = (one.vol >= minSharesReq) && (one.dollars >= MIN_DOLLAR_VOL);
+  const gateB = (three.vol >= (2 * minSharesReq)) && (three.dollars >= (2 * MIN_DOLLAR_VOL));
+  const gateC = (volPulseMult ?? 0) >= volPulseMin;
+
+  const trueCount = [gateA, gateB, gateC].filter(Boolean).length;
+  return {
+    ok: trueCount >= 2,
+    details: {
+      minSharesReq,
+      last1: { shares: one.vol, dollars: Math.round(one.dollars) },
+      last3: { shares: three.vol, dollars: Math.round(three.dollars) },
+      gates: { gateA, gateB, gateC, trueCount },
+    }
+  };
 }
+/* =================================================================================== */
 
 /* >>>>>>>>>>>>>>> REPLACED: dynamic spread function <<<<<<<<<<<<<<< */
 function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
-  // Hard rule: from 09:30:00 to 09:45:59 ET, always allow up to 0.70%
+  // Hard rule: from 09:30:00 to 09:45:59 ET, allow up to 1% to reduce misses at the open
   if (inWindow930to945ET()) {
-    return 0.007; // 0.70%
+    return 0.01; // 1%
   }
 
   // --- Original behavior outside that window ---
@@ -439,7 +494,6 @@ function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" |
 
   const p = Number(price);
   if (Number.isFinite(p)) {
-    // Keeping these caps as they were (they don't tighten current bases)
     if (p < 2) base = Math.min(base, 0.012);
     else if (p < 5) base = Math.min(base, 0.008);
   }
@@ -505,34 +559,52 @@ async function evaluateEntrySignals(
     snapshot,
     baseUrl
   );
-  const liq = passesBalancedLiquidityGuard(last.close, Number(last.volume ?? 0), floatShares);
-  dbg.liquidity = { float: floatShares ?? null, lastVol: Number(last.volume ?? 0), lastClose: last.close, dollarVol: Math.round(liq.dollarVol), minSharesReq: liq.minSharesReq, ok: liq.ok };
-  if (!liq.ok) {
-    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "liquidity" }, debug: dbg };
-  }
 
+  // Momentum baseline for the “gate C” part of liquidity
   const m = minutesSince930ET();
   const t = clamp01((m - DECAY_START_MIN) / (DECAY_END_MIN - DECAY_START_MIN));
   const VOL_MULT_MIN = lerp(VOL_MULT_START, VOL_MULT_END, t);
-  const NEAR_OR_PCT = lerp(NEAR_OR_START, NEAR_OR_END, t);
-  const VWAP_RECLAIM_BAND = lerp(VWAP_BAND_START, VWAP_BAND_END, t);
+
+  const vwap = computeSessionVWAP(candles, today);
+  const volPulse = computeVolumePulse(candles, today, 5);
+
+  // ===== RELAXED LIQUIDITY (2-of-3 rule with 1-min, 3-min, volPulse) =====
+  const liq = passesRelaxedLiquidity(
+    today,
+    candles,
+    last.close,
+    floatShares,
+    volPulse?.mult ?? null,
+    VOL_MULT_MIN
+  );
+  dbg.liquidity = {
+    relaxed: true,
+    float: floatShares ?? null,
+    lastClose: last.close,
+    details: liq.details,
+    ok: liq.ok
+  };
+  if (!liq.ok) {
+    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "liquidity" }, debug: dbg };
+  }
+  // =======================================================================
 
   const orRange = computeOpeningRange(candles, today);
-  const vwap = computeSessionVWAP(candles, today);
-  const vol = computeVolumePulse(candles, today, 5);
 
   const aboveVWAP = vwap != null && last ? last.close >= vwap : false;
   const breakORH = !!(orRange && last && last.close > orRange.high);
+  const NEAR_OR_PCT = lerp(NEAR_OR_START, NEAR_OR_END, t);
+  const VWAP_RECLAIM_BAND = lerp(VWAP_BAND_START, VWAP_BAND_END, t);
   const nearOR = !!(orRange && last && last.close >= orRange.high * (1 - NEAR_OR_PCT));
   const vwapRecl = !!(vwap != null && last && last.close >= vwap && last.low >= vwap * (1 - VWAP_RECLAIM_BAND));
-  const volOK = (vol?.mult ?? 0) >= VOL_MULT_MIN;
+  const volOK = (volPulse?.mult ?? 0) >= VOL_MULT_MIN;
 
   const signals: Record<string, boolean> = { volPulseOK: volOK, breakORH, nearOR, vwapReclaim: vwapRecl };
   const signalCount = Object.values(signals).filter(Boolean).length;
   const armedMomentum = !!(aboveVWAP && signalCount >= 2);
 
   const dip = dipArmedNow({ candles, todayYMD: today, vwap: vwap ?? null });
-  dbg.signals = { aboveVWAP, volPulse: vol?.mult ?? null, VOL_MULT_MIN, breakORH, nearOR, NEAR_OR_PCT, vwapReclaim: vwapRecl, VWAP_RECLAIM_BAND, signalCount, mSince930: m, armedMomentum, armedDip: dip.armed };
+  dbg.signals = { aboveVWAP, volPulse: volPulse?.mult ?? null, VOL_MULT_MIN, breakORH, nearOR, NEAR_OR_PCT, vwapReclaim: vwapRecl, VWAP_RECLAIM_BAND, signalCount, mSince930: m, armedMomentum, armedDip: dip.armed };
   dbg.dipMeta = dip.meta;
 
   const eligible = true;

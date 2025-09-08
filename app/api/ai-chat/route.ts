@@ -223,6 +223,7 @@ type Intent =
   | "sell_price"
   | "entry_price"
   | "status"
+  | "why_no_trade" // ← NEW
   | "help";
 
 // More robust, order-agnostic P&L detection
@@ -237,6 +238,10 @@ function isPnlIntent(m: string) {
   );
 }
 
+function isWhyNoTradeIntent(m: string) {
+  return /(why|how).*(no\s*trade|didn'?t\s*(trade|get in|enter)|miss(ed)?\s*(a\s*)?trade|didn'?t\s*get\s*filled|no\s*entry)/i.test(m);
+}
+
 function parseIntent(q: string): Intent {
   const m = q.toLowerCase();
 
@@ -246,6 +251,8 @@ function parseIntent(q: string): Intent {
   if ((/\b(buy|bought|enter|entered|entry|get in|got in|added|add)\b/.test(m) &&
        /\b(price|avg|average|cost|fill|fills?)\b/.test(m)) ||
       /\b(average cost|avg cost|avg entry|average entry)\b/.test(m)) return "entry_price";
+
+  if (isWhyNoTradeIntent(q)) return "why_no_trade"; // ← NEW
 
   if (/(why).*(trade|traded|buy|bought|sell|sold|enter|entry|took|take|long|short)/.test(m)) return "why_trade";
 
@@ -314,6 +321,17 @@ function getBaseUrl(req: Request) {
   const proto = (req.headers.get("x-forwarded-proto") || "http").split(",")[0].trim();
   const host = (req.headers.get("x-forwarded-host") || req.headers.get("host") || "").split(",")[0].trim();
   return `${proto}://${host}`;
+}
+
+// NEW: fetch current bot tick (to read debug/info for explanations)
+async function fetchBotTick(base: string): Promise<any | null> {
+  try {
+    const r = await fetch(`${base}/api/bot/tick`, { cache: "no-store" });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
 }
 
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
@@ -531,6 +549,71 @@ async function answerStockQuestionWithLLM(userQuestion: string, facts: any) {
   return await safeChat([{ role: "system", content: system }, { role: "user", content: user }]);
 }
 
+/* ───────────────── NEW: “why didn't we trade today?” explainer ───────────────── */
+function humanizeNoTradeReasons(tick: any): string {
+  if (!tick) return "I couldn't fetch the bot’s latest status.";
+  const parts: string[] = [];
+
+  // Market/weekday guard
+  if (tick.skipped === "not_weekday") parts.push("Market was closed (not a weekday).");
+
+  const dbg = tick.debug || {};
+  const reasons: string[] = Array.isArray(dbg.reasons) ? dbg.reasons : [];
+  const info = tick.info || {};
+  const liq = info.liquidity || {};
+
+  // High-level reasons
+  if (reasons.includes("scan_no_ai_pick_yet")) parts.push("No AI pick was available during the scan window.");
+  if (reasons.includes("scan_no_armed_signal_after_eval")) parts.push("Signals didn’t arm (no momentum/dip confirmation).");
+  if (reasons.some((r) => r.startsWith("force_spread_guard_fail_"))) parts.push("Spread guard blocked entries in the force window.");
+
+  // Detailed per-symbol evals if present
+  const evals = dbg.scan_evals || {};
+  const perTickers: string[] = [];
+  for (const sym of Object.keys(evals)) {
+    const ev = evals[sym] || {};
+    const why: string[] = [];
+    if (ev?.debug?.spread && ev?.debug?.spread.spreadOK === false) {
+      const lim = ev.debug.spread.limitPct != null ? `${(ev.debug.spread.limitPct * 100).toFixed(2)}%` : "limit";
+      why.push(`spread too wide (limit ${lim})`);
+    }
+    if (ev?.debug?.liquidity && ev?.debug?.liquidity.ok === false) {
+      const det = ev.debug.liquidity;
+      const need = det?.minSharesReq != null ? det.minSharesReq.toLocaleString() : "n/a";
+      const dvol = det?.dollarVol != null ? `$${Math.round(det.dollarVol).toLocaleString()}` : "n/a";
+      why.push(`liquidity short (needed ≥ ${need} sh/min & $${(tick?.info?.liquidity?.minDollarVol ?? 0).toLocaleString()} $, saw ${dvol})`);
+    }
+    if (ev?.meta?.reason === "price_band") why.push("price outside allowed band");
+    if (!ev?.armed && !ev?.armedDip && !ev?.armedMomentum) why.push("no armed signals");
+
+    if (why.length) perTickers.push(`${sym}: ${why.join("; ")}`);
+  }
+
+  // Compose message
+  if (perTickers.length) {
+    parts.push(`Per-ticker checks — ${perTickers.join(" | ")}`);
+  }
+
+  // Add thresholds so the user sees the guardrails
+  const liqLine = (liq?.minSharesAbs || liq?.floatPctPerMin || liq?.minDollarVol)
+    ? `Liquidity thresholds: min shares ${liq.minSharesAbs?.toLocaleString?.() ?? "?"}, float/min ${(liq.floatPctPerMin*100)?.toFixed?.(3) ?? "?"}%, dollar vol $${liq.minDollarVol?.toLocaleString?.() ?? "?"} (per 1-min bar).`
+    : "";
+  if (liqLine) parts.push(liqLine);
+
+  // Special windows’ flags
+  if (info?.scan_0930_0944 === false && info?.force_0945_0946 === false) {
+    parts.push("We were outside the scan/force windows.");
+  }
+
+  return parts.length ? parts.join(" ") : "No trade executed; bot did not meet entry conditions.";
+}
+
+async function explainNoTradeToday(base: string) {
+  const tick = await fetchBotTick(base);
+  const draft = humanizeNoTradeReasons(tick);
+  // Try to keep it crisp with the LLM polish if available
+  return await maybePolishReply(draft, { tick });
+}
 /* ───────────────── Small formatters ───────────────── */
 function summarizeTrades(trades: DbTrade[]) {
   if (trades.length === 0) return "No trades in that range.";
@@ -579,9 +662,16 @@ export async function POST(req: Request) {
         "- What’s my P&L today / this week / this month?\n" +
         "- Are we holding anything?\n" +
         "- Why did we trade ABCD?\n" +
+        "- Why didn’t we trade today?\n" + // ← NEW example in help
         "- What price did we sell/exit ABCD?\n" +
         "- What price did we buy/enter ABCD?\n" +
         "- Ask about a ticker with $ (e.g., “Is $ABCD above VWAP?”)";
+      return NextResponse.json({ reply });
+    }
+
+    if (intent === "why_no_trade") { // ← NEW: explicit intent
+      const base = getBaseUrl(req);
+      const reply = await explainNoTradeToday(base);
       return NextResponse.json({ reply });
     }
 
@@ -759,8 +849,15 @@ export async function POST(req: Request) {
     const traded = summarizeTrades(tradesInRange);
     const pieces: string[] = [];
     pieces.push(openPos?.open ? tone.holding(openPos) : tone.flat());
-    if (traded === "No trades in that range.") pieces.push(`No trades ${label}.`);
-    else pieces.push(`Trades ${label}: ${traded}.`);
+    if (traded === "No trades in that range.") {
+      // NEW: if user didn't explicitly ask but there were no trades today, volunteer a one-liner reason
+      const base = getBaseUrl(req);
+      const why = await explainNoTradeToday(base).catch(() => null);
+      pieces.push(`No trades ${label}.`);
+      if (why) pieces.push(why);
+    } else {
+      pieces.push(`Trades ${label}: ${traded}.`);
+    }
     if (tradesInRange.length) pieces.push(`Realized P&L ${label}: ${money(realized)}.`);
     const draft = tone.fun(pieces.join(" "));
     return NextResponse.json({ reply: await maybePolishReply(draft, { openPos, traded, realized, label }) });
