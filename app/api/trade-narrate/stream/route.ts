@@ -35,10 +35,10 @@ const MIN_SHARES_ABS = 8_000;
 const FLOAT_MIN_PCT_PER_MIN = 0.0025; // 0.25%
 const MIN_DOLLAR_VOL = 200_000;
 
-// Stream pacing
-const TICK_MS = 20_000;             // ~every 20s
+// Stream pacing (cheaper but “live” feel)
+const TICK_MS = 8_000;              // cheap snapshot every ~8s
 const MAX_SCAN_MINUTES = 15;        // safety
-const DETAIL_EVERY_N_TICKS = 3;     // full detail every 3 ticks
+const DETAIL_EVERY_N_TICKS = 4;     // heavy detail ~every 32s
 
 /* ───────────────────── “Human” cadence ───────────────────── */
 const THINK_MIN_MS = 450;
@@ -198,14 +198,28 @@ function computeVolumePulse(candles: Candle[], todayYMD: string, lookback = 5) {
   return { mult: latest.volume / avgPrior, latestVol: latest.volume, avgPrior };
 }
 
+/* ───────────────────── Caches ───────────────────── */
+// Minute-level cache for heavy signal reads per symbol
+const minuteSignalCache = new Map<string, SignalReadOK>();
+
+// Float rarely changes intraday: cache per day
+const floatCache = new Map<string, { ymd: string; value: number }>();
+
 /* Float lookups (safe fallbacks) */
 async function fetchFloatShares(base: string, symbol: string, lastPrice: number | null): Promise<number | null> {
+  const ymd = yyyyMmDdET();
+  const hit = floatCache.get(symbol);
+  if (hit && hit.ymd === ymd) return hit.value;
+
   try {
     const r = await fetch(`${base}/api/fmp/float?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
     if (r.ok) {
       const j = await r.json();
       const f = Number(j?.float ?? j?.floatShares ?? j?.freeFloat);
-      if (Number.isFinite(f) && f > 0) return f;
+      if (Number.isFinite(f) && f > 0) {
+        floatCache.set(symbol, { ymd, value: f });
+        return f;
+      }
     }
   } catch {}
   try {
@@ -215,9 +229,16 @@ async function fetchFloatShares(base: string, symbol: string, lastPrice: number 
       const arr = Array.isArray(j2) ? j2 : Array.isArray(j2?.profile) ? j2.profile : [];
       const row = arr[0] || j2 || {};
       const f = Number(row.floatShares ?? row.sharesFloat ?? row.freeFloat);
-      if (Number.isFinite(f) && f > 0) return f;
+      if (Number.isFinite(f) && f > 0) {
+        floatCache.set(symbol, { ymd, value: f });
+        return f;
+      }
       const so = Number(row.sharesOutstanding ?? row.mktCapShares);
-      if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
+      if (Number.isFinite(so) && so > 0) {
+        const est = Math.floor(so * 0.8);
+        floatCache.set(symbol, { ymd, value: est });
+        return est;
+      }
     }
   } catch {}
   try {
@@ -229,7 +250,11 @@ async function fetchFloatShares(base: string, symbol: string, lastPrice: number 
       const p = Number(lastPrice ?? row.price);
       if (Number.isFinite(mcap) && Number.isFinite(p) && p > 0) {
         const so = mcap / p;
-        if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
+        if (Number.isFinite(so) && so > 0) {
+          const est = Math.floor(so * 0.8);
+          floatCache.set(symbol, { ymd, value: est });
+          return est;
+        }
       }
     }
   } catch {}
@@ -338,6 +363,14 @@ async function readSignalsForNarration(base: string, symbol: string): Promise<Si
     if (!day.length) return { ok: false, reason: "no_day_candles" };
 
     const last = day[day.length - 1];
+
+    // Minute cache key (ET, rounded to minute)
+    const lastET = toET(last.date);
+    const key = `${symbol}:${lastET.getFullYear()}-${lastET.getMonth() + 1}-${lastET.getDate()} ${lastET.getHours()}:${lastET.getMinutes()}`;
+    const cached = minuteSignalCache.get(key);
+if (cached) return cached; // ✅ no duplicate "ok"
+
+
     const priceOK = last.close >= PRICE_MIN && last.close <= PRICE_MAX;
 
     // dynamic thresholds (decay)
@@ -367,7 +400,7 @@ async function readSignalsForNarration(base: string, symbol: string): Promise<Si
     const signalCount = [breakORH, nearOR, vwapRecl, volOK].filter(Boolean).length;
     const armedMomentum = !!(aboveVWAP && signalCount >= 2);
 
-    return {
+    const result: SignalReadOK = {
       ok: true,
       price: last.close,
       priceOK,
@@ -388,6 +421,9 @@ async function readSignalsForNarration(base: string, symbol: string): Promise<Si
       signalCount,
       armedMomentum,
     };
+
+    minuteSignalCache.set(key, result);
+    return result;
   } catch {
     return { ok: false, reason: "error" };
   }
@@ -461,9 +497,8 @@ async function streamOpenAINarration(
       ],
     });
 
-    // pipe tokens → client
     for await (const part of stream) {
-      const delta = part.choices?.[0]?.delta?.content || "";
+      const delta = (part as any).choices?.[0]?.delta?.content || "";
       if (delta) controller.enqueue(td.encode(delta));
     }
     controller.enqueue(td.encode("\n"));
@@ -503,6 +538,7 @@ export async function POST(req: NextRequest) {
           // SCAN LOOP
           let scanTicks = 0;
           let announcedTopOnce = false;
+          let lastPicks: string[] = []; // reuse picks between ticks
 
           while (inScanWindowET() && scanTicks < Math.ceil((MAX_SCAN_MINUTES * 60_000) / TICK_MS)) {
             scanTicks++;
@@ -523,20 +559,23 @@ export async function POST(req: NextRequest) {
               announcedTopOnce = true;
             }
 
-            // Ask your /api/recommendation for 1–2 symbols to narrate
-            let picks: string[] = [];
-            try {
-              const r = await fetch(`${base}/api/recommendation`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ stocks: top, forcePick: true, requirePick: true }),
-                cache: "no-store",
-              });
-              if (r.ok) {
-                const j = await r.json();
-                picks = parseTwoPicksFromResponse(j, top.map((s) => s.ticker)).slice(0, 2);
-              }
-            } catch {}
+            // Picks: only fetch on detail ticks; otherwise reuse lastPicks
+            let picks: string[] = lastPicks;
+            if (doDetailed) {
+              try {
+                const r = await fetch(`${base}/api/recommendation`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ stocks: top, forcePick: true, requirePick: true }),
+                  cache: "no-store",
+                });
+                if (r.ok) {
+                  const j = await r.json();
+                  picks = parseTwoPicksFromResponse(j, top.map((s) => s.ticker)).slice(0, 2);
+                  lastPicks = picks;
+                }
+              } catch {}
+            }
 
             if (!picks.length) {
               if (doDetailed) {
@@ -546,66 +585,77 @@ export async function POST(req: NextRequest) {
               continue;
             }
 
-            if (doDetailed) {
-              if (picks.length === 1) {
-                await say(controller, `Primary: ${picks[0]}. Secondary loading… 🧠\n`);
-              } else {
-                await say(controller, `Short-list: ${picks[0]} (primary), ${picks[1]} (secondary). ${pick(persona.emojis)}\n`);
-              }
+            // On light ticks, speak quick price lines from snapshot only (cheap)
+            if (!doDetailed) {
+              const byTicker = new Map((snap?.stocks || []).map(s => [s.ticker, s]));
+              const lines = picks
+                .map(sym => {
+                  const row = byTicker.get(sym);
+                  const px = row?.price != null ? `$${Number(row.price).toFixed(2)}` : "—";
+                  return `${sym} ${px}`;
+                })
+                .join(" • ");
+              await say(controller, `${lines} (${hhmmssET()} ET)\n`, 0, false);
+              await sleep(TICK_MS);
+              continue;
             }
 
-            // Detailed narration with OpenAI (fallback to template)
-            if (doDetailed) {
-              for (const sym of picks) {
-                const read = await readSignalsForNarration(base, sym);
-                if (!read.ok) {
-                  await say(controller, `• ${sym}: no fresh intraday bars yet; skipping for now. 🧃\n`);
-                  continue;
+            // Detail narration (heavy) with OpenAI (fallback to template)
+            if (picks.length === 1) {
+              await say(controller, `Primary: ${picks[0]}. Secondary loading… 🧠\n`);
+            } else {
+              await say(controller, `Short-list: ${picks[0]} (primary), ${picks[1]} (secondary). ${pick(persona.emojis)}\n`);
+            }
+
+            for (const sym of picks) {
+              const read = await readSignalsForNarration(base, sym);
+              if (!read.ok) {
+                await say(controller, `• ${sym}: no fresh intraday bars yet; skipping for now. 🧃\n`);
+                continue;
+              }
+
+              // Try LLM narration first
+              const usedLLM = await streamOpenAINarration(controller, {
+                symbol: sym,
+                timeET: hhmmssET(),
+                read,
+                allowEmoji: true,
+              });
+
+              if (!usedLLM) {
+                // Fallback to concise template
+                const parts: string[] = [];
+                parts.push(`• ${sym}: $${read.price.toFixed(2)} — `);
+                parts.push(
+                  `price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "wide"}${read.spreadNote || ""}`
+                );
+                const liqStr = `liq ${read.liq.ok ? "OK" : "light"} (need ≥ ${read.liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min)`;
+                parts.push(`, ${liqStr}.`);
+
+                const levels: string[] = [];
+                if (read.orHigh != null) levels.push(`ORH ${read.orHigh.toFixed(2)}`);
+                if (read.vwap != null) levels.push(`VWAP ${read.vwap.toFixed(2)}`);
+                if (levels.length) parts.push(` Levels: ${levels.join(", ")}.`);
+
+                const sigs: string[] = [];
+                if (read.aboveVWAP) sigs.push("above VWAP");
+                if (read.breakORH) sigs.push("pushing OR high");
+                if (read.nearOR) sigs.push(`near OR (${(read.NEAR_OR_PCT * 100).toFixed(2)}% band)`);
+                if (read.vwapRecl) sigs.push(`VWAP reclaim (${(read.VWAP_RECLAIM_BAND * 100).toFixed(2)}% hold)`);
+                if (read.volMult != null) sigs.push(`vol pulse ${read.volMult.toFixed(2)}× (need ≥ ${read.VOL_MULT_MIN.toFixed(2)}×)`);
+                if (sigs.length) parts.push(` Signals: ${sigs.join(", ")}.`);
+
+                if (read.priceOK && read.spreadOK && read.liq.ok && read.armedMomentum) {
+                  parts.push(` Read: momentum armed (above VWAP + ${read.signalCount} confirms). Comfortable to act. 🚀`);
+                } else {
+                  const needs: string[] = [];
+                  if (!read.priceOK) needs.push("price in band");
+                  if (!read.spreadOK) needs.push("tighter spread");
+                  if (!read.liq.ok) needs.push("more liquidity");
+                  if (!(read.aboveVWAP && read.signalCount >= 2)) needs.push("above VWAP + ≥2 signals");
+                  if (needs.length) parts.push(` Needs: ${needs.join(", ")}. No FOMO — let it come to us. 😎`);
                 }
-
-                // Try LLM narration first
-                const usedLLM = await streamOpenAINarration(controller, {
-                  symbol: sym,
-                  timeET: hhmmssET(),
-                  read,
-                  allowEmoji: true,
-                });
-
-                if (!usedLLM) {
-                  // Fallback to your concise template if model unavailable
-                  const parts: string[] = [];
-                  parts.push(`• ${sym}: $${read.price.toFixed(2)} — `);
-                  parts.push(
-                    `price ${read.priceOK ? "in band" : "out of band"}, spread ${read.spreadOK ? "tight" : "wide"}${read.spreadNote || ""}`
-                  );
-                  const liqStr = `liq ${read.liq.ok ? "OK" : "light"} (need ≥ ${read.liq.minSharesReq.toLocaleString()} sh & $${MIN_DOLLAR_VOL.toLocaleString()}/min)`;
-                  parts.push(`, ${liqStr}.`);
-
-                  const levels: string[] = [];
-                  if (read.orHigh != null) levels.push(`ORH ${read.orHigh.toFixed(2)}`);
-                  if (read.vwap != null) levels.push(`VWAP ${read.vwap.toFixed(2)}`);
-                  if (levels.length) parts.push(` Levels: ${levels.join(", ")}.`);
-
-                  const sigs: string[] = [];
-                  if (read.aboveVWAP) sigs.push("above VWAP");
-                  if (read.breakORH) sigs.push("pushing OR high");
-                  if (read.nearOR) sigs.push(`near OR (${(read.NEAR_OR_PCT * 100).toFixed(2)}% band)`);
-                  if (read.vwapRecl) sigs.push(`VWAP reclaim (${(read.VWAP_RECLAIM_BAND * 100).toFixed(2)}% hold)`);
-                  if (read.volMult != null) sigs.push(`vol pulse ${read.volMult.toFixed(2)}× (need ≥ ${read.VOL_MULT_MIN.toFixed(2)}×)`);
-                  if (sigs.length) parts.push(` Signals: ${sigs.join(", ")}.`);
-
-                  if (read.priceOK && read.spreadOK && read.liq.ok && read.armedMomentum) {
-                    parts.push(` Read: momentum armed (above VWAP + ${read.signalCount} confirms). Comfortable to act. 🚀`);
-                  } else {
-                    const needs: string[] = [];
-                    if (!read.priceOK) needs.push("price in band");
-                    if (!read.spreadOK) needs.push("tighter spread");
-                    if (!read.liq.ok) needs.push("more liquidity");
-                    if (!(read.aboveVWAP && read.signalCount >= 2)) needs.push("above VWAP + ≥2 signals");
-                    if (needs.length) parts.push(` Needs: ${needs.join(", ")}. No FOMO — let it come to us. 😎`);
-                  }
-                  await say(controller, parts.join("") + ` ${pick(persona.emojis)}${riff()}`);
-                }
+                await say(controller, parts.join("") + ` ${pick(persona.emojis)}${riff()}`);
               }
             }
 
