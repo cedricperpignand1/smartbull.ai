@@ -31,7 +31,7 @@ function isMarketOpenET(d = nowET()): boolean {
   const beforeClose = h < 16;
   return afterOpen && beforeClose;
 }
-// >>> NEW: narrator time window (weekdays, 9:30–9:45 ET)
+// >>> narrator time window (weekdays, 9:30–9:45 ET)
 function inNarrationWindowET(d = nowET()): boolean {
   const day = d.getDay();
   if (day === 0 || day === 6) return false; // Sun/Sat
@@ -216,7 +216,7 @@ function FloatingNarrator() {
   const toggle = () => (isActive() ? stopAll() : start());
   const active = isActive();
 
-  // >>> NEW: auto-start/stop window (9:30–9:45 ET on weekdays) + visibility guard
+  // auto-start/stop window (9:30–9:45 ET on weekdays) + visibility guard
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -562,7 +562,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
 }
 
 /* =========================================================
-   Page (NEW layout: nested grid in the RIGHT column)
+   Page (updated: symbol wiring + modal)
    ========================================================= */
 export default function Home() {
   const { data: session, status } = useSession();
@@ -805,7 +805,8 @@ export default function Home() {
           {/* RIGHT: NESTED GRID */}
           <div className="grid gap-5">
             <div className="relative">
-              <TradeChartPanel height={720} />
+              {/* >>> FEED THE SELECTED SYMBOL HERE */}
+              <TradeChartPanel height={720} symbolWhenFlat={selectedStock ?? undefined} />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
               </div>
@@ -830,8 +831,42 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Chart modal (unchanged from your original) */}
-      {/* ... */}
+      {/* ===== Chart modal (restored) ===== */}
+      {chartVisible && selectedStock && (
+        <div
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/50 p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) closeChart(); }}
+        >
+          <div className="w-full max-w-6xl bg-white rounded-2xl shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b">
+              <div className="font-semibold text-slate-800">
+                {selectedStock} — TradingView
+              </div>
+              <button
+                onClick={closeChart}
+                className="rounded-md px-3 py-1.5 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800"
+              >
+                Close
+              </button>
+            </div>
+            <div className="h-[680px]">
+              <TradeChartPanel height={680} symbolWhenFlat={selectedStock} />
+            </div>
+
+            {/* Optional: agent result area and analyze button */}
+            <div className="px-4 py-3 border-t bg-slate-50 flex items-center gap-3">
+              <Button onClick={handleAgent} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 text-sm rounded-md">
+                Analyze This Chart
+              </Button>
+              {agentResult && (
+                <pre className="text-xs whitespace-pre-wrap bg-white rounded-md p-2 ring-1 ring-slate-200 flex-1 overflow-auto max-h-40">
+                  {agentResult}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
@@ -866,8 +901,7 @@ function TopGainers({
       right={
         <div className="flex items-center gap-2">
           <span className="px-2 py-1 rounded-md text-xs font-semibold bg-gray-900 text-white/90">
-            {dataSource || "FMP (stream)"
-            }
+            {dataSource || "FMP (stream)"}
           </span>
           <Button
             onClick={onAskAI}
