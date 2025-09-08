@@ -7,14 +7,24 @@ import Navbar from "../components/Navbar";
 import { Button } from "../components/ui/button";
 import { useBotPoll } from "../components/useBotPoll";
 
-// >>> Fixed messages area height (tweak to match your screenshot)
-const CHAT_FIXED_HEIGHT_PX = 635;
-
-// lazy chart (no SSR)
+/* =========================================================
+   Lazy components (no SSR)
+   ========================================================= */
+// Positions chart (your existing implementation)
 const TradeChartPanel = dynamic<{ height?: number; symbolWhenFlat?: string }>(
   () => import("../components/TradeChartPanel"),
   { ssr: false }
 );
+
+// TradingView chart (for the modal on Top Gainers click)
+const TradingViewChart = dynamic(() => import("../components/TradingViewChart"), {
+  ssr: false,
+});
+
+/* =========================================================
+   Constants
+   ========================================================= */
+const CHAT_FIXED_HEIGHT_PX = 635;
 
 /* =========================================================
    ET helpers
@@ -31,12 +41,12 @@ function isMarketOpenET(d = nowET()): boolean {
   const beforeClose = h < 16;
   return afterOpen && beforeClose;
 }
-// >>> narrator time window (weekdays, 9:30–9:45 ET)
+// narrator time window (weekdays, 9:30–9:45 ET)
 function inNarrationWindowET(d = nowET()): boolean {
   const day = d.getDay();
-  if (day === 0 || day === 6) return false; // Sun/Sat
+  if (day === 0 || day === 6) return false;
   const mins = d.getHours() * 60 + d.getMinutes();
-  return mins >= 9 * 60 + 30 && mins < 9 * 60 + 45; // [09:30, 09:45)
+  return mins >= 9 * 60 + 30 && mins < 9 * 60 + 45;
 }
 
 /* =========================================================
@@ -114,7 +124,6 @@ function GlassPanel({
         </span>
         {right}
       </div>
-      {/* pb-0 so the chat hugs the bottom, and min-h-0 so the child flex can shrink */}
       <div className={`${dense ? "p-3" : "px-4 pt-2 pb-0"} flex-1 min-h-0 overflow-hidden`}>{children}</div>
     </div>
   );
@@ -224,21 +233,12 @@ function FloatingNarrator() {
       const visible = document.visibilityState === "visible";
       const inWin = inNarrationWindowET();
 
-      // Start when we enter the 9:30–9:45 ET window (and tab is visible)
-      if (inWin && visible && !isActive()) {
-        start();
-      }
-
-      // Stop when we leave the window or tab becomes hidden
-      if ((!inWin || !visible) && isActive()) {
-        stopAll();
-      }
+      if (inWin && visible && !isActive()) start();
+      if ((!inWin || !visible) && isActive()) stopAll();
     };
 
-    // Run once on mount in case we're already inside the window
     tick();
-
-    const id = setInterval(tick, 5000); // check every 5s
+    const id = setInterval(tick, 5000);
     const onVis = () => tick();
     document.addEventListener("visibilitychange", onVis);
 
@@ -311,7 +311,6 @@ function ChatBox() {
 
   return (
     <div className="flex flex-col">
-      {/* FIXED HEIGHT + SCROLLBAR, matches your screenshot by default */}
       <div
         ref={scrollRef}
         className="
@@ -476,10 +475,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
 
       if (!res.ok || !(data?.ok ?? false)) {
         const reason =
-          data?.error ||
-          data?.message ||
-          (typeof data === "string" ? data : "") ||
-          `HTTP ${res.status}`;
+          data?.error || data?.message || (typeof data === "string" ? data : "") || `HTTP ${res.status}`;
         setMsg(`Panic sell failed: ${reason}`);
         return;
       }
@@ -562,7 +558,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
 }
 
 /* =========================================================
-   Page (updated: symbol wiring + modal)
+   Page (positions chart + modal TV chart)
    ========================================================= */
 export default function Home() {
   const { data: session, status } = useSession();
@@ -802,10 +798,10 @@ export default function Home() {
             />
           </div>
 
-          {/* RIGHT: NESTED GRID */}
+          {/* RIGHT: Positions chart (TradeChartPanel) + status cards */}
           <div className="grid gap-5">
             <div className="relative">
-              {/* >>> FEED THE SELECTED SYMBOL HERE */}
+              {/* Feed selected symbol (optional) to show same on positions panel */}
               <TradeChartPanel height={720} symbolWhenFlat={selectedStock ?? undefined} />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
@@ -831,7 +827,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* ===== Chart modal (restored) ===== */}
+      {/* ===== Modal: TradingViewChart (NOT TradeChartPanel) ===== */}
       {chartVisible && selectedStock && (
         <div
           className="fixed inset-0 z-[120] flex items-center justify-center bg-black/50 p-4"
@@ -849,11 +845,12 @@ export default function Home() {
                 Close
               </button>
             </div>
+
             <div className="h-[680px]">
-              <TradeChartPanel height={680} symbolWhenFlat={selectedStock} />
+              {/* Force remount on ticker; TradingViewChart handles size & symbol prefix */}
+              <TradingViewChart key={selectedStock} symbol={selectedStock} />
             </div>
 
-            {/* Optional: agent result area and analyze button */}
             <div className="px-4 py-3 border-t bg-slate-50 flex items-center gap-3">
               <Button onClick={handleAgent} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 text-sm rounded-md">
                 Analyze This Chart
@@ -1073,7 +1070,6 @@ function AIRecommendation({
               </>
             );
           })()}
-
         </div>
       )}
 
