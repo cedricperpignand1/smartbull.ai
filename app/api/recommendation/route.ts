@@ -39,6 +39,9 @@ const PM_END_H   = 9, PM_END_M   = 45;
 // Optional: global toggle to disable PM fetch without redeploy
 const PM_ENABLED = (process.env.RECOMMENDATION_PM_ENABLED ?? "true").toLowerCase() !== "false";
 
+// ⬇️ New: centralize your float threshold
+const MIN_FLOAT = 2_000_000;
+
 /* ──────────────────────────────────────────────────────────
    Utils (time, numbers)
    ────────────────────────────────────────────────────────── */
@@ -555,7 +558,7 @@ export async function POST(req: Request) {
       (r as any).softPref = scoreSoft(r as any); // 0..1
     }
 
-    /* Hard filters (PRICE BAND: $1–$70) */
+    /* Hard filters (PRICE BAND: $1–$70 + enforce MIN_FLOAT) */
     const filtered = enriched.filter((s) => {
       const passAvgVol    = (s.avgVolume ?? 0) >= 500_000;
       const passRelVol    = (s.relVol ?? 0) >= 3.0;
@@ -563,16 +566,19 @@ export async function POST(req: Request) {
       const p = s.price ?? 0;
       const passPrice     = p >= 1 && p <= 70;
       const passVenue     = !s.isEtf && !s.isOTC;
-      const passFloat     = (s.sharesOutstanding ?? 0) > 1_999_999; // avoid ultra-tiny
+      const passFloat     = (s.sharesOutstanding ?? 0) >= MIN_FLOAT; // ⬅️ enforce here
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
-    // EXTRA price-band safety: if no "filtered" survive other rules,
-    // prefer $1–$70 names from enriched before falling back to everything.
+    // EXTRA price-band safety: fallback also enforces float now
     const enrichedPriceBand = enriched.filter((s) => {
       const p = s.price ?? 0;
-      return p >= 1 && p <= 70;
+      const f = s.sharesOutstanding ?? 0;
+      return p >= 1 && p <= 70 && f >= MIN_FLOAT; // ⬅️ enforce here too
     });
+
+    // Last-chance fallback that still respects float
+    const lastChance = enriched.filter((s) => (s.sharesOutstanding ?? 0) >= MIN_FLOAT); // ⬅️ enforce here
 
     // Sort helper: prioritize AM tone if available, then DollarVol, then SoftPref
     const byComposite = (arr: any[]) =>
@@ -587,7 +593,7 @@ export async function POST(req: Request) {
     const prePool =
       filtered.length
         ? filtered
-        : (enrichedPriceBand.length ? enrichedPriceBand : enriched);
+        : (enrichedPriceBand.length ? enrichedPriceBand : lastChance);
 
     // First pass: momentum/liquidity order
     const candidatesBase = byComposite(prePool).slice(0, PREMARKET_LIMIT);
@@ -741,11 +747,16 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       ? modelObj.picks.map((s: any) => String(s).toUpperCase())
       : parsePicksFromText(content);
 
-    // Validate model picks against candidate set
+    // Validate model picks against candidate set AND float threshold
     const byTicker: Record<string, any> = {};
     for (const c of prefSorted) byTicker[String(c.ticker).toUpperCase()] = c;
 
-    const validModel = picksFromModel.filter(p => !!byTicker[p]);
+    const meetsFloat = (row: any) => (row?.sharesOutstanding ?? 0) >= MIN_FLOAT;
+
+    const validModel = picksFromModel.filter(p => {
+      const c = byTicker[p];
+      return !!c && meetsFloat(c); // ⬅️ enforce here
+    });
 
     // Build final picks with POST-ENFORCEMENT of policy
     const finalPicks: string[] = [];
@@ -770,9 +781,10 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       const candSm  = isSmallCap(cand?.marketCap);
 
       if (!(candLow || candSm)) {
-        // find a preferred alternative from prefSorted
+        // find a preferred alternative from prefSorted (must also meet float)
         const alt = prefSorted.find(x =>
           (isLowFloat(x.sharesOutstanding) || isSmallCap(x.marketCap)) &&
+          (x?.sharesOutstanding ?? 0) >= MIN_FLOAT &&
           !already.has(String(x.ticker).toUpperCase())
         );
         pushPick(alt ? alt.ticker : p);
@@ -781,9 +793,10 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       }
     }
 
-    // 2) Fill remaining slots strictly from preference order
+    // 2) Fill remaining slots strictly from preference order (still enforce float)
     for (const c of prefSorted) {
       if (finalPicks.length >= topN) break;
+      if (!meetsFloat(c)) continue; // ⬅️ enforce again
       pushPick(c.ticker);
     }
 
@@ -863,6 +876,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           defaultTopN: DEFAULT_TOP_N,
           lowFloatMax: LOW_FLOAT_MAX,
           smallCapMax: SMALL_CAP_MAX,
+          minFloat: MIN_FLOAT, // ⬅️ expose for debugging
         },
         nowET: nowET().toISOString(),
       },

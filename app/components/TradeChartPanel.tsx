@@ -32,7 +32,8 @@ type TradeWire = {
 
 /* ───────────────── Time utils ───────────────── */
 function toSec(ts: string | number | Date) {
-  const t = typeof ts === "string" ? new Date(ts).getTime() : ts instanceof Date ? ts.getTime() : ts;
+  const t =
+    typeof ts === "string" ? new Date(ts).getTime() : ts instanceof Date ? ts.getTime() : ts;
   return Math.floor(t / 1000);
 }
 function toET(d: Date) {
@@ -62,7 +63,7 @@ function isBeforeETClose(nowUTC = new Date()) {
   return mins <= 16 * 60;
 }
 
-/** Cumulative session VWAP (from 9:30 ET forward) */
+/** Cumulative session VWAP (from 9:30 ET forward) – numeric-safe */
 function computeSessionVWAP(candles: Candle[], dayYMD: string) {
   let pv = 0;
   let vol = 0;
@@ -72,9 +73,16 @@ function computeSessionVWAP(candles: Candle[], dayYMD: string) {
     const mins = d.getHours() * 60 + d.getMinutes();
     if (!isSameETDay(d, dayYMD)) continue;
     if (mins < 9 * 60 + 30) continue;
-    const typical = (c.high + c.low + c.close) / 3;
-    pv += typical * c.volume;
-    vol += c.volume;
+
+    const h = Number(c.high);
+    const l = Number(c.low);
+    const cl = Number(c.close);
+    const v = Number(c.volume);
+    if (![h, l, cl, v].every(Number.isFinite)) continue;
+
+    const typical = (h + l + cl) / 3;
+    pv += typical * v;
+    vol += v;
     if (vol > 0) out.push({ time: toSec(c.date), value: pv / vol });
   }
   return out;
@@ -129,7 +137,9 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
   async function load() {
     if (!symbol) return;
     try {
-      const j = await fetchJSON<{ trades: TradeWire[] }>(`/api/trades/today?symbol=${encodeURIComponent(symbol)}`);
+      const j = await fetchJSON<{ trades: TradeWire[] }>(
+        `/api/trades/today?symbol=${encodeURIComponent(symbol)}`
+      );
       setRows(Array.isArray(j?.trades) ? j.trades : []);
     } catch {}
   }
@@ -153,7 +163,13 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
 }
 
 /** 1m candles: poll fast when “active” (open or sticky), slow when not; pause when hidden/outside hours. */
-function useCandles1m(symbol: string | null, isActiveFast: boolean, pollMsFast = 30000, pollMsSlow = 120000, limit = 240) {
+function useCandles1m(
+  symbol: string | null,
+  isActiveFast: boolean,
+  pollMsFast = 30000,
+  pollMsSlow = 120000,
+  limit = 240
+) {
   const visible = useVisibility();
   const [candles, setCandles] = useState<Candle[] | null>(null);
 
@@ -165,7 +181,30 @@ function useCandles1m(symbol: string | null, isActiveFast: boolean, pollMsFast =
     if (!url) return;
     try {
       const data = await fetchJSON<{ candles: Candle[] }>(url);
-      setCandles(Array.isArray((data as any).candles) ? (data as any).candles : []);
+
+      // Normalize to numbers & drop any bad rows
+     const raw = Array.isArray((data as any).candles) ? (data as any).candles : [];
+
+const clean: Candle[] = raw
+  .map((k: Partial<Candle>) => ({
+    date: String(k.date ?? ""),
+    open: Number(k.open),
+    high: Number(k.high),
+    low: Number(k.low),
+    close: Number(k.close),
+    volume: Number(k.volume),
+  }))
+  .filter(
+    (k: Candle) =>
+      Number.isFinite(k.open) &&
+      Number.isFinite(k.high) &&
+      Number.isFinite(k.low) &&
+      Number.isFinite(k.close) &&
+      Number.isFinite(k.volume)
+  );
+
+
+      setCandles(clean);
     } catch {}
   }
 
@@ -236,7 +275,9 @@ export default function TradeChartPanel({
       if (!isBeforeETClose() && stickySymbol) {
         setStickySymbol(null);
         setStickyDay(null);
-        try { sessionStorage.removeItem("chartSticky"); } catch {}
+        try {
+          sessionStorage.removeItem("chartSticky");
+        } catch {}
       }
     }, 60_000);
     return () => clearInterval(id);
@@ -264,7 +305,14 @@ export default function TradeChartPanel({
   const candleSeriesRef = useRef<any>(null);
   const vwapSeriesRef = useRef<any>(null);
   const priceLinesRef = useRef<any[]>([]);
-  const [hover, setHover] = useState<{ price?: number; o?: number; h?: number; l?: number; c?: number; vwap?: number } | null>(null);
+  const [hover, setHover] = useState<{
+    price?: number;
+    o?: number;
+    h?: number;
+    l?: number;
+    c?: number;
+    vwap?: number;
+  } | null>(null);
 
   // Create chart (compat shim v4/v5)
   useEffect(() => {
@@ -292,8 +340,14 @@ export default function TradeChartPanel({
       if (typeof anyChart.addCandlestickSeries === "function") {
         candleSeries = anyChart.addCandlestickSeries({});
       } else if (typeof anyChart.addSeries === "function") {
-        try { candleSeries = anyChart.addSeries({ type: "Candlestick" }); } catch { candleSeries = anyChart.addSeries("Candlestick"); }
-      } else { throw new Error("No addSeries"); }
+        try {
+          candleSeries = anyChart.addSeries({ type: "Candlestick" });
+        } catch {
+          candleSeries = anyChart.addSeries("Candlestick");
+        }
+      } else {
+        throw new Error("No addSeries");
+      }
       candleSeries.applyOptions({
         upColor: "#22c55e",
         downColor: "#ef4444",
@@ -307,19 +361,32 @@ export default function TradeChartPanel({
       if (typeof anyChart.addLineSeries === "function") {
         vwapSeries = anyChart.addLineSeries({});
       } else {
-        try { vwapSeries = anyChart.addSeries({ type: "Line" }); } catch { vwapSeries = anyChart.addSeries("Line"); }
+        try {
+          vwapSeries = anyChart.addSeries({ type: "Line" });
+        } catch {
+          vwapSeries = anyChart.addSeries("Line");
+        }
       }
       vwapSeries.applyOptions({ lineWidth: 2 });
 
       // Legend: crosshair move
       const onMove = (p: any) => {
-        if (!p?.time) { setHover(null); return; }
+        if (!p?.time) {
+          setHover(null);
+          return;
+        }
         const sd = p.seriesData as Map<any, any>;
         const c = sd?.get(candleSeries);
         const v = sd?.get(vwapSeries);
-        if (!c) { setHover(null); return; }
+        if (!c) {
+          setHover(null);
+          return;
+        }
         setHover({
-          o: c.open, h: c.high, l: c.low, c: c.close,
+          o: c.open,
+          h: c.high,
+          l: c.low,
+          c: c.close,
           price: c.close,
           vwap: typeof v?.value === "number" ? v.value : undefined,
         });
@@ -330,20 +397,31 @@ export default function TradeChartPanel({
       candleSeriesRef.current = candleSeries;
       vwapSeriesRef.current = vwapSeries;
 
-      const resize = () => {
+      const applyWidth = () => {
         if (!containerRef.current) return;
         chart.applyOptions({ width: containerRef.current.clientWidth });
       };
-      resize();
-      window.addEventListener("resize", resize);
+      applyWidth();
+
+      // ResizeObserver for container changes
+      const ro = new ResizeObserver(applyWidth);
+      if (containerRef.current) ro.observe(containerRef.current);
+
+      const onWinResize = () => applyWidth();
+      window.addEventListener("resize", onWinResize);
+
       cleanup = () => {
-        window.removeEventListener("resize", resize);
+        window.removeEventListener("resize", onWinResize);
+        ro.disconnect();
         chart.unsubscribeCrosshairMove(onMove);
         chart.remove();
       };
     })();
 
-    return () => { destroyed = true; cleanup(); };
+    return () => {
+      destroyed = true;
+      cleanup();
+    };
   }, [height]);
 
   // Update series when data changes (candles + markers + lines)
@@ -354,7 +432,11 @@ export default function TradeChartPanel({
     if (!cs || !vs || !chart) return;
 
     // clear old price lines
-    for (const pl of priceLinesRef.current) { try { cs.removePriceLine(pl); } catch {} }
+    for (const pl of priceLinesRef.current) {
+      try {
+        cs.removePriceLine(pl);
+      } catch {}
+    }
     priceLinesRef.current = [];
 
     if (!candles || candles.length === 0) {
@@ -366,15 +448,15 @@ export default function TradeChartPanel({
 
     const seriesData = candles.map((c) => ({
       time: toSec(c.date),
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close),
     }));
     cs.setData(seriesData);
 
     const vwap = computeSessionVWAP(candles, yyyyMmDdET(new Date()));
-    vs.setData(vwap);
+    vs.setData(Array.isArray(vwap) ? vwap : []);
 
     chart.timeScale().fitContent();
 
@@ -390,7 +472,10 @@ export default function TradeChartPanel({
       let bestDiff = Math.abs((seriesData[0].time as number) - entryAt);
       for (const pt of seriesData) {
         const diff = Math.abs((pt.time as number) - entryAt);
-        if (diff < bestDiff) { best = pt.time as number; bestDiff = diff; }
+        if (diff < bestDiff) {
+          best = pt.time as number;
+          bestDiff = diff;
+        }
       }
       markerTime = best;
     }
@@ -398,30 +483,74 @@ export default function TradeChartPanel({
     const markers: any[] = [];
 
     if (entryPrice != null) {
-      const pl = cs.createPriceLine({ price: entryPrice, title: "Entry", lineWidth: 1, color: "#9ca3af" });
+      const pl = cs.createPriceLine({
+        price: entryPrice,
+        title: "Entry",
+        lineWidth: 1,
+        color: "#9ca3af",
+      });
       priceLinesRef.current.push(pl);
-      if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#9ca3af", shape: "arrowUp", text: "Entry" });
+      if (markerTime)
+        markers.push({
+          time: markerTime,
+          position: "belowBar",
+          color: "#9ca3af",
+          shape: "arrowUp",
+          text: "Entry",
+        });
     }
     if (stopLoss != null) {
-      const pl = cs.createPriceLine({ price: stopLoss, title: "Stop", lineWidth: 1, color: "#ef4444" });
+      const pl = cs.createPriceLine({
+        price: stopLoss,
+        title: "Stop",
+        lineWidth: 1,
+        color: "#ef4444",
+      });
       priceLinesRef.current.push(pl);
-      if (markerTime) markers.push({ time: markerTime, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SL" });
+      if (markerTime)
+        markers.push({
+          time: markerTime,
+          position: "aboveBar",
+          color: "#ef4444",
+          shape: "arrowDown",
+          text: "SL",
+        });
     }
     if (takeProfit != null) {
-      const pl = cs.createPriceLine({ price: takeProfit, title: "Target", lineWidth: 1, color: "#22c55e" });
+      const pl = cs.createPriceLine({
+        price: takeProfit,
+        title: "Target",
+        lineWidth: 1,
+        color: "#22c55e",
+      });
       priceLinesRef.current.push(pl);
-      if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "TP" });
+      if (markerTime)
+        markers.push({
+          time: markerTime,
+          position: "belowBar",
+          color: "#22c55e",
+          shape: "arrowUp",
+          text: "TP",
+        });
     }
 
     // Exit markers + average exit line (today only)
     if (Array.isArray(todayTrades) && todayTrades.length) {
-      const sells = todayTrades.filter(t => t.side.toUpperCase() === "SELL");
+      const sells = todayTrades.filter((t) => t.side.toUpperCase() === "SELL");
       if (sells.length) {
         const totalSold = sells.reduce((s, r) => s + r.shares, 0);
-        const wAvgExit = totalSold > 0 ? sells.reduce((s, r) => s + r.price * r.shares, 0) / totalSold : null;
+        const wAvgExit =
+          totalSold > 0
+            ? sells.reduce((s, r) => s + r.price * r.shares, 0) / totalSold
+            : null;
 
         if (wAvgExit != null) {
-          const pl = cs.createPriceLine({ price: wAvgExit, title: "Exit avg", lineWidth: 1, color: "#f59e0b" });
+          const pl = cs.createPriceLine({
+            price: wAvgExit,
+            title: "Exit avg",
+            lineWidth: 1,
+            color: "#f59e0b",
+          });
           priceLinesRef.current.push(pl);
         }
 
@@ -433,16 +562,33 @@ export default function TradeChartPanel({
           let bestDiff = Math.abs((seriesData[0].time as number) - t);
           for (const pt of seriesData) {
             const diff = Math.abs((pt.time as number) - t);
-            if (diff < bestDiff) { best = pt.time as number; bestDiff = diff; }
+            if (diff < bestDiff) {
+              best = pt.time as number;
+              bestDiff = diff;
+            }
           }
           mtime = best;
-          markers.push({ time: mtime, position: "aboveBar", color: "#f59e0b", shape: "arrowDown", text: `Exit ${s.shares}` });
+          markers.push({
+            time: mtime,
+            position: "aboveBar",
+            color: "#f59e0b",
+            shape: "arrowDown",
+            text: `Exit ${s.shares}`,
+          });
         }
       }
     }
 
     cs.setMarkers(markers);
-  }, [candles, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.entryAt, todayTrades, hasOpen]);
+  }, [
+    candles,
+    pos?.entryPrice,
+    pos?.stopLoss,
+    pos?.takeProfit,
+    pos?.entryAt,
+    todayTrades,
+    hasOpen,
+  ]);
 
   // compute R:R in legend from hover price (assume long) – only meaningful while open
   const rr = useMemo(() => {
@@ -482,7 +628,9 @@ export default function TradeChartPanel({
               )}
             </div>
           ) : stickyActive ? (
-            <div className="text-xs text-slate-400 italic">Position closed — showing last chart until 4:00 PM ET.</div>
+            <div className="text-xs text-slate-400 italic">
+              Position closed — showing last chart until 4:00 PM ET.
+            </div>
           ) : null}
         </div>
 
@@ -493,10 +641,16 @@ export default function TradeChartPanel({
             <div className="pointer-events-none absolute right-3 top-3 rounded-md bg-slate-800/80 px-3 py-2 text-[11px] leading-4 text-slate-200">
               {hover ? (
                 <>
-                  <div>O {hover.o?.toFixed(2)} H {hover.h?.toFixed(2)} L {hover.l?.toFixed(2)} C {hover.c?.toFixed(2)}</div>
+                  <div>
+                    O {hover.o?.toFixed(2)} H {hover.h?.toFixed(2)} L {hover.l?.toFixed(2)} C{" "}
+                    {hover.c?.toFixed(2)}
+                  </div>
                   <div>VWAP {hover.vwap != null ? hover.vwap.toFixed(2) : "—"}</div>
                   {rr ? (
-                    <div className="text-slate-300">R→SL {rr.rToStop.toFixed(2)}x{rr.rToTP != null ? ` • R→TP ${rr.rToTP.toFixed(2)}x` : ""}</div>
+                    <div className="text-slate-300">
+                      R→SL {rr.rToStop.toFixed(2)}x
+                      {rr.rToTP != null ? ` • R→TP ${rr.rToTP.toFixed(2)}x` : ""}
+                    </div>
                   ) : (
                     <div className="text-slate-500">R:R —</div>
                   )}

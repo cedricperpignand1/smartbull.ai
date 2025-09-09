@@ -1,4 +1,4 @@
-// app/api/bot/tick/route.ts 
+// app/api/bot/tick/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -10,6 +10,7 @@ import {
   submitBracketBuy,
   closePositionMarket,
   replaceTpSlIfBetter,
+  getPosition,               // ⬅️ added
   getBars1m,
   premarketRangeISO,
   computePremarketLevelsFromBars,
@@ -96,11 +97,8 @@ const FRESHNESS_MS = 30_000;
 const REQUIRE_AI_PICK = true;
 
 /* ====================== RELAXED LIQUIDITY: tuned for low-floats ====================== */
-// Lower absolute floor so cheap/low-float names can pass
 const MIN_SHARES_ABS = 3_000;
-// Lower per-minute float requirement to 0.10% of float
 const FLOAT_MIN_PCT_PER_MIN = 0.001;
-// Lower dollar-volume floor so sub-$10 names can qualify realistically
 const MIN_DOLLAR_VOL = 75_000;
 /* ===================================================================================== */
 
@@ -132,7 +130,6 @@ function isMandatoryExitET() {
 function inWindow930to945ET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
-  // 09:30 (570) through 09:45 (585) inclusive
   return mins >= 9 * 60 + 30 && mins <= 9 * 60 + 45;
 }
 
@@ -426,13 +423,6 @@ function sumVolAndDollars(bars: Candle[], priceHint?: number | null) {
   }
   return { vol, dollars };
 }
-/**
- * New relaxed liquidity:
- * - Gate A (1-min): shares >= minSharesReq AND dollarVol >= MIN_DOLLAR_VOL
- * - Gate B (3-min rolling): shares >= 2*minSharesReq AND dollars >= 2*MIN_DOLLAR_VOL
- * - Gate C (momentum assist): volPulse >= VOL_MULT_MIN (same as momentum gate)
- * Pass if at least **2 of the 3** are true.
- */
 function passesRelaxedLiquidity(
   todayYMD: string,
   candles: Candle[],
@@ -441,7 +431,6 @@ function passesRelaxedLiquidity(
   volPulseMult: number | null,
   volPulseMin: number
 ) {
-  // compute minShares requirement from float or absolute floor
   let minSharesReq = MIN_SHARES_ABS;
   if (Number.isFinite(Number(floatShares)) && floatShares! > 0) {
     const byFloat = Math.floor(floatShares! * FLOAT_MIN_PCT_PER_MIN);
@@ -475,12 +464,9 @@ function passesRelaxedLiquidity(
 
 /* >>>>>>>>>>>>>>> REPLACED: dynamic spread function <<<<<<<<<<<<<<< */
 function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
-  // Hard rule: from 09:30:00 to 09:45:59 ET, allow up to 1% to reduce misses at the open
   if (inWindow930to945ET()) {
     return 0.01; // 1%
   }
-
-  // --- Original behavior outside that window ---
   const toPct = (v: number) => Math.max(0.001, Math.min(0.02, v));
   let base =
     phase === "force"
@@ -560,7 +546,6 @@ async function evaluateEntrySignals(
     baseUrl
   );
 
-  // Momentum baseline for the “gate C” part of liquidity
   const m = minutesSince930ET();
   const t = clamp01((m - DECAY_START_MIN) / (DECAY_END_MIN - DECAY_START_MIN));
   const VOL_MULT_MIN = lerp(VOL_MULT_START, VOL_MULT_END, t);
@@ -568,7 +553,6 @@ async function evaluateEntrySignals(
   const vwap = computeSessionVWAP(candles, today);
   const volPulse = computeVolumePulse(candles, today, 5);
 
-  // ===== RELAXED LIQUIDITY (2-of-3 rule with 1-min, 3-min, volPulse) =====
   const liq = passesRelaxedLiquidity(
     today,
     candles,
@@ -587,7 +571,6 @@ async function evaluateEntrySignals(
   if (!liq.ok) {
     return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "liquidity" }, debug: dbg };
   }
-  // =======================================================================
 
   const orRange = computeOpeningRange(candles, today);
 
@@ -613,24 +596,60 @@ async function evaluateEntrySignals(
   return { eligible, armed, armedMomentum, armedDip: dip.armed, refPrice: last.close ?? null, meta: { dipMeta: dip.meta, vwap, orRange }, debug: dbg };
 }
 
-/* -------------------------- order helper -------------------------- */
+/* -------------------------- order helper (UPDATED) -------------------------- */
 async function placeEntryNow(ticker: string, ref: number, state: any) {
   const cashNum = Number(state!.cash);
   const shares = Math.floor(Math.min(cashNum, INVEST_BUDGET) / ref);
   if (shares <= 0) return { ok: false, reason: `insufficient_cash_for_one_share_ref_${ticker}_${ref.toFixed(2)}` };
-  const tp = ref * (1 + TARGET_PCT);
-  const sl = ref * (1 + STOP_PCT);
+
+  // 1) Place a temporary bracket based on ref (instant protection).
+  const tmpTp = ref * (1 + TARGET_PCT);
+  const tmpSl = ref * (1 + STOP_PCT);
+
+  let order;
   try {
-    const order = await submitBracketBuy({ symbol: ticker, qty: shares, entryType: "market", tp, sl, tif: "day" });
-    await prisma.position.create({ data: { ticker, entryPrice: ref, shares, open: true, brokerOrderId: order.id } });
-    await prisma.trade.create({ data: { side: "BUY", ticker, price: ref, shares, brokerOrderId: order.id } });
-    await prisma.botState.update({ where: { id: 1 }, data: { cash: cashNum - shares * ref, equity: cashNum - shares * ref + shares * ref } });
-    return { ok: true, shares };
+    order = await submitBracketBuy({
+      symbol: ticker,
+      qty: shares,
+      entryType: "market",
+      tp: tmpTp,
+      sl: tmpSl,
+      tif: "day",
+    });
   } catch (e: any) {
     const msg = e?.message || "unknown";
     const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
+
+  // 2) Poll for the REAL average fill price.
+  let entry = Number.NaN;
+  for (let i = 0; i < 24; i++) { // ~6s (24 * 250ms)
+    try {
+      const pos = await getPosition(ticker);
+      const px = Number(pos?.avg_entry_price);
+      if (Number.isFinite(px) && px > 0) { entry = px; break; }
+    } catch { /* transient */ }
+    await new Promise(r => setTimeout(r, 250));
+  }
+  if (!Number.isFinite(entry)) entry = ref; // fallback
+
+  // 3) Recenter TP/SL from the REAL fill (fixes the 5% risk drift).
+  const newTp = entry * (1 + TARGET_PCT);
+  const newSl = entry * (1 + STOP_PCT);
+  try {
+    await replaceTpSlIfBetter({ symbol: ticker, newTp, newSl });
+  } catch { /* best effort */ }
+
+  // 4) Persist REAL entry (so PnL/ratchet use true cost basis).
+  await prisma.position.create({ data: { ticker, entryPrice: entry, shares, open: true, brokerOrderId: order.id } });
+  await prisma.trade.create({ data: { side: "BUY", ticker, price: entry, shares, brokerOrderId: order.id } });
+  await prisma.botState.update({
+    where: { id: 1 },
+    data: { cash: cashNum - shares * entry, equity: cashNum - shares * entry + shares * entry },
+  });
+
+  return { ok: true, shares };
 }
 
 /* -------------------------- memos -------------------------- */
@@ -838,7 +857,7 @@ async function handle(req: Request) {
         }
       }
 
-      // Force window 09:45–09:46 (also uses base)
+      // Force window 09:45–09:46
       if (!openPos && marketOpen && inForceWindow() && state!.lastRunDay !== today) {
         let snapshot = await getSnapshot(base);
         let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);

@@ -1,3 +1,4 @@
+// app/api/positions/open/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -10,10 +11,32 @@ type PositionWire = {
   ticker: string | null;
   shares: number | null;
   entryPrice: number | null;
-  entryAt: string | null; // ISO
+  entryAt: string | null;    // ISO
   stopLoss: number | null;
   takeProfit: number | null;
   error?: string;
+};
+
+// safe number → number|null
+const num = (v: any): number | null => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+// safe ISO date → string|null
+const iso = (d: any): string | null => {
+  const t = d instanceof Date ? d : (d ? new Date(d) : null);
+  return t && !isNaN(t.getTime()) ? t.toISOString() : null;
+};
+
+const EMPTY: PositionWire = {
+  open: false,
+  ticker: null,
+  shares: null,
+  entryPrice: null,
+  entryAt: null,
+  stopLoss: null,
+  takeProfit: null,
 };
 
 export async function GET() {
@@ -24,46 +47,29 @@ export async function GET() {
     });
 
     if (!row) {
-      return NextResponse.json({
-        open: false,
-        ticker: null,
-        shares: null,
-        entryPrice: null,
-        entryAt: null,
-        stopLoss: null,
-        takeProfit: null,
-      } satisfies PositionWire);
+      return NextResponse.json(EMPTY, { headers: { "Cache-Control": "no-store" } });
     }
 
-    const stopLoss = row.stopLoss ?? row.stop_price ?? null;
-    const takeProfit = row.takeProfit ?? row.target_price ?? null;
+    // map possible column aliases from your schema
+    const tickerRaw = row.ticker ?? row.symbol ?? null;
+    const entryPx   = num(row.entryPrice ?? row.avgEntry);
+    const sharesNum = num(row.shares ?? row.qty);
+    const sl        = num(row.stopLoss ?? row.stop_price);
+    const tp        = num(row.takeProfit ?? row.target_price);
 
     const payload: PositionWire = {
       open: true,
-      ticker: row.ticker ?? row.symbol ?? null,
-      shares: Number(row.shares ?? row.qty ?? 0) || null,
-      entryPrice:
-        row.entryPrice != null
-          ? Number(row.entryPrice)
-          : row.avgEntry != null
-          ? Number(row.avgEntry)
-          : null,
-      entryAt: row.entryAt ? new Date(row.entryAt).toISOString() : null,
-      stopLoss: stopLoss != null ? Number(stopLoss) : null,
-      takeProfit: takeProfit != null ? Number(takeProfit) : null,
+      ticker: typeof tickerRaw === "string" ? tickerRaw.toUpperCase() : null,
+      shares: Number.isFinite(sharesNum ?? NaN) ? Math.floor(sharesNum!) : null,
+      entryPrice: entryPx,
+      entryAt: iso(row.entryAt ?? row.enteredAt ?? row.createdAt),
+      stopLoss: sl,
+      takeProfit: tp,
     };
 
-    return NextResponse.json(payload);
+    return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
   } catch (e: any) {
-    return NextResponse.json({
-      open: false,
-      ticker: null,
-      shares: null,
-      entryPrice: null,
-      entryAt: null,
-      stopLoss: null,
-      takeProfit: null,
-      error: e?.message || "failed to load position",
-    } satisfies PositionWire);
+    const errPayload: PositionWire = { ...EMPTY, error: e?.message || "failed to load position" };
+    return NextResponse.json(errPayload, { headers: { "Cache-Control": "no-store" }, status: 200 });
   }
 }

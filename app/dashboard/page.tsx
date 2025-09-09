@@ -821,7 +821,7 @@ export default function Home() {
           <div className="grid gap-5">
             <div className="relative">
               {/* IMPORTANT: decoupled from Top Gainers clicks */}
-              <TradeChartPanel height={720} symbolWhenFlat={posChartSymbol} />
+              <TradeChartPanel height={720} />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
               </div>
