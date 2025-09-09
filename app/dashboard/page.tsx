@@ -10,16 +10,24 @@ import { useBotPoll } from "../components/useBotPoll";
 /* =========================================================
    Lazy components (no SSR)
    ========================================================= */
-// Positions chart (your existing implementation)
 const TradeChartPanel = dynamic<{ height?: number; symbolWhenFlat?: string }>(
   () => import("../components/TradeChartPanel"),
   { ssr: false }
 );
 
-// TradingView chart (for the modal on Top Gainers click)
 const TradingViewChart = dynamic<
-  { symbol: string; height?: number; theme?: "light" | "dark"; interval?: "1" | "3" | "5" | "15" | "30" | "60" | "120" | "240" | "D"; timezone?: string }
+  {
+    symbol: string;
+    height?: number;
+    theme?: "light" | "dark";
+    interval?: "1" | "3" | "5" | "15" | "30" | "60" | "120" | "240" | "D";
+    timezone?: string;
+  }
 >(() => import("../components/TradingViewChart").then((m) => m.default), {
+  ssr: false,
+});
+
+const Level2Panel = dynamic(() => import("../components/Level2Panel"), {
   ssr: false,
 });
 
@@ -43,7 +51,6 @@ function isMarketOpenET(d = nowET()): boolean {
   const beforeClose = h < 16;
   return afterOpen && beforeClose;
 }
-// narrator time window (weekdays, 9:30–9:45 ET)
 function inNarrationWindowET(d = nowET()): boolean {
   const day = d.getDay();
   if (day === 0 || day === 6) return false;
@@ -227,7 +234,6 @@ function FloatingNarrator() {
   const toggle = () => (isActive() ? stopAll() : start());
   const active = isActive();
 
-  // auto-start/stop window (9:30–9:45 ET on weekdays) + visibility guard
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -599,7 +605,10 @@ export default function Home() {
   const [recommendation, setRecommendation] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
 
-  // Modal (TradingView) state — used only for the modal
+  // Keep the two AI picks (for Level-2 tie-breaker)
+  const [topPicks, setTopPicks] = useState<string[]>([]);
+
+  // Modal (TradingView)
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const [chartVisible, setChartVisible] = useState(false);
   const [agentResult, setAgentResult] = useState<string | null>(null);
@@ -687,6 +696,7 @@ export default function Home() {
 
       if (!res.ok || data?.errorMessage) {
         setRecommendation(`Error: ${data?.errorMessage || res.statusText}`);
+        setTopPicks([]);
         return;
       }
 
@@ -694,15 +704,19 @@ export default function Home() {
       const reasons: Record<string, string[]> = data?.reasons || {};
       const risk: string = data?.risk || "";
 
+      setTopPicks(picks.slice(0, 2).map((t) => String(t).toUpperCase()));
+
       const lines: string[] = [];
       if (picks[0]) {
         lines.push(`Top 1: ${picks[0]}`);
-        if (Array.isArray(reasons[picks[0]]) && reasons[picks[0]].length) lines.push(`  • ${reasons[picks[0]].join("\n  • ")}`);
+        if (Array.isArray(reasons[picks[0]]) && reasons[picks[0]].length)
+          lines.push(`  • ${reasons[picks[0]].join("\n  • ")}`);
       }
       if (picks[1]) {
         lines.push("");
         lines.push(`Top 2: ${picks[1]}`);
-        if (Array.isArray(reasons[picks[1]]) && reasons[picks[1]].length) lines.push(`  • ${reasons[picks[1]].join("\n  • ")}`);
+        if (Array.isArray(reasons[picks[1]]) && reasons[picks[1]].length)
+          lines.push(`  • ${reasons[picks[1]].join("\n  • ")}`);
       }
       if (risk) {
         lines.push("");
@@ -711,6 +725,7 @@ export default function Home() {
       setRecommendation(lines.join("\n") || "No recommendation.");
     } catch {
       setRecommendation("Failed to analyze stocks. Check server logs.");
+      setTopPicks([]);
     } finally {
       setAnalyzing(false);
     }
@@ -719,8 +734,6 @@ export default function Home() {
   /* ===========================
      Chart behaviors (DECOUPLED)
      =========================== */
-
-  // Clicking a top gainer only controls the TradingView modal
   const handleStockClick = (ticker: string) => {
     setSelectedStock(ticker);
     setChartVisible(true);
@@ -732,12 +745,73 @@ export default function Home() {
     setAgentResult(null);
   };
 
-  // The positions chart should reflect ONLY an actual open position.
-  // If there is an open position, show that ticker; otherwise undefined.
   const posChartSymbol = useMemo(
     () => (tradeData?.openPos?.ticker ? String(tradeData.openPos.ticker).toUpperCase() : undefined),
     [tradeData?.openPos?.ticker]
   );
+
+  // Fallback symbols for tie-breaker (if AI hasn't picked yet)
+  const tieA = useMemo(() => {
+    const a = topPicks[0] || stocks[0]?.ticker || "AAPL";
+    return a.toUpperCase();
+  }, [topPicks, stocks]);
+  const tieB = useMemo(() => {
+    let candidate =
+      topPicks[1] ||
+      stocks.find((s) => s.ticker && s.ticker.toUpperCase() !== tieA)?.ticker ||
+      "MSFT";
+    candidate = String(candidate).toUpperCase();
+    if (candidate === tieA) candidate = "MSFT";
+    return candidate;
+  }, [topPicks, stocks, tieA]);
+
+  // Level-2 symbol pick via quick stats
+  type L2QuickStat = {
+    symbol: string;
+    buyCount: number;
+    sellCount: number;
+    buyNotional: number;
+    sellNotional: number;
+  };
+  const [l2Choice, setL2Choice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let timer: any;
+
+    async function fetchStats(a: string, b: string) {
+      try {
+        const q = [a, b].filter(Boolean).join(",");
+        if (!q) return;
+        const res = await fetch(`/api/level2/quick-stats?symbols=${encodeURIComponent(q)}`, { cache: "no-store" });
+        const data = await res.json();
+
+        const stats: Record<string, L2QuickStat> = data?.stats || {};
+        const sa = stats[a];
+        const sb = stats[b];
+
+        let pick = a;
+        if (sa && sb) {
+          if ((sb.buyNotional ?? 0) > (sa.buyNotional ?? 0)) pick = b;
+          else if ((sb.buyNotional ?? 0) === (sa.buyNotional ?? 0)) {
+            if ((sb.buyCount ?? 0) > (sa.buyCount ?? 0)) pick = b;
+          }
+        } else if (!sa && sb) {
+          pick = b;
+        } else {
+          pick = a;
+        }
+
+        setL2Choice(String(pick).toUpperCase());
+      } catch {
+        // keep previous choice on error
+      }
+    }
+
+    const run = () => fetchStats(tieA, tieB);
+    run();
+    timer = setInterval(run, 5000);
+    return () => clearInterval(timer);
+  }, [tieA, tieB]);
 
   const handleAgent = async () => {
     try {
@@ -749,9 +823,7 @@ export default function Home() {
       if (!res.ok) throw new Error("Failed to analyze chart");
       const data = await res.json();
       setAgentResult(
-        `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice || "Not provided"}\n\n${data.reason}\n\nPrediction: ${
-          data.prediction || "N/A"
-        }`
+        `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice || "Not provided"}\n\n${data.reason}\n\nPrediction: ${data.prediction || "N/A"}`
       );
     } catch {
       alert("Error analyzing the chart.");
@@ -768,7 +840,12 @@ export default function Home() {
     let n = 0;
     for (const t of all) {
       const ms =
-        pickMs(t.createdAt) ?? pickMs(t.time) ?? pickMs(t.ts) ?? pickMs(t.at) ?? pickMs(t.filledAt) ?? pickMs(t.executedAt);
+        pickMs(t.createdAt) ??
+        pickMs(t.time) ??
+        pickMs(t.ts) ??
+        pickMs(t.at) ??
+        pickMs(t.filledAt) ??
+        pickMs(t.executedAt);
       if (!ms) continue;
       if (ymdET(new Date(ms)) === todayKey) n++;
     }
@@ -776,6 +853,13 @@ export default function Home() {
   }, [statusTradesToday, tradeData]);
 
   const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
+
+  // Symbol to show if tie-breaker hasn't produced a choice yet
+  const l2SymbolDefault = useMemo(() => {
+    const botPick = botData?.lastRec?.ticker ? String(botData.lastRec.ticker).toUpperCase() : null;
+    const firstGainer = stocks[0]?.ticker ? String(stocks[0].ticker).toUpperCase() : null;
+    return botPick || firstGainer || "AAPL";
+  }, [botData?.lastRec?.ticker, stocks]);
 
   return (
     <main
@@ -804,8 +888,8 @@ export default function Home() {
             </GlassPanel>
           </div>
 
-          {/* MIDDLE: Top Gainers */}
-          <div>
+          {/* MIDDLE: Top Gainers + Level 2 */}
+          <div className="grid gap-5">
             <TopGainers
               loading={loading}
               errorMessage={errorMessage}
@@ -815,12 +899,14 @@ export default function Home() {
               analyzing={analyzing}
               onPick={handleStockClick}
             />
+
+            {/* Level-2 (use tie-breaker choice if available) */}
+            <Level2Panel symbol={(l2Choice || l2SymbolDefault)} mock={true} height={380} />
           </div>
 
-          {/* RIGHT: Positions chart (TradeChartPanel) + status cards */}
+          {/* RIGHT: Positions chart + status cards */}
           <div className="grid gap-5">
             <div className="relative">
-              {/* IMPORTANT: decoupled from Top Gainers clicks */}
               <TradeChartPanel height={720} />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
@@ -846,7 +932,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* ===== Modal: TradingViewChart (NOT TradeChartPanel) ===== */}
+      {/* ===== Modal: TradingViewChart ===== */}
       {chartVisible && selectedStock && (
         <div
           className="fixed inset-0 z-[120] flex items-center justify-center bg-black/50 p-4"

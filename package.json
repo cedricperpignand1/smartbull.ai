@@ -28,6 +28,7 @@
     "clsx": "^2.1.1",
     "framer-motion": "^12.23.12",
     "geist": "^1.4.2",
+    "ib": "^0.2.9",
     "lightningcss": "1.22.0",
     "lightweight-charts": "^5.0.8",
     "lucide-react": "^0.536.0",

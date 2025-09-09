@@ -12,6 +12,7 @@ import {
 } from "../../../lib/fmpCached";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 /* ──────────────────────────────────────────────────────────
    Config
@@ -39,7 +40,7 @@ const PM_END_H   = 9, PM_END_M   = 45;
 // Optional: global toggle to disable PM fetch without redeploy
 const PM_ENABLED = (process.env.RECOMMENDATION_PM_ENABLED ?? "true").toLowerCase() !== "false";
 
-// ⬇️ New: centralize your float threshold
+// ⬇️ Central float threshold (server-enforced)
 const MIN_FLOAT = 2_000_000;
 
 /* ──────────────────────────────────────────────────────────
@@ -261,7 +262,6 @@ async function getOrFetchPremarket(symbols: string[]) {
     pmLastFetchMs = 0;
   }
 
-  // After 09:45, if we already have a full snapshot → reuse
   const nowAfter945 = isAfterOrAt(PM_END_H, PM_END_M);
   const nowBefore9  = isBefore(PM_START_H, PM_START_M);
 
@@ -279,15 +279,13 @@ async function getOrFetchPremarket(symbols: string[]) {
     return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
   }
 
-  // Fetch the current partial window (09:00 → min(now, 09:45))
   const fresh = await fetchBarsWindow(symbols, startISO, endISO);
 
-  // Merge into cache
   for (const s of symbols) {
     pmCache[s] = fresh[s] || pmCache[s] || {};
   }
   pmCacheWindow = "09:00–09:45";
-  pmCacheEndISO = endISO; // note: before 09:45 this is a moving cap
+  pmCacheEndISO = endISO;
   pmLastFetchMs = nowMs;
 
   return { bySym: symbols.reduce((acc, s) => { acc[s] = pmCache[s] || {}; return acc; }, {} as Record<string, PMetrics>), skipped: null };
@@ -376,7 +374,6 @@ function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; empl
   const fMin = floats.length ? Math.min(...floats) : null;
   const fMax = floats.length ? Math.max(...floats) : null;
 
-  // log-scale employees to avoid domination by mega caps
   const log = (x: number) => Math.log10(Math.max(1, x));
   const eLogs = emps.map(log);
   const eMin = eLogs.length ? Math.min(...eLogs) : null;
@@ -395,20 +392,17 @@ function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; empl
   const W_AVG   = 0.15; // slight nudge for liquidity consistency
 
   return (row: { sharesOutstanding?: number|null; employees?: number|null; avgVolume?: number|null }) => {
-    // Float: reverse-normalize so smaller float → higher score
     const f = row.sharesOutstanding ?? null;
     let floatN = 0;
     if (f != null && fMin != null && fMax != null && fMax - fMin > 0) {
-      const straight = norm(f, fMin, fMax);   // small→0, big→1
-      floatN = 1 - straight;                  // invert: small→1, big→0
+      const straight = norm(f, fMin, fMax);
+      floatN = 1 - straight; // invert: small→1, big→0
     }
 
-    // Employees: log-normalized
     const e = row.employees ?? null;
     const eLog = e != null ? log(e) : null;
     const empN = norm(eLog, eMin, eMax);
 
-    // Avg volume: linear
     const avgN = norm(row.avgVolume ?? null, aMin, aMax);
 
     return W_FLOAT * floatN + W_EMP * empN + W_AVG * avgN; // 0..1
@@ -418,7 +412,6 @@ function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; empl
 /* ──────────────────────────────────────────────────────────
    NEW: Preference rules & comparator (hard guidance)
    ────────────────────────────────────────────────────────── */
-// Policy knobs (tuneable)
 const LOW_FLOAT_MAX = 50_000_000;      // treat as "low float" if <= 50M shares
 const SMALL_CAP_MAX = 1_000_000_000;   // treat as "small cap" if <= $1B
 
@@ -447,17 +440,14 @@ function compareByPreference(a: any, b: any) {
   if (aSm !== bSm) return aSm ? -1 : 1;
 
   if (aLow && bLow) {
-    // both low-float → favor higher employees
     const ae = a.employees ?? 0;
     const be = b.employees ?? 0;
     if (ae !== be) return be - ae;
-    // tie → smaller float wins
     const af = a.sharesOutstanding ?? Number.POSITIVE_INFINITY;
     const bf = b.sharesOutstanding ?? Number.POSITIVE_INFINITY;
     if (af !== bf) return af - bf;
   }
 
-  // quality fallbacks
   const pm = (b.pmScore ?? -1) - (a.pmScore ?? -1);
   if (Math.abs(pm) > 1e-12) return pm;
   const dv = (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0);
@@ -641,12 +631,11 @@ export async function POST(req: Request) {
         `RelVolFloat:${s.relVolFloat != null ? s.relVolFloat.toFixed(3) + "x" : "n/a"}`,
         `DollarVol:${s.dollarVolume != null ? Math.round(s.dollarVolume).toLocaleString() : "n/a"}`,
         `Employees:${s.employees ?? "n/a"}`,
-        `SoftPref:${((s as any).softPref ?? 0).toFixed(2)}`, // 0..1 helper for tie-break
+        `SoftPref:${((s as any).softPref ?? 0).toFixed(2)}`,
         `ProfitMarginTTM:${s.profitMarginTTM != null ? (Math.abs(s.profitMarginTTM) <= 1 ? (s.profitMarginTTM*100).toFixed(2) : s.profitMarginTTM.toFixed(2)) + "%" : "n/a"}`,
         `Sector:${s.sector ?? "n/a"}`,
         `Industry:${s.industry ?? "n/a"}`,
         `Headlines(+/-):${s.headlinePos}/${s.headlineNeg}`,
-        // ── Morning 09:00–09:45 fields ──
         `AM_High:${(s as any).pmHigh ?? "n/a"}`,
         `AM_Low:${(s as any).pmLow ?? "n/a"}`,
         `AM_RangePct:${(s as any).pmRangePct != null ? (((s as any).pmRangePct*100).toFixed(2) + "%") : "n/a"}`,
@@ -749,7 +738,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
 
     // Validate model picks against candidate set AND float threshold
     const byTicker: Record<string, any> = {};
-    for (const c of prefSorted) byTicker[String(c.ticker).toUpperCase()] = c;
+    for (const c of (prefSorted as any[])) byTicker[String(c.ticker).toUpperCase()] = c;
 
     const meetsFloat = (row: any) => (row?.sharesOutstanding ?? 0) >= MIN_FLOAT;
 
@@ -762,7 +751,6 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     const finalPicks: string[] = [];
     const already = new Set<string>();
 
-    // Helper: push if not already included
     const pushPick = (t: string) => {
       const u = t.toUpperCase();
       if (!already.has(u) && byTicker[u]) {
@@ -776,13 +764,11 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       if (finalPicks.length >= topN) break;
       const cand = byTicker[p];
 
-      // If cand violates preference while there exists a better one, replace
       const candLow = isLowFloat(cand?.sharesOutstanding);
       const candSm  = isSmallCap(cand?.marketCap);
 
       if (!(candLow || candSm)) {
-        // find a preferred alternative from prefSorted (must also meet float)
-        const alt = prefSorted.find(x =>
+        const alt = (prefSorted as any[]).find(x =>
           (isLowFloat(x.sharesOutstanding) || isSmallCap(x.marketCap)) &&
           (x?.sharesOutstanding ?? 0) >= MIN_FLOAT &&
           !already.has(String(x.ticker).toUpperCase())
@@ -794,9 +780,9 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     }
 
     // 2) Fill remaining slots strictly from preference order (still enforce float)
-    for (const c of prefSorted) {
+    for (const c of (prefSorted as any[])) {
       if (finalPicks.length >= topN) break;
-      if (!meetsFloat(c)) continue; // ⬅️ enforce again
+      if (!meetsFloat(c)) continue;
       pushPick(c.ticker);
     }
 
@@ -807,7 +793,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     const saved: any[] = [];
     for (const sym of finalPicks) {
       const t = sym.toUpperCase();
-      const c = prefSorted.find((x: any) => String(x.ticker).toUpperCase() === t);
+      const c = (prefSorted as any[]).find((x: any) => String(x.ticker).toUpperCase() === t);
       const priceNum = Number(c?.price ?? 0);
 
       const expl = buildExplanationForPick(t, c as any, reasonsMap[t], risk);
@@ -829,14 +815,14 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     return NextResponse.json({
       picks: finalPicks,
       primary: finalPicks[0] ?? null,
-      secondary: finalPicks[1] ?? null,   // ⬅️ front-end "two box" hook
+      secondary: finalPicks[1] ?? null,
       reasons: reasonsMap,
       risk: risk ?? "",
       savedCount: saved.length,
       saved,
       raw: typeof content === "string" ? content : JSON.stringify(content),
       context: {
-        tickers: prefSorted.map((x: any) => ({
+        tickers: (prefSorted as any[]).map((x: any) => ({
           ticker: x.ticker,
           price: x.price,
           changesPercentage: x.changesPercentage,
@@ -851,8 +837,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           profitMarginTTM: x.profitMarginTTM,
           headlinePos: x.headlinePos,
           headlineNeg: x.headlineNeg,
-          softPref: (x as any).softPref ?? 0, // expose for debugging
-          // Morning 09:00–09:45 context
+          softPref: (x as any).softPref ?? 0,
           amHigh: x.pmHigh ?? null,
           amLow: x.pmLow ?? null,
           amRangePct: x.pmRangePct ?? null,
@@ -860,7 +845,6 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           amVWAP: x.pmVWAP ?? null,
           amUpMinutePct: x.pmUpMinutePct ?? null,
           amScore: x.pmScore ?? null,
-          // preference flags
           isLowFloat: isLowFloat(x.sharesOutstanding),
           isSmallCap: isSmallCap(x.marketCap),
         })),
@@ -876,7 +860,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           defaultTopN: DEFAULT_TOP_N,
           lowFloatMax: LOW_FLOAT_MAX,
           smallCapMax: SMALL_CAP_MAX,
-          minFloat: MIN_FLOAT, // ⬅️ expose for debugging
+          minFloat: MIN_FLOAT,
         },
         nowET: nowET().toISOString(),
       },
