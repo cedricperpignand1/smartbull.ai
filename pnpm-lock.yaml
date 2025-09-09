@@ -35,6 +35,9 @@ importers:
       geist:
         specifier: ^1.4.2
         version: 1.4.2(next@14.2.32(react-dom@18.3.1(react@18.3.1))(react@18.3.1))
+      ib:
+        specifier: ^0.2.9
+        version: 0.2.9
       lightningcss:
         specifier: 1.22.0
         version: 1.22.0
@@ -626,6 +629,9 @@ packages:
     resolution: {integrity: sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA==}
     engines: {node: '>=6'}
 
+  command-buffer@0.1.0:
+    resolution: {integrity: sha512-HgU3HdxE1rQ0MWi+LM8AxTubzW1+r5EoPGy/V5XsqNFsZpU6phHLKBee+qRhEr2tMpNaWbqq2PyRF7ZsTlrIKQ==}
+
   confbox@0.2.2:
     resolution: {integrity: sha512-1NB+BKqhtNipMsov4xI/NnhCKp9XG9NamYp5PVm9klAT0fsrNPjaFICsCFhNhwZJKNh7zB/3q8qXz0E9oaMNtQ==}
 
@@ -725,6 +731,9 @@ packages:
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
 
+  function-rate-limit@1.1.0:
+    resolution: {integrity: sha512-XNFOWy3kSz+96MeBCDUMmsLMSb7SmkAIfnhOsPRPz9V2Dx2agNmqjT//3QvXOgIH7FcGPfXMj8peajKHYuQ/Sw==}
+
   geist@1.4.2:
     resolution: {integrity: sha512-OQUga/KUc8ueijck6EbtT07L4tZ5+TZgjw8PyWfxo16sL5FWk7gNViPNU8hgCFjy6bJi9yuTP+CRpywzaGN8zw==}
     peerDependencies:
@@ -739,6 +748,9 @@ packages:
 
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
+
+  ib@0.2.9:
+    resolution: {integrity: sha512-W+7j4Ghx7V+kwy9Uvic6sj9yONc6Oi6JGBz16s2UFveVqoFTrBhYWAzV1GU6ebqJCCFhHk5OnKBp8uHdheQuog==}
 
   jiti@2.5.1:
     resolution: {integrity: sha512-twQoecYPiVA5K/h6SxtORw/Bs3ar+mLUtoPSc7iMXzQzK8d7eJ/R09wmTwAjiamETn1cXYPGfNnu7DMoHgu12w==}
@@ -874,6 +886,9 @@ packages:
 
   lightweight-charts@5.0.8:
     resolution: {integrity: sha512-dNBK5TlNcG78RUnxYRAZP4XpY5bkp3EE0PPjFFPkdIZ8RvnvL2JLgTb1BLh40trHhgJl51b1bCz8678GpnKvIw==}
+
+  lodash@4.17.21:
+    resolution: {integrity: sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg==}
 
   loose-envify@1.4.0:
     resolution: {integrity: sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==}
@@ -1617,6 +1632,8 @@ snapshots:
 
   clsx@2.1.1: {}
 
+  command-buffer@0.1.0: {}
+
   confbox@0.2.2: {}
 
   consola@3.4.2: {}
@@ -1708,6 +1725,8 @@ snapshots:
   fsevents@2.3.3:
     optional: true
 
+  function-rate-limit@1.1.0: {}
+
   geist@1.4.2(next@14.2.32(react-dom@18.3.1(react@18.3.1))(react@18.3.1)):
     dependencies:
       next: 14.2.32(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -1726,6 +1745,12 @@ snapshots:
       pathe: 2.0.3
 
   graceful-fs@4.2.11: {}
+
+  ib@0.2.9:
+    dependencies:
+      command-buffer: 0.1.0
+      function-rate-limit: 1.1.0
+      lodash: 4.17.21
 
   jiti@2.5.1: {}
 
@@ -1822,6 +1847,8 @@ snapshots:
   lightweight-charts@5.0.8:
     dependencies:
       fancy-canvas: 2.1.0
+
+  lodash@4.17.21: {}
 
   loose-envify@1.4.0:
     dependencies:
