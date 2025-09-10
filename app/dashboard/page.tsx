@@ -34,7 +34,7 @@ const Level2Panel = dynamic(() => import("../components/Level2Panel"), {
 /* =========================================================
    Constants
    ========================================================= */
-const CHAT_FIXED_HEIGHT_PX = 635;
+const CHAT_FIXED_HEIGHT_PX = 1100;
 
 /* =========================================================
    ET helpers
@@ -901,7 +901,7 @@ export default function Home() {
             />
 
             {/* Level-2 (use tie-breaker choice if available) */}
-            <Level2Panel symbol={(l2Choice || l2SymbolDefault)} mock={true} height={380} />
+            <Level2Panel symbol={(l2Choice || l2SymbolDefault)} mock={true} height={225} />
           </div>
 
           {/* RIGHT: Positions chart + status cards */}
