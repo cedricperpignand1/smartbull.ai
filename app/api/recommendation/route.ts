@@ -44,8 +44,10 @@ const PM_END_H   = 9, PM_END_M   = 45;
 // Optional: global toggle to disable PM fetch without redeploy
 const PM_ENABLED = (process.env.RECOMMENDATION_PM_ENABLED ?? "true").toLowerCase() !== "false";
 
-// ⬇️ Central float threshold (server-enforced)
-const MIN_FLOAT = 2_000_000;
+// ⬇️ Central thresholds (server-enforced)
+const MIN_FLOAT = 2_000_000;         // minimum float (shares outstanding)
+const MIN_LIVE_VOLUME = 500_000;     // minimum live (today) volume
+const MIN_AVG_VOLUME  = 500_000;     // minimum average volume
 
 /* ──────────────────────────────────────────────────────────
    Utils (time, numbers)
@@ -389,7 +391,7 @@ function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; empl
   const norm = (x: number|null, lo: number|null, hi: number|null) => {
     if (x == null || lo == null || hi == null || !Number.isFinite(x) || hi - lo <= 0) return 0;
     return Math.max(0, Math.min(1, (x - lo) / (hi - lo)));
-  };
+    };
 
   const W_FLOAT = 0.60; // strongest: smaller float better
   const W_EMP   = 0.25; // keep employees meaningful but not dominant
@@ -474,14 +476,24 @@ export async function POST(req: Request) {
 
     const body = await req.json();
     const stocksIn = body.gainers || body.stocks;
-    const topN = Math.max(1, Math.min(2, Number(body.topN ?? DEFAULT_TOP_N))); // ⬅️ default TWO
+    const topN = Math.max(1, Math.min(2, Number(body.topN ?? DEFAULT_TOP_N))); // default TWO
 
     if (!stocksIn || !Array.isArray(stocksIn) || stocksIn.length === 0) {
       return NextResponse.json({ errorMessage: "No valid stock data provided to /api/recommendation." }, { status: 400 });
     }
 
+    // ⬇️ Early input gate: drop anything with live volume < 500k
+    const stocksInFiltered = (stocksIn as any[]).filter((s: any) => {
+      const v = s?.volume;
+      return v != null && Number(v) >= MIN_LIVE_VOLUME;
+    });
+
+    if (!stocksInFiltered.length) {
+      return NextResponse.json({ errorMessage: "No symbols meet the minimum live volume requirement (≥ 500,000)." }, { status: 400 });
+    }
+
     // Normalize incoming (cap to MAX_INPUT)
-    const base = (stocksIn as any[]).slice(0, MAX_INPUT).map((s: any) => {
+    const base = (stocksInFiltered as any[]).slice(0, MAX_INPUT).map((s: any) => {
       const ticker = s.ticker || s.symbol;
       const price = num(s.price);
       const changesPercentage = num(s.changesPercentage);
@@ -552,27 +564,30 @@ export async function POST(req: Request) {
       (r as any).softPref = scoreSoft(r as any); // 0..1
     }
 
-    /* Hard filters (PRICE BAND: $1–$70 + enforce MIN_FLOAT) */
+    /* Hard filters (PRICE BAND: $1–$70 + enforce MIN_FLOAT + live/avg volume floors) */
     const filtered = enriched.filter((s) => {
-      const passAvgVol    = (s.avgVolume ?? 0) >= 500_000;
-      const passRelVol    = (s.relVol ?? 0) >= 3.0;
+      const passLiveVol   = (s.volume ?? 0)    >= MIN_LIVE_VOLUME; // ⬅️ new
+      const passAvgVol    = (s.avgVolume ?? 0) >= MIN_AVG_VOLUME;
+      const passRelVol    = (s.relVol ?? 0)    >= 3.0;
       const passDollarVol = (s.dollarVolume ?? 0) >= 10_000_000;
       const p = s.price ?? 0;
       const passPrice     = p >= 1 && p <= 70;
       const passVenue     = !s.isEtf && !s.isOTC;
-      const passFloat     = (s.sharesOutstanding ?? 0) >= MIN_FLOAT; // ⬅️ enforce here
-      return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
+      const passFloat     = (s.sharesOutstanding ?? 0) >= MIN_FLOAT;
+      return passLiveVol && passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
-    // EXTRA price-band safety: fallback also enforces float now
+    // EXTRA price-band safety: fallback also enforces float + live volume
     const enrichedPriceBand = enriched.filter((s) => {
       const p = s.price ?? 0;
       const f = s.sharesOutstanding ?? 0;
-      return p >= 1 && p <= 70 && f >= MIN_FLOAT; // ⬅️ enforce here too
+      return p >= 1 && p <= 70 && f >= MIN_FLOAT && (s.volume ?? 0) >= MIN_LIVE_VOLUME;
     });
 
-    // Last-chance fallback that still respects float
-    const lastChance = enriched.filter((s) => (s.sharesOutstanding ?? 0) >= MIN_FLOAT); // ⬅️ enforce here
+    // Last-chance fallback that still respects float + live volume
+    const lastChance = enriched.filter((s) =>
+      (s.sharesOutstanding ?? 0) >= MIN_FLOAT && (s.volume ?? 0) >= MIN_LIVE_VOLUME
+    );
 
     // Sort helper: prioritize AM tone if available, then DollarVol, then SoftPref
     const byComposite = (arr: any[]) =>
@@ -748,7 +763,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
 
     const validModel = picksFromModel.filter(p => {
       const c = byTicker[p];
-      return !!c && meetsFloat(c); // ⬅️ enforce here
+      return !!c && meetsFloat(c); // enforce float
     });
 
     // Build final picks with POST-ENFORCEMENT of policy
@@ -906,6 +921,8 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           lowFloatMax: LOW_FLOAT_MAX,
           smallCapMax: SMALL_CAP_MAX,
           minFloat: MIN_FLOAT,
+          minLiveVolume: MIN_LIVE_VOLUME,
+          minAvgVolume: MIN_AVG_VOLUME,
         },
         nowET: nowET().toISOString(),
       },

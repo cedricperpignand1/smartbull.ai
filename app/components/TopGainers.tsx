@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 
 type Mode = "auto" | "fmp" | "alpaca";
 
@@ -132,6 +132,17 @@ export default function TopGainers() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // ---- Filter config ----
+  const MIN_VOL = 500_000;
+  const MAX_ROWS = 8;
+
+  // Derived: filter out low-volume and limit to top 8 (assumes stocks already sorted by gain)
+  const filteredStocks = useMemo(() => {
+    return (stocks || [])
+      .filter((s) => (s.volume ?? 0) >= MIN_VOL)
+      .slice(0, MAX_ROWS);
+  }, [stocks]);
+
   // Centralized fetch that reads from the cached snapshot route
   const fetchData = async () => {
     try {
@@ -186,10 +197,11 @@ export default function TopGainers() {
     try {
       setAiLoading(true);
       setAiPick("");
+      // IMPORTANT: send only the filtered (>=500k vol) list
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks }),
+        body: JSON.stringify({ stocks: filteredStocks }),
       });
       const data = await res.json();
       setAiPick(data.recommendation || "No recommendation.");
@@ -225,6 +237,11 @@ export default function TopGainers() {
                 : sourceUsed}
             </span>
           )}
+
+          {/* Badge to indicate active volume filter */}
+          <span className="px-2 py-1 rounded text-xs bg-blue-100 text-blue-700" title="Hidden if volume < 500,000">
+            ≥500K Vol Filter
+          </span>
 
           {marketOpen !== null && (
             <span className="px-2 py-1 rounded text-xs bg-gray-100 text-gray-700">
@@ -265,6 +282,10 @@ export default function TopGainers() {
         <p>Loading...</p>
       ) : errorMessage ? (
         <p className="text-red-600">{errorMessage}</p>
+      ) : filteredStocks.length === 0 ? (
+        <div className="text-sm text-gray-700 bg-yellow-50 border border-yellow-200 rounded p-3">
+          No gainers meet the ≥500,000 volume requirement right now.
+        </div>
       ) : (
         <div className="flex-1 overflow-auto">
           {/* Rounded modern table */}
@@ -282,7 +303,7 @@ export default function TopGainers() {
             </thead>
 
             <tbody>
-              {stocks.map((s, i) => (
+              {filteredStocks.map((s, i) => (
                 <tr
                   key={i}
                   className="bg-white ring-1 ring-gray-200 shadow-sm hover:shadow-md transition-shadow"
@@ -313,7 +334,7 @@ export default function TopGainers() {
             <button
               onClick={getRecommendation}
               className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={!stocks.length || aiLoading}
+              disabled={!filteredStocks.length || aiLoading}
             >
               {aiLoading ? "Analyzing..." : "Get AI Pick"}
             </button>

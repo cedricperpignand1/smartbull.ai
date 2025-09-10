@@ -64,6 +64,11 @@ export async function POST(req: Request) {
 
   for (const stock of stocks) {
     try {
+      // 🚫 Skip if volume under 500K
+      if (!stock.volume || stock.volume < 500_000) {
+        continue;
+      }
+
       const news = await fetchNews(stock.ticker);
       const score = scoreStock(stock, news);
 
@@ -79,7 +84,7 @@ export async function POST(req: Request) {
 
   if (!bestStock) {
     return NextResponse.json({
-      recommendation: "Unable to analyze stocks. Try again later.",
+      recommendation: "No stocks met the minimum 500K volume requirement.",
     });
   }
 
