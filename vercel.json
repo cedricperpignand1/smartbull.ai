@@ -1,11 +1,10 @@
 {
   "version": 2,
   "crons": [
-   
     { "path": "/api/bot/tick", "schedule": "34-59 13 * * 1-5" },
     { "path": "/api/bot/tick", "schedule": "0-16 14 * * 1-5" },
+    { "path": "/api/bot/tick", "schedule": "0-2 15 * * 1-5" },
 
-    
     { "path": "/api/bot/tick", "schedule": "55-56 19 * * 1-5" },
 
     { "path": "/api/alpaca/sync", "schedule": "*/2 13-21 * * 1-5" },

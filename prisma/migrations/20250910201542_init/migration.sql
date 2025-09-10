@@ -1,6 +1,3 @@
-﻿-- CreateSchema
-CREATE SCHEMA IF NOT EXISTS "public";
-
 -- CreateTable
 CREATE TABLE "public"."User" (
     "id" TEXT NOT NULL,
@@ -52,10 +49,10 @@ CREATE TABLE "public"."VerificationToken" (
 -- CreateTable
 CREATE TABLE "public"."BotState" (
     "id" INTEGER NOT NULL DEFAULT 1,
-    "cash" DECIMAL(65,30) NOT NULL,
-    "pnl" DECIMAL(65,30) NOT NULL,
-    "equity" DECIMAL(65,30) NOT NULL,
-    "lastRunDay" TEXT,
+    "cash" DECIMAL(18,6) NOT NULL,
+    "pnl" DECIMAL(18,6) NOT NULL,
+    "equity" DECIMAL(18,6) NOT NULL,
+    "lastRunDay" VARCHAR(10),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -66,8 +63,9 @@ CREATE TABLE "public"."BotState" (
 CREATE TABLE "public"."Recommendation" (
     "id" SERIAL NOT NULL,
     "ticker" TEXT NOT NULL,
-    "price" DECIMAL(65,30) NOT NULL,
+    "price" DECIMAL(18,6),
     "at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "explanation" TEXT,
 
     CONSTRAINT "Recommendation_pkey" PRIMARY KEY ("id")
 );
@@ -76,12 +74,13 @@ CREATE TABLE "public"."Recommendation" (
 CREATE TABLE "public"."Position" (
     "id" SERIAL NOT NULL,
     "ticker" TEXT NOT NULL,
-    "entryPrice" DECIMAL(65,30) NOT NULL,
+    "entryPrice" DECIMAL(18,6) NOT NULL,
     "shares" INTEGER NOT NULL,
     "entryAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "open" BOOLEAN NOT NULL DEFAULT true,
-    "exitPrice" DECIMAL(65,30),
+    "exitPrice" DECIMAL(18,6),
     "exitAt" TIMESTAMP(3),
+    "brokerOrderId" TEXT,
 
     CONSTRAINT "Position_pkey" PRIMARY KEY ("id")
 );
@@ -91,9 +90,12 @@ CREATE TABLE "public"."Trade" (
     "id" SERIAL NOT NULL,
     "side" TEXT NOT NULL,
     "ticker" TEXT NOT NULL,
-    "price" DECIMAL(65,30) NOT NULL,
+    "price" DECIMAL(18,6) NOT NULL,
     "shares" INTEGER NOT NULL,
     "at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "brokerOrderId" TEXT,
+    "filledAt" TIMESTAMP(3),
+    "filledPrice" DECIMAL(18,6),
 
     CONSTRAINT "Trade_pkey" PRIMARY KEY ("id")
 );
@@ -113,9 +115,23 @@ CREATE UNIQUE INDEX "VerificationToken_token_key" ON "public"."VerificationToken
 -- CreateIndex
 CREATE UNIQUE INDEX "VerificationToken_identifier_token_key" ON "public"."VerificationToken"("identifier", "token");
 
+-- CreateIndex
+CREATE INDEX "Recommendation_ticker_at_idx" ON "public"."Recommendation"("ticker", "at");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Position_brokerOrderId_key" ON "public"."Position"("brokerOrderId");
+
+-- CreateIndex
+CREATE INDEX "Position_open_id_idx" ON "public"."Position"("open", "id");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Trade_brokerOrderId_key" ON "public"."Trade"("brokerOrderId");
+
+-- CreateIndex
+CREATE INDEX "Trade_ticker_at_idx" ON "public"."Trade"("ticker", "at");
+
 -- AddForeignKey
 ALTER TABLE "public"."Account" ADD CONSTRAINT "Account_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "public"."Session" ADD CONSTRAINT "Session_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-

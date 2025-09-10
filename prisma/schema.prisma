@@ -1,19 +1,14 @@
-// ----------
-// Datasource & Generator
-// ----------
-datasource db {
-  provider          = "postgresql"
-  url               = env("DATABASE_URL")
-  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
-}
-
 generator client {
   provider = "prisma-client-js"
 }
 
-// ----------
-// AUTH MODELS (NextAuth.js compatible)
-// ----------
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  directUrl         = env("DIRECT_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
 model User {
   id             String    @id @default(cuid())
   name           String?
@@ -60,15 +55,12 @@ model VerificationToken {
   @@unique([identifier, token])
 }
 
-// ----------
-// BOT TRADING MODELS
-// ----------
 model BotState {
   id         Int      @id @default(1)
-  cash       Decimal
-  pnl        Decimal
-  equity     Decimal
-  lastRunDay String? // YYYY-MM-DD in ET
+  cash       Decimal  @db.Decimal(18, 6)
+  pnl        Decimal  @db.Decimal(18, 6)
+  equity     Decimal  @db.Decimal(18, 6)
+  lastRunDay String?  @db.VarChar(10)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 }
@@ -76,9 +68,9 @@ model BotState {
 model Recommendation {
   id          Int      @id @default(autoincrement())
   ticker      String
-  price       Decimal   // Price at recommendation time
-  at          DateTime  @default(now())
-  explanation String?   // <-- NEW: optional text explaining why the AI picked it
+  price       Decimal? @db.Decimal(18, 6)
+  at          DateTime @default(now())
+  explanation String?
 
   @@index([ticker, at])
 }
@@ -86,29 +78,27 @@ model Recommendation {
 model Position {
   id            Int       @id @default(autoincrement())
   ticker        String
-  entryPrice    Decimal
+  entryPrice    Decimal   @db.Decimal(18, 6)
   shares        Int
   entryAt       DateTime  @default(now())
   open          Boolean   @default(true)
-  exitPrice     Decimal?
+  exitPrice     Decimal?  @db.Decimal(18, 6)
   exitAt        DateTime?
-
-  // Alpaca parent BUY order id
   brokerOrderId String?   @unique
+
+  @@index([open, id])
 }
 
 model Trade {
-  id           Int      @id @default(autoincrement())
-  side         String   // "BUY" | "SELL"
-  ticker       String
-  price        Decimal
-  shares       Int
-  at           DateTime @default(now())
+  id            Int       @id @default(autoincrement())
+  side          String
+  ticker        String
+  price         Decimal   @db.Decimal(18, 6)
+  shares        Int
+  at            DateTime  @default(now())
+  brokerOrderId String?   @unique
+  filledAt      DateTime?
+  filledPrice   Decimal?  @db.Decimal(18, 6)
 
-  // Alpaca order id for this trade (parent for BUY, leg for SELL, or market close)
-  brokerOrderId String?  @unique
-
-  // Actual fill info (from Alpaca)
-  filledAt     DateTime?
-  filledPrice  Decimal?
+  @@index([ticker, at])
 }

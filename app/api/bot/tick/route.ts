@@ -50,7 +50,7 @@ function getBaseUrl(req: Request) {
 function yyyyMmDdLocal(d: Date) {
   const dt = new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const mo = String(dt.getMonth() + 1).padStart(2, "0");
-  const da = String(dt.getDate()).padStart(2, "0");
+  const da = String(dt.getDate() + 0).padStart(2, "0");
   return `${dt.getFullYear()}-${mo}-${da}`;
 }
 function yyyyMmDd(date: Date) {
@@ -131,6 +131,34 @@ function inWindow930to945ET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
   return mins >= 9 * 60 + 30 && mins <= 9 * 60 + 45;
+}
+
+/* ---------- SECOND ATTEMPT WINDOW HELPERS ---------- */
+/** 2nd attempt entry window: 10:00:00–10:01:59 ET */
+function inSecondForceWindow() {
+  const d = nowET();
+  return d.getHours() === 10 && (d.getMinutes() === 0 || d.getMinutes() === 1);
+}
+/** End-of-2nd-attempt failsafe: clear day-lock around 10:01:30+ */
+function inEndOfSecondForceFailsafe() {
+  const d = nowET();
+  return d.getHours() === 10 && d.getMinutes() === 1 && d.getSeconds() >= 30;
+}
+/** Have we already placed any BUY after 09:46:00 ET today? (DB-backed) */
+async function hasBuyAfter946TodayDB(): Promise<boolean> {
+  const now = nowET();
+  const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const start946 = new Date(etNow);
+  start946.setHours(9, 46, 0, 0);
+
+  const buy = await prisma.trade.findFirst({
+    where: {
+      side: "BUY",
+      at: { gte: start946, lte: nowET() },
+    },
+    orderBy: { at: "desc" },
+  });
+  return !!buy;
 }
 
 /* -------------------------- buy-the-dip -------------------------- */
@@ -270,7 +298,7 @@ function toET(dateIso: string) {
 }
 function isSameETDay(d: Date, ymd: string) {
   const mo = String(d.getMonth() + 1).padStart(2, "0");
-  const da = String(d.getDate()).padStart(2, "0");
+  const da = String(d.getDate() + 0).padStart(2, "0");
   return `${d.getFullYear()}-${mo}-${da}` === ymd;
 }
 async function fetchCandles1m(symbol: string, limit: number, baseUrl: string): Promise<Candle[]> {
@@ -618,6 +646,9 @@ async function placeEntryNow(ticker: string, ref: number, state: any) {
     });
   } catch (e: any) {
     const msg = e?.message || "unknown";
+    the_body: {
+      /* avoid leaking big bodies in debug */
+    }
     const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
@@ -941,6 +972,98 @@ async function handle(req: Request) {
         if (state!.lastRunDay === yyyyMmDdET()) {
           await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
           (debug.reasons as string[]).push("force_failsafe_cleared_day_lock");
+        }
+      }
+
+      /* --------------------- SECOND ATTEMPT 10:00–10:01 --------------------- */
+      if (!openPos && marketOpen && inSecondForceWindow() && state!.lastRunDay !== today) {
+        if (await hasBuyAfter946TodayDB()) {
+          debug.reasons.push("second_force_skipped_buy_after_946");
+        } else {
+          let snapshot = await getSnapshot(base);
+          let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
+          if (!top.length && lastGoodSnapshot && lastGoodSnapshotDay === today) {
+            top = lastGoodSnapshot.stocks.slice(0, TOP_CANDIDATES);
+            debug.used_last_good_snapshot_second_force = true;
+          }
+          const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
+          const candidates = affordableTop.length ? affordableTop : top;
+
+          debug.second_force_top = candidates.map((s) => s.ticker);
+          debug.second_force_affordable_count = affordableTop.length;
+
+          const BURST_TRIES = 10;
+          const BURST_DELAY_MS = 300;
+
+          for (let i = 0; i < BURST_TRIES && !openPos; i++) {
+            const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
+            if (lastRecRow?.ticker) lastRec = lastRecRow;
+
+            const picks = [primary, secondary].filter(Boolean) as string[];
+            if (!picks.length) {
+              debug.reasons.push(`second_force_no_ai_pick_iter_${i}`);
+              await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+              continue;
+            }
+
+            debug[`second_force_iter_${i}_picks`] = picks;
+
+            let entered = false;
+            for (const sym of picks) {
+              let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
+              if (!Number.isFinite(Number(ref))) {
+                const q = await fmpQuoteCached(sym!);
+                const p = priceFromFmp(q);
+                if (p != null) ref = p;
+              }
+              if (ref == null || !Number.isFinite(Number(ref))) {
+                debug.reasons.push(`second_force_no_price_for_entry_${sym}`);
+                continue;
+              }
+              if (ref < PRICE_MIN || ref > PRICE_MAX) {
+                debug.reasons.push(`second_force_price_band_fail_${sym}_${Number(ref).toFixed(2)}`);
+                continue;
+              }
+              const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
+              const spreadOK = await spreadGuardOK(sym!, spreadLimit);
+              if (!spreadOK) {
+                debug.reasons.push(`second_force_spread_guard_fail_${sym}_limit=${(spreadLimit * 100).toFixed(2)}%`);
+                continue;
+              }
+
+              const claim = await prisma.botState.updateMany({
+                where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: yyyyMmDdET() } }] },
+                data: { lastRunDay: yyyyMmDdET() },
+              });
+              const claimed = claim.count === 1;
+              if (!claimed) continue;
+
+              const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+              if (already) continue;
+
+              const placed = await placeEntryNow(sym!, Number(ref), state!);
+              if (placed.ok) {
+                debug.lastMessage = `✅ 10:00 SECOND FORCE BUY (guards ok) ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares})`;
+                openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+                entered = true;
+                break;
+              } else {
+                debug.reasons.push(`second_force_place_entry_failed_${sym}:${placed.reason}`);
+                await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+              }
+            }
+
+            if (entered) break;
+            await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+          }
+        }
+      }
+
+      // End-of-second-force failsafe: clear day-lock if nothing filled by ~10:01:30
+      if (!openPos && inEndOfSecondForceFailsafe()) {
+        if (state!.lastRunDay === yyyyMmDdET()) {
+          await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+          debug.reasons.push("second_force_failsafe_cleared_day_lock");
         }
       }
 
