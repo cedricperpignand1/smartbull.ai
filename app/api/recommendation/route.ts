@@ -25,6 +25,10 @@ const OPENAI_ORG = process.env.OPENAI_ORGANIZATION_ID || "";
 const ALPACA_KEY = process.env.ALPACA_KEY || process.env.ALPACA_API_KEY || "";
 const ALPACA_SECRET = process.env.ALPACA_SECRET || process.env.ALPACA_API_SECRET || "";
 
+// Base URL for server→server fetch (e.g. https://yourapp.com). Leave blank locally.
+const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL || "";
+const makeUrl = (p: string) => (BASE_URL ? `${BASE_URL}${p}` : p);
+
 /* ──────────────────────────────────────────────────────────
    Limits to control API usage
    ────────────────────────────────────────────────────────── */
@@ -789,6 +793,35 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     const reasonsMap: Record<string, string[]> = modelObj?.reasons || {};
     const risk: string | undefined = typeof modelObj?.risk === "string" ? modelObj.risk : undefined;
 
+    /* ──────────────────────────────────────────────────────
+       ---- L2 tiebreaker (place after finalPicks is set) ----
+       Uses your Level-2 pressure endpoint to possibly swap the top two.
+       Fails safe if endpoint is unavailable.
+       ────────────────────────────────────────────────────── */
+    try {
+      const toRank = (finalPicks as string[]).slice(0, 2);
+      if (toRank.length === 2) {
+        const qs = encodeURIComponent(toRank.join(","));
+        const r = await fetch(makeUrl(`/api/l2/pressure?symbols=${qs}`), { cache: "no-store" });
+        if (r.ok) {
+          const j = await r.json();
+          const map: Record<string, number | null> = {};
+          for (const row of (j?.results ?? [])) {
+            map[String(row.symbol).toUpperCase()] = (typeof row.score === "number" ? row.score : null);
+          }
+          const a = toRank[0].toUpperCase();
+          const b = toRank[1].toUpperCase();
+          const sa = map[a]; const sb = map[b];
+          if (sa != null && sb != null && sb > sa) {
+            // swap: pick the one with higher buy pressure as primary
+            finalPicks[0] = b;
+            finalPicks[1] = a;
+          }
+        }
+      }
+    } catch { /* ignore L2 errors and keep original order */ }
+    /* ---- /L2 tiebreaker ---- */
+
     /* Save picks with explanation (includes AM bullets if present) */
     const saved: any[] = [];
     for (const sym of finalPicks) {
@@ -812,8 +845,20 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       }
     }
 
+    // 🔔 Tell the L2 streaming layer which 1–2 symbols to track now (uses swapped order if any)
+    try {
+      const toTrack = finalPicks.slice(0, 2);
+      if (toTrack.length) {
+        fetch(makeUrl(`/api/l2/track`), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbols: toTrack })
+        }).catch(() => {});
+      }
+    } catch {}
+
     return NextResponse.json({
-      picks: finalPicks,
+      picks: finalPicks.slice(0, 2),
       primary: finalPicks[0] ?? null,
       secondary: finalPicks[1] ?? null,
       reasons: reasonsMap,
