@@ -605,13 +605,6 @@ export default function Home() {
   const [recommendation, setRecommendation] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
 
-  // === NEW: Filter & limit to top 8 by ≥500K volume ===
-  const MIN_VOL = 500_000;
-  const filteredGainers = useMemo(
-    () => (stocks || []).filter((s) => (s.volume ?? 0) >= MIN_VOL).slice(0, 8),
-    [stocks]
-  );
-
   // Keep the two AI picks (for Level-2 tie-breaker)
   const [topPicks, setTopPicks] = useState<string[]>([]);
 
@@ -689,7 +682,7 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // Ask AI recs — send ONLY the filtered list (>=500k vol, top 8)
+  // Ask AI recs
   const askAIRecommendation = async () => {
     try {
       setAnalyzing(true);
@@ -697,7 +690,7 @@ export default function Home() {
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks: filteredGainers, topN: 2 }),
+        body: JSON.stringify({ stocks: stocks.slice(0, 20), topN: 2 }),
       });
       const data = await res.json();
 
@@ -757,20 +750,20 @@ export default function Home() {
     [tradeData?.openPos?.ticker]
   );
 
-  // Fallback symbols for tie-breaker (use filtered list)
+  // Fallback symbols for tie-breaker (if AI hasn't picked yet)
   const tieA = useMemo(() => {
-    const a = topPicks[0] || filteredGainers[0]?.ticker || "AAPL";
+    const a = topPicks[0] || stocks[0]?.ticker || "AAPL";
     return a.toUpperCase();
-  }, [topPicks, filteredGainers]);
+  }, [topPicks, stocks]);
   const tieB = useMemo(() => {
     let candidate =
       topPicks[1] ||
-      filteredGainers.find((s) => s.ticker && s.ticker.toUpperCase() !== tieA)?.ticker ||
+      stocks.find((s) => s.ticker && s.ticker.toUpperCase() !== tieA)?.ticker ||
       "MSFT";
     candidate = String(candidate).toUpperCase();
     if (candidate === tieA) candidate = "MSFT";
     return candidate;
-  }, [topPicks, filteredGainers, tieA]);
+  }, [topPicks, stocks, tieA]);
 
   // Level-2 symbol pick via quick stats
   type L2QuickStat = {
@@ -861,12 +854,12 @@ export default function Home() {
 
   const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
 
-  // Symbol to show if tie-breaker hasn't produced a choice yet (use filtered list)
+  // Symbol to show if tie-breaker hasn't produced a choice yet
   const l2SymbolDefault = useMemo(() => {
     const botPick = botData?.lastRec?.ticker ? String(botData.lastRec.ticker).toUpperCase() : null;
-    const firstGainer = filteredGainers[0]?.ticker ? String(filteredGainers[0].ticker).toUpperCase() : null;
+    const firstGainer = stocks[0]?.ticker ? String(stocks[0].ticker).toUpperCase() : null;
     return botPick || firstGainer || "AAPL";
-  }, [botData?.lastRec?.ticker, filteredGainers]);
+  }, [botData?.lastRec?.ticker, stocks]);
 
   return (
     <main
@@ -896,12 +889,11 @@ export default function Home() {
           </div>
 
           {/* MIDDLE: Top Gainers + Level 2 */}
-          {/* filtered ≥500k & top 8 */}
           <div className="grid gap-5">
             <TopGainers
               loading={loading}
               errorMessage={errorMessage}
-              stocks={filteredGainers}     
+              stocks={stocks}
               dataSource={dataSource}
               onAskAI={askAIRecommendation}
               analyzing={analyzing}
@@ -927,7 +919,7 @@ export default function Home() {
                 alpaca={alpaca}
                 analyzing={analyzing}
                 askAI={askAIRecommendation}
-                stocksCount={filteredGainers.length}  
+                stocksCount={stocks.length}
                 recommendation={recommendation}
               />
               <BotStatus statusError={statusError} statusTick={statusTick} todayTradeCount={todayTradeCount} />
