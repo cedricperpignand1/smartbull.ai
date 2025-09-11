@@ -861,6 +861,18 @@ export default function Home() {
     return botPick || firstGainer || "AAPL";
   }, [botData?.lastRec?.ticker, stocks]);
 
+  // === NEW: Only allow fallback BEFORE 4:00 PM ET (so it clears at 4pm) ===
+  const beforeCloseET = useMemo(() => {
+    const d = nowET();
+    const mins = d.getHours() * 60 + d.getMinutes();
+    return mins <= 16 * 60; // 4:00pm ET
+  }, []);
+
+  const fallbackSymbolBeforeClose =
+    beforeCloseET
+      ? (posChartSymbol || l2Choice || stocks[0]?.ticker?.toUpperCase() || "AAPL")
+      : undefined;
+
   return (
     <main
       className="min-h-screen w-full flex flex-col"
@@ -907,7 +919,11 @@ export default function Home() {
           {/* RIGHT: Positions chart + status cards */}
           <div className="grid gap-5">
             <div className="relative">
-              <TradeChartPanel height={720} />
+              <TradeChartPanel
+                height={720}
+                // Fallback only before 4:00pm ET; after 4pm, panel clears unless a position is open
+                symbolWhenFlat={fallbackSymbolBeforeClose}
+              />
               <div className="absolute right-4 top-3 z-10">
                 <PanicSellButton disabled={!hasOpenPos} />
               </div>
