@@ -9,8 +9,8 @@ import { isWeekdayET, isMarketHoursET, yyyyMmDdET, nowET } from "@/lib/market";
 import {
   submitBracketBuy,
   closePositionMarket,
-  replaceTpSlIfBetter,
-  getPosition,               // ⬅️ added
+  replaceTpSlIfBetter,   // will be called with {force:true} right after fill
+  getPosition,
   getBars1m,
   premarketRangeISO,
   computePremarketLevelsFromBars,
@@ -67,14 +67,15 @@ const MIN_TICK_MS = 200;
 
 const START_CASH = 4000;
 const INVEST_BUDGET = 4000;
-const TARGET_PCT = 0.10;
-const STOP_PCT = -0.05;
+const TARGET_PCT = 0.10;   // +10% TP from *fill*
+const STOP_PCT = -0.05;    // -5% SL from fill (initial)
 const TOP_CANDIDATES = 8;
 
-const RATCHET_ENABLED = true;
+/** Disable built-in ratchet so it doesn't fight our new trailing logic */
+const RATCHET_ENABLED = false;              // <-- disabled
 const RATCHET_STEP_PCT = 0.05;
-const RATCHET_LIFT_BROKER_CHILDREN = true;
-const RATCHET_VIRTUAL_EXITS = true;
+const RATCHET_LIFT_BROKER_CHILDREN = false; // <-- disabled
+const RATCHET_VIRTUAL_EXITS = false;        // <-- disabled
 const LIFT_COOLDOWN_MS = 6000;
 const ratchetLiftMemo: Record<string, { lastStep: number; lastLiftAt: number }> = {};
 
@@ -102,6 +103,10 @@ const FLOAT_MIN_PCT_PER_MIN = 0.001;
 const MIN_DOLLAR_VOL = 75_000;
 /* ===================================================================================== */
 
+/* -------------------------- NEW trailing config -------------------------- */
+const TRAIL_STEP_PCT = 0.05;           // 5% step for trailing on the remaining half
+const BREAKEVEN_TRIGGER_PCT = 0.05;    // when price is +5% above fill, lift SL to ≥ breakeven
+
 /* -------------------------- time windows -------------------------- */
 function inPreScanWindow() {
   const d = nowET(); const mins = d.getHours() * 60 + d.getMinutes(); const s = d.getSeconds();
@@ -126,7 +131,7 @@ function isMandatoryExitET() {
   return mins >= (15 * 60 + 50);
 }
 
-/* >>>>>>>>>>>>>>> NEW: constant 0.70% spread window helper <<<<<<<<<<<<<<< */
+/* >>>>>>>>>>>>>>> constant spread helper (kept) <<<<<<<<<<<<<<< */
 function inWindow930to945ET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
@@ -134,17 +139,14 @@ function inWindow930to945ET() {
 }
 
 /* ---------- SECOND ATTEMPT WINDOW HELPERS ---------- */
-/** 2nd attempt entry window: 10:00:00–10:01:59 ET */
 function inSecondForceWindow() {
   const d = nowET();
   return d.getHours() === 10 && (d.getMinutes() === 0 || d.getMinutes() === 1);
 }
-/** End-of-2nd-attempt failsafe: clear day-lock around 10:01:30+ */
 function inEndOfSecondForceFailsafe() {
   const d = nowET();
   return d.getHours() === 10 && d.getMinutes() === 1 && d.getSeconds() >= 30;
 }
-/** Have we already placed any BUY after 09:46:00 ET today? (DB-backed) */
 async function hasBuyAfter946TodayDB(): Promise<boolean> {
   const now = nowET();
   const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
@@ -152,10 +154,7 @@ async function hasBuyAfter946TodayDB(): Promise<boolean> {
   start946.setHours(9, 46, 0, 0);
 
   const buy = await prisma.trade.findFirst({
-    where: {
-      side: "BUY",
-      at: { gte: start946, lte: nowET() },
-    },
+    where: { side: "BUY", at: { gte: start946, lte: nowET() } },
     orderBy: { at: "desc" },
   });
   return !!buy;
@@ -490,7 +489,7 @@ function passesRelaxedLiquidity(
 }
 /* =================================================================================== */
 
-/* >>>>>>>>>>>>>>> REPLACED: dynamic spread function <<<<<<<<<<<<<<< */
+/* >>>>>>>>>>>>>>> dynamic spread function <<<<<<<<<<<<<<< */
 function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
   if (inWindow930to945ET()) {
     return 0.01; // 1%
@@ -514,7 +513,7 @@ function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" |
   return toPct(base);
 }
 
-/* -------------------------- ratchet targets -------------------------- */
+/* -------------------------- ratchet targets (kept but disabled) -------------------------- */
 function computeRatchetTargets(entry: number, dayHighSinceOpen: number) {
   if (!RATCHET_ENABLED) return null;
   if (!Number.isFinite(entry) || !Number.isFinite(dayHighSinceOpen) || entry <= 0) return null;
@@ -646,9 +645,7 @@ async function placeEntryNow(ticker: string, ref: number, state: any) {
     });
   } catch (e: any) {
     const msg = e?.message || "unknown";
-    the_body: {
-      /* avoid leaking big bodies in debug */
-    }
+    the_body: { /* avoid leaking big bodies in debug */ }
     const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
@@ -665,14 +662,15 @@ async function placeEntryNow(ticker: string, ref: number, state: any) {
   }
   if (!Number.isFinite(entry)) entry = ref; // fallback
 
-  // 3) Recenter TP/SL from the REAL fill (fixes the 5% risk drift).
-  const newTp = entry * (1 + TARGET_PCT);
-  const newSl = entry * (1 + STOP_PCT);
+  // 3) Recenter TP/SL from the REAL fill (force exact 10%/5% relative to *fill*).
+  const newTp = Math.round(entry * (1 + TARGET_PCT) * 100) / 100;
+  const newSl = Math.round(entry * (1 + STOP_PCT) * 100) / 100;
   try {
-    await replaceTpSlIfBetter({ symbol: ticker, newTp, newSl });
+    // IMPORTANT: use force=true so TP can go DOWN from the temporary value
+    await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true });
   } catch { /* best effort */ }
 
-  // 4) Persist REAL entry (so PnL/ratchet use true cost basis).
+  // 4) Persist REAL entry (so PnL/trailing use true cost basis).
   await prisma.position.create({ data: { ticker, entryPrice: entry, shares, open: true, brokerOrderId: order.id } });
   await prisma.trade.create({ data: { side: "BUY", ticker, price: entry, shares, brokerOrderId: order.id } });
   await prisma.botState.update({
@@ -686,6 +684,8 @@ async function placeEntryNow(ticker: string, ref: number, state: any) {
 /* -------------------------- memos -------------------------- */
 const partialTPMemo: Record<string, { day: string; taken: boolean }> = {};
 const lastDynSLMemo: Record<string, { day: string; sl: number }> = {};
+type TrailState = { day: string; active: boolean; anchor: number };
+const trailHalfMemo: Record<string, TrailState> = {};
 
 /* -------------------------- handlers -------------------------- */
 export async function GET(req: Request) { return handle(req); }
@@ -1067,7 +1067,7 @@ async function handle(req: Request) {
         }
       }
 
-      // Holding loop (live price, ratchet, partial TP)
+      // Holding loop (live price, trailing, partial TP)
       if (openPos) {
         const q = await fmpQuoteCached(openPos.ticker);
         const pParsed = priceFromFmp(q);
@@ -1082,14 +1082,25 @@ async function handle(req: Request) {
 
           try {
             const todayYMD = yyyyMmDdET();
+            const base = getBaseUrl(req);
             const candles = await fetchCandles1m(openPos.ticker, 240, base);
             const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
             if (day.length >= 2) {
-              const prior = day.slice(0, -1);
-              const dayHigh = Math.max(...prior.map((c) => c.high));
               const entry = Number(openPos.entryPrice);
-              const rat = computeRatchetTargets(entry, dayHigh);
 
+              /* --- Pre-partial protection: once price ≥ entry * (1+5%), lift SL to ≥ breakeven --- */
+              {
+                const memoKey = `${openPos.ticker}:${todayYMD}`;
+                if (p >= entry * (1 + BREAKEVEN_TRIGGER_PCT)) {
+                  const breakevenSL = Math.round(entry * 100) / 100;
+                  try {
+                    await replaceTpSlIfBetter({ symbol: openPos.ticker, newSl: breakevenSL });
+                    lastDynSLMemo[memoKey] = { day: todayYMD, sl: Math.max(lastDynSLMemo[memoKey]?.sl ?? 0, breakevenSL) };
+                  } catch {}
+                }
+              }
+
+              /* --- Base half-take at exact +10% TP from fill --- */
               const baseTP = Math.round(entry * (1 + TARGET_PCT) * 100) / 100;
               const memoKey = `${openPos.ticker}:${todayYMD}`;
               const alreadyTookHalf = partialTPMemo[memoKey]?.taken === true && partialTPMemo[memoKey].day === todayYMD;
@@ -1110,80 +1121,45 @@ async function handle(req: Request) {
                     });
 
                     partialTPMemo[memoKey] = { day: todayYMD, taken: true };
+
+                    // refresh openPos
                     openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
 
-                    if (rat && RATCHET_LIFT_BROKER_CHILDREN && openPos) {
-                      const prev = lastDynSLMemo[memoKey]?.sl ?? rat.initialSL;
-                      const monotonicSL = Math.max(prev, rat.dynSL);
-                      try {
-                        await replaceTpSlIfBetter({ symbol: openPos.ticker, newTp: rat.dynTP, newSl: monotonicSL });
-                        lastDynSLMemo[memoKey] = { day: todayYMD, sl: monotonicSL };
-                      } catch {}
-                    }
+                    // Start trailing for remaining half
+                    trailHalfMemo[memoKey] = { day: todayYMD, active: true, anchor: p };
                   } catch (e: any) {
                     debug.reasons.push(`partial_tp_sell_exception:${e?.message || "unknown"}`);
                   }
                 }
               }
 
-              if (rat && openPos) {
-                const prevSL = lastDynSLMemo[memoKey]?.sl ?? rat.initialSL;
-                const monotonicSL = Math.max(prevSL, rat.dynSL);
-                lastDynSLMemo[memoKey] = { day: todayYMD, sl: monotonicSL };
-                debug.ratchet = { steps: rat.steps, dayHigh: Math.round(dayHigh * 100) / 100, dynSL: monotonicSL, dynTP: rat.dynTP };
+              /* --- Trailing mode for remaining half: +/− 5% bands that step up --- */
+              {
+                const tstate = trailHalfMemo[memoKey];
+                if (tstate?.active && openPos) {
+                  let newAnchor = tstate.anchor;
+                  // advance anchor only when price has moved ≥ +5% above prior anchor
+                  if (p >= tstate.anchor * (1 + TRAIL_STEP_PCT)) {
+                    newAnchor = p;
+                  }
 
-                if (RATCHET_LIFT_BROKER_CHILDREN) {
-                  const key = openPos.ticker;
-                  const memo = ratchetLiftMemo[key] || { lastStep: -1, lastLiftAt: 0 };
-                  const nowTs = Date.now();
-                  if (rat.steps > memo.lastStep && (nowTs - memo.lastLiftAt) >= LIFT_COOLDOWN_MS) {
-                    try {
-                      const replaced = await replaceTpSlIfBetter({ symbol: key, newTp: rat.dynTP, newSl: monotonicSL });
-                      ratchetLiftMemo[key] = { lastStep: rat.steps, lastLiftAt: nowTs };
-                      debug.ratchet_replace = { step: rat.steps, ...replaced, cooldownMs: LIFT_COOLDOWN_MS };
-                    } catch (e: any) {
-                      debug.reasons.push(`ratchet_replace_children_exception:${e?.message || "unknown"}`);
+                  const desiredSl = Math.round(newAnchor * (1 - TRAIL_STEP_PCT) * 100) / 100; // anchor -5%
+                  const desiredTp = Math.round(newAnchor * (1 + TRAIL_STEP_PCT) * 100) / 100; // anchor +5%
+
+                  // SL never down; TP only raised by helper
+                  const monotonicSL = Math.max(lastDynSLMemo[memoKey]?.sl ?? 0, desiredSl);
+
+                  try {
+                    await replaceTpSlIfBetter({ symbol: openPos.ticker, newTp: desiredTp, newSl: monotonicSL });
+                    lastDynSLMemo[memoKey] = { day: todayYMD, sl: monotonicSL };
+                    if (newAnchor !== tstate.anchor) {
+                      trailHalfMemo[memoKey] = { ...tstate, anchor: newAnchor };
                     }
-                  } else {
-                    debug.ratchet_replace_skipped = {
-                      reason: rat.steps <= memo.lastStep ? "no_new_step" : "cooldown",
-                      lastStep: memo.lastStep, lastLiftAgoMs: nowTs - memo.lastLiftAt, cooldownMs: LIFT_COOLDOWN_MS,
-                    };
-                  }
-                }
-
-                if (RATCHET_VIRTUAL_EXITS && openPos) {
-                  if (p >= rat.dynTP) {
-                    const exitTicker = openPos.ticker;
-                    try {
-                      const shares = Number(openPos.shares);
-                      const entryPx = Number(openPos.entryPrice);
-                      await closePositionMarket(exitTicker);
-                      const exitVal = shares * p;
-                      const realized = exitVal - shares * entryPx;
-                      await prisma.trade.create({ data: { side: "SELL", ticker: exitTicker, price: p, shares } });
-                      await prisma.position.update({ where: { id: openPos.id }, data: { open: false, exitPrice: p, exitAt: nowET() } });
-                      state = await prisma.botState.update({ where: { id: 1 }, data: { cash: Number(state!.cash) + exitVal, pnl: Number(state!.pnl) + realized, equity: Number(state!.cash) + exitVal } });
-                      debug.lastMessage = `🏁 Ratchet TP hit ${exitTicker} @ ${p.toFixed(2)} (dynTP=${rat.dynTP.toFixed(2)})`;
-                      openPos = null;
-                    } catch (e: any) { debug.reasons.push(`ratchet_tp_close_exception:${e?.message || "unknown"}`); }
-                  } else if (p <= lastDynSLMemo[memoKey]?.sl) {
-                    const exitTicker = openPos.ticker;
-                    try {
-                      const shares = Number(openPos.shares);
-                      const entryPx = Number(openPos.entryPrice);
-                      await closePositionMarket(exitTicker);
-                      const exitVal = shares * p;
-                      const realized = exitVal - shares * entryPx;
-                      await prisma.trade.create({ data: { side: "SELL", ticker: exitTicker, price: p, shares } });
-                      await prisma.position.update({ where: { id: openPos.id }, data: { open: false, exitPrice: p, exitAt: nowET() } });
-                      state = await prisma.botState.update({ where: { id: 1 }, data: { cash: Number(state!.cash) + exitVal, pnl: Number(state!.pnl) + realized, equity: Number(state!.cash) + exitVal } });
-                      debug.lastMessage = `🛡️ Ratchet SL hit ${exitTicker} @ ${p.toFixed(2)} (dynSL=${(lastDynSLMemo[memoKey]?.sl || 0).toFixed(2)})`;
-                      openPos = null;
-                    } catch (e: any) { debug.reasons.push(`ratchet_sl_close_exception:${e?.message || "unknown"}`); }
-                  }
+                  } catch {}
                 }
               }
+
+              // (Old ratchet kept disabled)
             }
           } catch (e: any) { debug.reasons.push(`hold_calc_exception:${e?.message || "unknown"}`); }
         }
