@@ -309,40 +309,49 @@ function useCandles1m(
   return { candles };
 }
 
-/* ───────────────── Lightweight-charts compatibility helpers ───────────────── */
+/* ───────────────── Lightweight-charts ESM/CJS compat ───────────────── */
+type LWModule = {
+  createChart?: any;
+  CrosshairMode?: any;
+  ColorType?: any;
+  default?: LWModule;
+};
+async function loadLW() {
+  const m: LWModule = (await import("lightweight-charts")) as any;
+  const root = (m && (m.createChart ? m : m.default)) || m;
+
+  const createChart = root?.createChart || (m.default && m.default.createChart);
+  const CrosshairMode = root?.CrosshairMode || (m.default && m.default.CrosshairMode);
+  const ColorType = root?.ColorType || (m.default && m.default.ColorType);
+
+  return { createChart, CrosshairMode, ColorType };
+}
 function addCandlesCompat(chart: any) {
-  // Try classic API first
-  if (typeof chart.addCandlestickSeries === "function") {
+  if (chart && typeof chart.addCandlestickSeries === "function") {
     return chart.addCandlestickSeries({});
   }
-  // Try new object signature
-  try {
-    if (typeof chart.addSeries === "function") {
+  if (chart && typeof chart.addSeries === "function") {
+    try {
       return chart.addSeries({ type: "Candlestick" } as any);
-    }
-  } catch {}
-  // Try string signature
-  try {
-    if (typeof chart.addSeries === "function") {
+    } catch {}
+    try {
       return chart.addSeries("Candlestick", {} as any);
-    }
-  } catch {}
+    } catch {}
+  }
   throw new Error("No compatible method to add Candlestick series");
 }
 function addLineCompat(chart: any) {
-  if (typeof chart.addLineSeries === "function") {
+  if (chart && typeof chart.addLineSeries === "function") {
     return chart.addLineSeries({});
   }
-  try {
-    if (typeof chart.addSeries === "function") {
+  if (chart && typeof chart.addSeries === "function") {
+    try {
       return chart.addSeries({ type: "Line" } as any);
-    }
-  } catch {}
-  try {
-    if (typeof chart.addSeries === "function") {
+    } catch {}
+    try {
       return chart.addSeries("Line", {} as any);
-    }
-  } catch {}
+    } catch {}
+  }
   throw new Error("No compatible method to add Line series");
 }
 
@@ -410,9 +419,6 @@ export default function TradeChartPanel({
   }, [stickySymbol]);
 
   // which symbol to display:
-  //  - if open → current position
-  //  - else if sticky for today & before 4pm → that ticker
-  //  - else, optional fallback (symbolWhenFlat) *but only before 4pm*, otherwise empty
   const stickyActive = !!stickySymbol && stickyDay === dayYMD && beforeCloseFlag;
   const symbol: string | null =
     hasOpen
@@ -447,29 +453,36 @@ export default function TradeChartPanel({
     console.log("[TradeChartPanel] symbol:", symbol, "candles:", candles?.length ?? 0);
   }, [symbol, candles?.length]);
 
-  // Create chart (compat shim v4/v5)
+  // Create chart (robust import and series creation)
   useEffect(() => {
     let cleanup = () => {};
     let destroyed = false;
 
     (async () => {
       if (!containerRef.current) return;
-      const lc = await import("lightweight-charts");
-      if (destroyed) return;
 
-      const chart = lc.createChart(containerRef.current, {
+      const { createChart, CrosshairMode, ColorType } = await loadLW();
+      if (!createChart) {
+        console.error("[TradeChartPanel] lightweight-charts createChart not found");
+        return;
+      }
+
+      const chart = createChart(containerRef.current, {
         height,
-        layout: { textColor: "#e5e7eb", background: { type: lc.ColorType.Solid, color: "#0b1220" } },
+        layout: {
+          textColor: "#e5e7eb",
+          background: { type: ColorType?.Solid ?? 0, color: "#0b1220" },
+        },
         grid: { vertLines: { visible: false }, horzLines: { visible: true, color: "#1f2a44" } },
         rightPriceScale: { borderVisible: false },
         timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
-        crosshair: { mode: lc.CrosshairMode.Normal },
+        crosshair: { mode: CrosshairMode?.Normal ?? 0 },
       });
 
       // Candles (compat across versions)
       let candleSeries: any;
       try {
-        candleSeries = addCandlesCompat(chart as any);
+        candleSeries = addCandlesCompat(chart);
       } catch (e) {
         console.error("[TradeChartPanel] failed to add candlestick series:", e);
         return; // nothing to draw
@@ -485,10 +498,10 @@ export default function TradeChartPanel({
       // VWAP line
       let vwapSeries: any;
       try {
-        vwapSeries = addLineCompat(chart as any);
-      } catch (e) {
-        console.error("[TradeChartPanel] failed to add line series:", e);
-        vwapSeries = null; // continue without VWAP
+        vwapSeries = addLineCompat(chart);
+      } catch {
+        console.warn("[TradeChartPanel] no line series support; continuing without VWAP");
+        vwapSeries = null;
       }
 
       // Legend: crosshair move
@@ -515,9 +528,9 @@ export default function TradeChartPanel({
       };
       chart.subscribeCrosshairMove(onMove);
 
-      (chartRef as any).current = chart;
-      (candleSeriesRef as any).current = candleSeries;
-      (vwapSeriesRef as any).current = vwapSeries;
+      chartRef.current = chart;
+      candleSeriesRef.current = candleSeries;
+      vwapSeriesRef.current = vwapSeries;
 
       const applyWidth = () => {
         if (!containerRef.current) return;
@@ -659,58 +672,14 @@ export default function TradeChartPanel({
     }
 
     // Exit markers + average exit line (today only)
-    const todayTrades = Array.isArray((window as any).__todayTradesHack) ? (window as any).__todayTradesHack : undefined;
-    // NOTE: we still set markers below from hook value (kept separate for clarity)
-
-    // from hook:
-    if (Array.isArray(todayTrades) && todayTrades.length) {
-      // (no-op; left here if you want to inject externally)
-    }
-
-    // Use hook's rows for markers:
-    // (we already normalized to current symbol & today)
-    const rowsFromHook = (arguments as any) && true; // placeholder to avoid lint noise
-    // Actually build markers from hook value:
-    // (the hook variable is in closure above)
-    // We'll rebuild only SELL markers & avg:
-    // (we already have seriesData above)
-    // — but handle it only if we truly have todayTrades in state
-    // (we named the hook result todayTrades earlier)
-  }, [
-    candles,
-    pos?.entryPrice,
-    pos?.stopLoss,
-    pos?.takeProfit,
-    pos?.entryAt,
-    hasOpen,
-  ]);
-
-  // separate effect to place todayTrades markers cleanly (after data set)
-  useEffect(() => {
-    const cs = candleSeriesRef.current;
-    const chart = chartRef.current;
-    if (!cs || !chart) return;
-    if (!candles || candles.length === 0) return;
-
-    // build SELL markers & average exit line
-    const seriesData = candles.map((c) => ({
-      time: toSec(c.date),
-      open: Number(c.open),
-      high: Number(c.high),
-      low: Number(c.low),
-      close: Number(c.close),
-    }));
-
-    const markers: any[] = [];
-    const priceLinesToAdd: any[] = [];
-
     if (Array.isArray(todayTrades) && todayTrades.length) {
       const sells = todayTrades.filter((t) => String(t.side).toUpperCase() === "SELL");
       if (sells.length) {
         const totalSold = sells.reduce((s, r) => s + (Number(r.shares) || 0), 0);
         const wAvgExit =
           totalSold > 0
-            ? sells.reduce((s, r) => s + (Number(r.price) || 0) * (Number(r.shares) || 0), 0) / totalSold
+            ? sells.reduce((s, r) => s + (Number(r.price) || 0) * (Number(r.shares) || 0), 0) /
+              totalSold
             : null;
 
         if (wAvgExit != null && Number.isFinite(wAvgExit)) {
@@ -720,7 +689,7 @@ export default function TradeChartPanel({
             lineWidth: 1,
             color: "#f59e0b",
           });
-          priceLinesToAdd.push(pl);
+          priceLinesRef.current.push(pl);
         }
 
         for (const s of sells) {
@@ -746,14 +715,8 @@ export default function TradeChartPanel({
       }
     }
 
-    // apply markers (merge with existing from entry/SL/TP by appending)
-    try {
-      cs.setMarkers(markers);
-    } catch {}
-
-    // track added price lines so the next data update can clear them
-    priceLinesRef.current.push(...priceLinesToAdd);
-  }, [todayTrades, candles]);
+    cs.setMarkers(markers);
+  }, [candles, todayTrades, hasOpen, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.entryAt]);
 
   // compute R:R in legend from hover price (assume long) – only meaningful while open
   const rr = useMemo(() => {
