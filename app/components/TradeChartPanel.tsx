@@ -2,15 +2,8 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-/* ───────────────────────── Types ───────────────────────── */
-type Candle = {
-  date: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-};
+/* ================= Types ================= */
+type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
 type PositionWire = {
   open: boolean;
   ticker: string | null;
@@ -21,25 +14,21 @@ type PositionWire = {
   takeProfit: number | null;
   error?: string;
 };
-type TradeWire = {
-  side: "BUY" | "SELL" | string;
-  ticker: string;
-  price: number;
-  shares: number;
-  at: string; // ISO
-};
+type TradeWire = { side: "BUY" | "SELL" | string; ticker: string; price: number; shares: number; at: string };
 
-/* ───────────────────────── Time utils ───────────────────────── */
+/* ================= Time utils ================= */
 const toSec = (ts: string | number | Date) =>
   Math.floor(
-    (typeof ts === "string"
-      ? new Date(ts).getTime()
-      : ts instanceof Date
-      ? ts.getTime()
-      : ts) / 1000
+    (typeof ts === "string" ? new Date(ts).getTime() : ts instanceof Date ? ts.getTime() : ts) / 1000
   );
 
 const toET = (d: Date) => new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
+
+const isSameETDay = (d: Date, ymd: string) => {
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mo}-${da}` === ymd;
+};
 
 function yyyyMmDdET(nowUTC = new Date()) {
   const et = toET(nowUTC);
@@ -48,16 +37,9 @@ function yyyyMmDdET(nowUTC = new Date()) {
   return `${et.getFullYear()}-${mo}-${da}`;
 }
 
-const isSameETDay = (d: Date, ymd: string) => {
-  const mo = String(d.getMonth() + 1).padStart(2, "0");
-  const da = String(d.getDate()).padStart(2, "0");
-  return `${d.getFullYear()}-${mo}-${da}` === ymd;
-};
-
 const isMarketHoursET = (nowUTC = new Date()) => {
   const et = toET(nowUTC);
   const mins = et.getHours() * 60 + et.getMinutes();
-  // 9:30–16:00 ET
   return mins >= 9 * 60 + 30 && mins <= 16 * 60;
 };
 
@@ -67,17 +49,20 @@ const isBeforeETClose = (nowUTC = new Date()) => {
   return mins <= 16 * 60;
 };
 
-/* ───────────────────────── VWAP ───────────────────────── */
+/* ================= VWAP ================= */
 function computeSessionVWAP(candles: Candle[], dayYMD: string) {
-  let pv = 0;
-  let vol = 0;
+  let pv = 0,
+    vol = 0;
   const out: { time: number; value: number }[] = [];
   for (const c of candles) {
     const d = toET(new Date(c.date));
     const mins = d.getHours() * 60 + d.getMinutes();
     if (!isSameETDay(d, dayYMD) || mins < 9 * 60 + 30) continue;
 
-    const h = +c.high, l = +c.low, cl = +c.close, v = +c.volume;
+    const h = +c.high,
+      l = +c.low,
+      cl = +c.close,
+      v = +c.volume;
     if (![h, l, cl, v].every(Number.isFinite)) continue;
 
     const typical = (h + l + cl) / 3;
@@ -88,7 +73,7 @@ function computeSessionVWAP(candles: Candle[], dayYMD: string) {
   return out;
 }
 
-/* ───────────────────────── Data helpers ───────────────────────── */
+/* ================= Data helpers ================= */
 function useVisibility() {
   const [visible, setVisible] = useState(true);
   useEffect(() => {
@@ -162,11 +147,13 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
       `/api/trades?symbol=${enc}`,
       `/api/trades`,
     ];
+
     for (const url of urls) {
       try {
         const r = await fetch(url, { cache: "no-store" });
         if (!r.ok) continue;
         const j = await r.json();
+
         const raw: any[] = Array.isArray(j) ? j : Array.isArray(j?.trades) ? j.trades : [];
         if (!raw.length) continue;
 
@@ -187,6 +174,7 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
         /* try next */
       }
     }
+
     if (rows == null) setRows([]);
   }
 
@@ -227,6 +215,7 @@ function useCandles1m(
         const r = await fetch(url, { cache: "no-store" });
         if (!r.ok) continue;
         const data = await r.json();
+
         const raw: any[] = Array.isArray(data)
           ? data
           : Array.isArray(data?.candles)
@@ -245,11 +234,7 @@ function useCandles1m(
             close: Number(k.close ?? k.c),
             volume: Number(k.volume ?? k.v),
           }))
-          .filter(
-            (k) =>
-              !!k.date &&
-              [k.open, k.high, k.low, k.close, k.volume].every(Number.isFinite)
-          );
+          .filter((k) => !!k.date && [k.open, k.high, k.low, k.close, k.volume].every(Number.isFinite));
 
         if (clean.length) return clean;
       } catch {
@@ -279,59 +264,29 @@ function useCandles1m(
   return { candles };
 }
 
-/* ───────────────────────── lightweight-charts loader ───────────────────────── */
+/* ================= lightweight-charts v4 ONLY (CDN) ================= */
 declare global {
   interface Window {
     LightweightCharts?: any;
   }
 }
 
-type LW = { createChart: any; CrosshairMode: any; ColorType: any };
-
-async function loadLWModule(): Promise<LW | null> {
-  try {
-    const m: any = await import("lightweight-charts");
-    const root = m?.createChart ? m : m?.default;
-    if (!root?.createChart) return null;
-    return {
-      createChart: root.createChart,
-      CrosshairMode: root.CrosshairMode,
-      ColorType: root.ColorType,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function loadLWCDN(version = "4.2.0"): Promise<LW | null> {
-  return new Promise((resolve) => {
-    if (typeof window === "undefined") return resolve(null);
-    if (window.LightweightCharts?.createChart) {
-      const g = window.LightweightCharts;
-      resolve({
-        createChart: g.createChart,
-        CrosshairMode: g.CrosshairMode,
-        ColorType: g.ColorType,
-      });
-      return;
-    }
+async function ensureLWv4(): Promise<any | null> {
+  if (typeof window === "undefined") return null;
+  if (window.LightweightCharts?.createChart) return window.LightweightCharts;
+  await new Promise<void>((res, rej) => {
     const s = document.createElement("script");
-    s.src = `https://unpkg.com/lightweight-charts@${version}/dist/lightweight-charts.standalone.production.js`;
+    s.src =
+      "https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js";
     s.async = true;
-    s.onload = () => {
-      const g = window.LightweightCharts;
-      resolve(
-        g?.createChart
-          ? { createChart: g.createChart, CrosshairMode: g.CrosshairMode, ColorType: g.ColorType }
-          : null
-      );
-    };
-    s.onerror = () => resolve(null);
+    s.onload = () => res();
+    s.onerror = () => rej();
     document.head.appendChild(s);
-  });
+  }).catch(() => {});
+  return window.LightweightCharts?.createChart ? window.LightweightCharts : null;
 }
 
-/* ───────────────────────── Component ───────────────────────── */
+/* ================= Component ================= */
 export default function TradeChartPanel({
   height = 360,
   symbolWhenFlat,
@@ -341,7 +296,7 @@ export default function TradeChartPanel({
 }) {
   const pos = useOpenPosition(20000);
 
-  // 4pm ET gate so fallback symbol clears at close
+  // 4pm ET gate for fallback
   const [beforeCloseFlag, setBeforeCloseFlag] = useState(isBeforeETClose());
   useEffect(() => {
     const id = setInterval(() => setBeforeCloseFlag(isBeforeETClose()), 60_000);
@@ -403,70 +358,56 @@ export default function TradeChartPanel({
   const todayTrades = useTodayTrades(symbol, 30000);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const createdRef = useRef(false); // StrictMode guard
+  const createdRef = useRef(false); // single-create guard
   const chartRef = useRef<any>(null);
   const candleSeriesRef = useRef<any>(null);
   const vwapSeriesRef = useRef<any>(null);
   const priceLinesRef = useRef<any[]>([]);
-  const [hover, setHover] = useState<{ price?: number; o?: number; h?: number; l?: number; c?: number; vwap?: number } | null>(null);
+  const [hover, setHover] = useState<{
+    price?: number;
+    o?: number;
+    h?: number;
+    l?: number;
+    c?: number;
+    vwap?: number;
+  } | null>(null);
 
-  // Debug: see if candles are arriving
+  // debug
   useEffect(() => {
-    // eslint-disable-next-line no-console
     console.log("[TradeChartPanel] symbol:", symbol, "candles:", candles?.length ?? 0);
   }, [symbol, candles?.length]);
 
-  /* ───────── Create chart (handles v4/v5 + StrictMode) ───────── */
+  /* -------- Create chart (v4 only; single-run; clears container) -------- */
   useEffect(() => {
     let cleanup = () => {};
 
     (async () => {
       if (!containerRef.current) return;
-
-      // StrictMode: prevent double-create
-      if (createdRef.current) return;
+      if (createdRef.current) return; // prevent double mount
       createdRef.current = true;
 
-      // Clean any leftovers and enforce height for layout engines
+      // clear any leftover canvases
       containerRef.current.innerHTML = "";
       containerRef.current.style.height = `${height}px`;
 
-      let lw: LW | null = await loadLWModule();
-      if (!lw) lw = await loadLWCDN("4.2.0");
-      if (!lw) {
+      const L = await ensureLWv4();
+      if (!L?.createChart) {
         createdRef.current = false;
-        console.error("[TradeChartPanel] lightweight-charts not available");
+        console.error("[TradeChartPanel] LW v4 not loaded");
         return;
       }
 
-      const chart = lw.createChart(containerRef.current, {
+      const chart = L.createChart(containerRef.current, {
         height,
-        layout: { textColor: "#e5e7eb", background: { type: lw.ColorType?.Solid ?? 0, color: "#0b1220" } },
+        layout: { textColor: "#e5e7eb", background: { type: L.ColorType.Solid, color: "#0b1220" } },
         grid: { vertLines: { visible: false }, horzLines: { visible: true, color: "#1f2a44" } },
         rightPriceScale: { borderVisible: false },
         timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
-        crosshair: { mode: lw.CrosshairMode?.Normal ?? 0 },
+        crosshair: { mode: L.CrosshairMode.Normal },
         watermark: { visible: false } as any,
       });
 
-      // v4/v5 compatibility
-      const anyChart = chart as any;
-
-      let candleSeries: any;
-      if (typeof anyChart.addCandlestickSeries === "function") {
-        candleSeries = anyChart.addCandlestickSeries({});
-      } else if (typeof anyChart.addSeries === "function") {
-        try {
-          candleSeries = anyChart.addSeries({ type: "Candlestick" });
-        } catch {
-          candleSeries = anyChart.addSeries("Candlestick");
-        }
-      } else {
-        console.error("[TradeChartPanel] no method to add candlestick series");
-        createdRef.current = false;
-        return;
-      }
-
+      const candleSeries = chart.addCandlestickSeries({});
       candleSeries.applyOptions({
         upColor: "#22c55e",
         downColor: "#ef4444",
@@ -475,17 +416,8 @@ export default function TradeChartPanel({
         borderVisible: false,
       });
 
-      let vwapSeries: any = null;
-      if (typeof anyChart.addLineSeries === "function") {
-        vwapSeries = anyChart.addLineSeries({});
-      } else if (typeof anyChart.addSeries === "function") {
-        try {
-          vwapSeries = anyChart.addSeries({ type: "Line" });
-        } catch {
-          vwapSeries = anyChart.addSeries("Line");
-        }
-      }
-      vwapSeries?.applyOptions?.({ lineWidth: 2 });
+      const vwapSeries = chart.addLineSeries({});
+      vwapSeries.applyOptions({ lineWidth: 2 });
 
       const onMove = (p: any) => {
         if (!p?.time) {
@@ -494,7 +426,7 @@ export default function TradeChartPanel({
         }
         const sd = p.seriesData as Map<any, any>;
         const c = sd?.get(candleSeries);
-        const v = vwapSeries ? sd?.get(vwapSeries) : null;
+        const v = sd?.get(vwapSeries);
         if (!c) {
           setHover(null);
           return;
@@ -530,21 +462,21 @@ export default function TradeChartPanel({
         ro.disconnect();
         chart.unsubscribeCrosshairMove(onMove);
         chart.remove?.();
-        createdRef.current = false;
+        createdRef.current = false; // allow clean remounts
       };
     })();
 
     return () => cleanup();
   }, [height]);
 
-  /* ───────── Update series & markers when data changes ───────── */
+  /* -------- Update data/lines/markers -------- */
   useEffect(() => {
     const cs = candleSeriesRef.current;
     const vs = vwapSeriesRef.current;
     const chart = chartRef.current;
     if (!cs || !chart) return;
 
-    // clear old price lines
+    // remove old price lines
     for (const pl of priceLinesRef.current) {
       try {
         cs.removePriceLine(pl);
@@ -577,11 +509,11 @@ export default function TradeChartPanel({
 
     chart.timeScale().fitContent();
 
-    const openNow = !!pos?.open && !!pos?.ticker;
-    const entryPrice = openNow ? pos?.entryPrice ?? null : null;
-    const stopLoss = openNow ? pos?.stopLoss ?? null : null;
-    const takeProfit = openNow ? pos?.takeProfit ?? null : null;
-    const entryAt = openNow && pos?.entryAt ? toSec(pos.entryAt) : null;
+    const isOpen = !!pos?.open && !!pos?.ticker;
+    const entryPrice = isOpen ? pos?.entryPrice ?? null : null;
+    const stopLoss = isOpen ? pos?.stopLoss ?? null : null;
+    const takeProfit = isOpen ? pos?.takeProfit ?? null : null;
+    const entryAt = isOpen && pos?.entryAt ? toSec(pos.entryAt) : null;
 
     let markerTime = entryAt;
     if (entryAt && seriesData.length) {
@@ -600,58 +532,19 @@ export default function TradeChartPanel({
     const markers: any[] = [];
 
     if (entryPrice != null) {
-      const pl = cs.createPriceLine({
-        price: entryPrice,
-        title: "Entry",
-        lineWidth: 1,
-        color: "#9ca3af",
-      });
+      const pl = cs.createPriceLine({ price: entryPrice, title: "Entry", lineWidth: 1, color: "#9ca3af" });
       priceLinesRef.current.push(pl);
-      if (markerTime) {
-        markers.push({
-          time: markerTime,
-          position: "belowBar",
-          color: "#9ca3af",
-          shape: "arrowUp",
-          text: "Entry",
-        });
-      }
+      if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#9ca3af", shape: "arrowUp", text: "Entry" });
     }
     if (stopLoss != null) {
-      const pl = cs.createPriceLine({
-        price: stopLoss,
-        title: "Stop",
-        lineWidth: 1,
-        color: "#ef4444",
-      });
+      const pl = cs.createPriceLine({ price: stopLoss, title: "Stop", lineWidth: 1, color: "#ef4444" });
       priceLinesRef.current.push(pl);
-      if (markerTime) {
-        markers.push({
-          time: markerTime,
-          position: "aboveBar",
-          color: "#ef4444",
-          shape: "arrowDown",
-          text: "SL",
-        });
-      }
+      if (markerTime) markers.push({ time: markerTime, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SL" });
     }
     if (takeProfit != null) {
-      const pl = cs.createPriceLine({
-        price: takeProfit,
-        title: "Target",
-        lineWidth: 1,
-        color: "#22c55e",
-      });
+      const pl = cs.createPriceLine({ price: takeProfit, title: "Target", lineWidth: 1, color: "#22c55e" });
       priceLinesRef.current.push(pl);
-      if (markerTime) {
-        markers.push({
-          time: markerTime,
-          position: "belowBar",
-          color: "#22c55e",
-          shape: "arrowUp",
-          text: "TP",
-        });
-      }
+      if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "TP" });
     }
 
     if (Array.isArray(todayTrades) && todayTrades.length) {
@@ -659,17 +552,10 @@ export default function TradeChartPanel({
       if (sells.length) {
         const totalSold = sells.reduce((s, r) => s + (+r.shares || 0), 0);
         const wAvgExit =
-          totalSold > 0
-            ? sells.reduce((s, r) => s + (+r.price || 0) * (+r.shares || 0), 0) / totalSold
-            : null;
+          totalSold > 0 ? sells.reduce((s, r) => s + (+r.price || 0) * (+r.shares || 0), 0) / totalSold : null;
 
         if (wAvgExit != null && Number.isFinite(wAvgExit)) {
-          const pl = cs.createPriceLine({
-            price: wAvgExit,
-            title: "Exit avg",
-            lineWidth: 1,
-            color: "#f59e0b",
-          });
+          const pl = cs.createPriceLine({ price: wAvgExit, title: "Exit avg", lineWidth: 1, color: "#f59e0b" });
           priceLinesRef.current.push(pl);
         }
 
@@ -684,13 +570,7 @@ export default function TradeChartPanel({
               bestDiff = diff;
             }
           }
-          markers.push({
-            time: best,
-            position: "aboveBar",
-            color: "#f59e0b",
-            shape: "arrowDown",
-            text: `Exit ${s.shares}`,
-          });
+          markers.push({ time: best, position: "aboveBar", color: "#f59e0b", shape: "arrowDown", text: `Exit ${s.shares}` });
         }
       }
     }
@@ -734,26 +614,18 @@ export default function TradeChartPanel({
               )}
             </div>
           ) : stickyActive ? (
-            <div className="text-xs text-slate-400 italic">
-              Position closed — showing last chart until 4:00 PM ET.
-            </div>
+            <div className="text-xs text-slate-400 italic">Position closed — showing last chart until 4:00 PM ET.</div>
           ) : null}
         </div>
 
         {showChart ? (
           <>
-            <div
-              ref={containerRef}
-              className="w-full min-h-0"
-              style={{ height, lineHeight: 0 }}
-            />
-            {/* Hover legend */}
+            <div ref={containerRef} className="w-full min-h-0" style={{ height, lineHeight: 0 }} />
             <div className="pointer-events-none absolute right-3 top-3 rounded-md bg-slate-800/80 px-3 py-2 text-[11px] leading-4 text-slate-200">
               {hover ? (
                 <>
                   <div>
-                    O {hover.o?.toFixed(2)} H {hover.h?.toFixed(2)} L {hover.l?.toFixed(2)} C{" "}
-                    {hover.c?.toFixed(2)}
+                    O {hover.o?.toFixed(2)} H {hover.h?.toFixed(2)} L {hover.l?.toFixed(2)} C {hover.c?.toFixed(2)}
                   </div>
                   <div>VWAP {hover.vwap != null ? hover.vwap.toFixed(2) : "—"}</div>
                   {rr ? (

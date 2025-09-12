@@ -1,38 +1,35 @@
-// app/api/alpaca/sync/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { nowET } from "@/lib/market";
+// If you have nowET in "@/lib/market" keep it; otherwise use local fallback:
+import { nowET as _nowET } from "@/lib/market";
 
-/** ───────────────── Authorization ─────────────────
- * Allows: Vercel Cron (headers), or manual with ?token=ALPACA_WEBHOOK_SECRET.
- */
+const nowET: () => Date =
+  typeof _nowET === "function"
+    ? _nowET
+    : () => new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+
+/* ─────────── Authorization ─────────── */
 function authorized(req: Request) {
   const h = req.headers;
 
-  // Official Vercel Cron header
   if (h.get("x-vercel-cron") === "1") return true;
-
-  // Occasionally present on Vercel cron runs
   if (h.get("x-vercel-signature")) return true;
 
-  // "Run" button on dashboard (best-effort)
   const ua = (h.get("user-agent") || "").toLowerCase();
   if (ua.includes("vercel") && ua.includes("cron")) return true;
 
-  // Manual / local: ?token=ALPACA_WEBHOOK_SECRET
   const SECRET = process.env.ALPACA_WEBHOOK_SECRET?.trim();
-  if (!SECRET) return true; // dev convenience if not set
+  if (!SECRET) return true;
   const u = new URL(req.url);
   return u.searchParams.get("token") === SECRET;
 }
 
-/** ───────────────── Alpaca client ───────────────── */
+/* ─────────── Alpaca client ─────────── */
 const RAW_BASE = (process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets").trim();
-// normalize: no trailing slash, no trailing /v2
 const BASE = RAW_BASE.replace(/\/+$/, "").replace(/\/v2$/, "");
 
 const KEY =
@@ -66,9 +63,7 @@ async function alpGet(
   let json: any = null;
   try {
     json = text ? JSON.parse(text) : null;
-  } catch {
-    /* keep raw text */
-  }
+  } catch {}
   if (!r.ok) {
     const msg = json?.message || json?.error || text || `HTTP ${r.status}`;
     throw new Error(`Alpaca GET ${path} ${r.status}: ${msg}`);
@@ -76,13 +71,13 @@ async function alpGet(
   return json;
 }
 
-/** ───────────────── Types & helpers ───────────────── */
+/* ─────────── Types / helpers ─────────── */
 type AlpOrder = {
   id: string;
   client_order_id?: string;
   symbol: string;
   side: "buy" | "sell" | "unknown";
-  status: string;
+  status: string; // lower-case
   qty?: number | null;
   filled_qty?: number | null;
   filled_avg_price?: number | null;
@@ -96,7 +91,6 @@ function numOrNull(x: any): number | null {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
 }
-
 function norm(o: any): AlpOrder {
   const rawSide = String(o?.side ?? "").toLowerCase();
   const side: "buy" | "sell" | "unknown" =
@@ -124,18 +118,15 @@ function startOfETDayISO(isoLike?: string) {
   return d.toISOString();
 }
 
-/** Ensure bot state exists (for cash/PnL/equity updates). */
 async function ensureBotState() {
   let s = await prisma.botState.findUnique({ where: { id: 1 } });
   if (!s) {
-    s = await prisma.botState.create({
-      data: { id: 1, cash: 4000, pnl: 0, equity: 4000 },
-    });
+    s = await prisma.botState.create({ data: { id: 1, cash: 4000, pnl: 0, equity: 4000 } });
   }
   return s;
 }
 
-/** ───────────────── Apply BUY fill ───────────────── */
+/* ─────────── BUY fill ─────────── */
 async function applyBuyFill(o: AlpOrder) {
   if (o.side !== "buy") return;
   const ticker = o.symbol;
@@ -145,7 +136,7 @@ async function applyBuyFill(o: AlpOrder) {
   const filledAt = o.filled_at ? new Date(o.filled_at) : nowET();
   await ensureBotState();
 
-  // Prefer a position we created at submit; fallback to most recent open with same ticker
+  // Prefer matching brokerOrderId, else open pos of same ticker
   let pos = await prisma.position.findFirst({
     where: { OR: [{ brokerOrderId: o.id }, { open: true, ticker }] },
     orderBy: { id: "desc" },
@@ -153,7 +144,7 @@ async function applyBuyFill(o: AlpOrder) {
 
   const sharesFilled = o.filled_qty ?? o.qty ?? null;
 
-  // If somehow missing, create a position so UI stays consistent
+  // Create missing position if needed
   if (!pos && sharesFilled && filledAvg) {
     pos = await prisma.position.create({
       data: {
@@ -167,38 +158,34 @@ async function applyBuyFill(o: AlpOrder) {
   }
   if (!pos) return;
 
-  // BUY trade we inserted on submit (or not)
-  let buyTrade = await prisma.trade.findFirst({
-    where: { side: "BUY", brokerOrderId: o.id },
-    orderBy: { id: "desc" },
-  });
-
   const entryAssumed = Number(pos.entryPrice);
   const shares = Number(pos.shares);
   const fillPx = filledAvg ?? entryAssumed;
 
-  // Reconcile cash if our assumed price differs from actual fill (one-time)
+  // Reconcile cash if our assumed entry != actual fill
+  const buyTrade = await prisma.trade.findFirst({
+    where: { side: "BUY", brokerOrderId: o.id },
+    orderBy: { id: "desc" },
+  });
+
   if (buyTrade && !buyTrade.filledAt && Number.isFinite(entryAssumed) && Number.isFinite(fillPx)) {
-    const delta = shares * entryAssumed - shares * fillPx; // + if fill better than assumed
+    const delta = shares * entryAssumed - shares * fillPx;
     if (delta !== 0) {
       const st = await ensureBotState();
       await prisma.botState.update({
         where: { id: 1 },
-        data: {
-          cash: Number(st.cash) + delta,
-          equity: Number(st.equity) + delta,
-        },
+        data: { cash: Number(st.cash) + delta, equity: Number(st.equity) + delta },
       });
     }
   }
 
-  // Update position to true fill price & ensure brokerOrderId
+  // Update position entry price & link brokerOrderId
   await prisma.position.update({
     where: { id: pos.id },
     data: { entryPrice: fillPx, brokerOrderId: (pos as any).brokerOrderId ?? o.id },
   });
 
-  // Stamp or create the BUY trade
+  // Stamp or create BUY trade
   if (buyTrade) {
     await prisma.trade.update({
       where: { id: buyTrade.id },
@@ -219,34 +206,35 @@ async function applyBuyFill(o: AlpOrder) {
   }
 }
 
-/** ───────────────── Apply SELL fill ───────────────── */
+/* ─────────── SELL fill (handles partials) ─────────── */
 async function applySellFill(o: AlpOrder) {
   if (o.side !== "sell") return;
   const ticker = o.symbol;
   if (!ticker) return;
 
-  const pos = await prisma.position.findFirst({
-    where: { open: true, ticker },
+  // Match by brokerOrderId OR latest open position on ticker
+  let pos = await prisma.position.findFirst({
+    where: { OR: [{ brokerOrderId: o.id }, { open: true, ticker }] },
     orderBy: { id: "desc" },
   });
   if (!pos) return;
 
-  const shares = Number(pos.shares);
-  const entry = Number(pos.entryPrice);
-  const fillPx = o.filled_avg_price ?? entry;
+  const sharesPos = Number(pos.shares);
+  if (!Number.isFinite(sharesPos) || sharesPos === 0) return;
+
+  const qtyFilled = Number(o.filled_qty ?? o.qty ?? sharesPos);
   const filledAt = o.filled_at ? new Date(o.filled_at) : nowET();
 
-  const exitVal = shares * fillPx;
-  const entryVal = shares * entry;
-  const realized = exitVal - entryVal;
+  // If Alpaca didn’t give avg price (can happen on legs), fall back to position entry to at least log it
+  const fillPx = Number(
+    o.filled_avg_price ?? (Array.isArray(o.legs) ? o.legs[0]?.filled_avg_price : undefined) ?? pos.exitPrice ?? pos.entryPrice
+  );
 
-  // Close position
-  await prisma.position.update({
-    where: { id: pos.id },
-    data: { open: false, exitPrice: fillPx, exitAt: filledAt },
-  });
+  const entry = Number(pos.entryPrice);
+  const sellQty = Math.min(qtyFilled, sharesPos);
+  const realized = (fillPx - entry) * sellQty;
 
-  // Create SELL trade if not present
+  // Upsert SELL trade for this broker leg (id-based)
   const existingSell = await prisma.trade.findFirst({
     where: { side: "SELL", brokerOrderId: o.id },
     orderBy: { id: "desc" },
@@ -257,34 +245,47 @@ async function applySellFill(o: AlpOrder) {
         side: "SELL",
         ticker,
         price: fillPx,
-        shares,
+        shares: sellQty,
         brokerOrderId: o.id,
         filledAt,
         filledPrice: fillPx,
       },
     });
+  } else {
+    // ensure it’s stamped
+    await prisma.trade.update({
+      where: { id: existingSell.id },
+      data: { price: fillPx, shares: sellQty, filledAt, filledPrice: fillPx },
+    });
   }
 
-  // Update state
+  // Update bot state cash/pnl/equity
   const st = await ensureBotState();
+  const exitVal = sellQty * fillPx;
   const newCash = Number(st.cash) + exitVal;
   const newPnl = Number(st.pnl) + realized;
 
   await prisma.botState.update({
     where: { id: 1 },
-    data: {
-      cash: newCash,
-      pnl: newPnl,
-      equity: newCash, // if multiple symbols open, equity will be refreshed by tick route
-    },
+    data: { cash: newCash, pnl: newPnl, equity: newCash },
   });
+
+  // Close or reduce position
+  if (sellQty >= sharesPos) {
+    await prisma.position.update({
+      where: { id: pos.id },
+      data: { open: false, exitPrice: fillPx, exitAt: filledAt, shares: 0 },
+    });
+  } else {
+    await prisma.position.update({
+      where: { id: pos.id },
+      data: { shares: sharesPos - sellQty },
+    });
+  }
 }
 
-/** ───────────────── Sync recent orders ─────────────────
- * Pulls orders (parents + TP/SL legs), flattens, and mirrors fills.
- */
+/* ─────────── Sync recent orders ─────────── */
 async function syncRecentOrders(afterISO: string, untilISO?: string) {
-  // status=all & nested=true brings bracket legs along
   const ordersRaw = await alpGet("/v2/orders", {
     status: "all",
     limit: 200,
@@ -303,12 +304,17 @@ async function syncRecentOrders(afterISO: string, untilISO?: string) {
 
   let processed = 0;
   for (const o of flat) {
-    // Consider filled if fully/partially filled OR has a filled_avg_price
-    const filled =
-      (o.status && (o.status.includes("filled") || o.status.includes("partially_filled"))) ||
-      ((o.filled_qty ?? 0) > 0 && o.filled_avg_price != null);
+    // Robust filled detection:
+    //  - status 'filled' or 'partially_filled'
+    //  - OR any positive filled_qty
+    //  - OR presence of filled_at
+    const isFilled =
+      o.status.includes("filled") ||
+      o.status.includes("partially_filled") ||
+      (o.filled_qty ?? 0) > 0 ||
+      !!o.filled_at;
 
-    if (!filled) continue;
+    if (!isFilled) continue;
 
     if (o.side === "buy") {
       await applyBuyFill(o);
@@ -322,7 +328,7 @@ async function syncRecentOrders(afterISO: string, untilISO?: string) {
   return { checked: flat.length, processed, afterISO, untilISO: untilISO || null };
 }
 
-/** ───────────────── Handlers ───────────────── */
+/* ─────────── Handlers ─────────── */
 export async function GET(req: Request) {
   if (!authorized(req)) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
@@ -336,19 +342,15 @@ export async function GET(req: Request) {
     let afterISO: string;
 
     if (day) {
-      // start of ET day
       afterISO = startOfETDayISO(`${day}T00:00:00Z`);
     } else {
-      const wm = Math.max(15, Math.min(1440 * 7, Number(u.searchParams.get("windowMinutes") ?? "90"))); // up to 7 days
+      const wm = Math.max(15, Math.min(1440 * 7, Number(u.searchParams.get("windowMinutes") ?? "90")));
       afterISO = new Date(Date.now() - wm * 60 * 1000).toISOString();
     }
 
-    // Optional until=ISO
     const untilISO = u.searchParams.get("until") || undefined;
-
     const res = await syncRecentOrders(afterISO, untilISO);
 
-    // Quick echo for troubleshooting env mismatches
     const keyLast4 = KEY ? KEY.slice(-4) : "";
     return NextResponse.json({ ok: true, base: BASE, keyLast4, ...res });
   } catch (e: any) {

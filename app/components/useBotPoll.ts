@@ -3,16 +3,13 @@
 import { useEffect, useRef, useState } from "react";
 import { getJSON } from "@/lib/getJSON";
 
-/* ===========================
-   Types
-=========================== */
-
+/* ========= Types ========= */
 export type TickPayload = {
   state?: { cash: number; pnl: number; equity: number } | any;
   lastRec?: { ticker: string; price: number; at?: string } | any;
   position?: { ticker: string; entryPrice: number; shares: number } | any;
   live?: { ticker: string | null; price: number | null } | null;
-  serverTimeET?: string; // used as the canonical “now” in ET
+  serverTimeET?: string;
   info?: { inEntryWindow?: boolean; snapshotAgeMs?: number } | any;
   signals?: any;
   debug?: { lastMessage?: string; reasons?: string[]; top8?: string[] } | any;
@@ -20,32 +17,27 @@ export type TickPayload = {
 };
 
 export type Trade = {
-  id: number;
+  id?: string | number;
   side: "BUY" | "SELL";
   ticker: string;
   price: number;
-  shares: number;
+  shares?: number;
+  qty?: number;
 
-  // Possible timestamp fields (your API may use any of these)
   createdAt?: string | number;
   filledAt?: string | number;
-  openedAt?: string | number;
-  submittedAt?: string | number;
-  executedAt?: string | number;
-  timestamp?: string | number;
+  at?: string | number;
   time?: string | number;
+  executedAt?: string | number;
 
-  // Some backends also include a pre-computed day key:
-  ymdET?: string; // "YYYY-MM-DD" in ET
+  ymdET?: string; // server may send this; we’ll honor it if present
 };
 
-type TradesPayload = { trades: Trade[] } | any;
+type TradesPayload = { trades: Trade[]; openPos?: any } | Trade[];
 
-/* ===========================
-   Helpers
-=========================== */
+/* ========= Helpers ========= */
 
-// Format a Date as America/New_York YYYY-MM-DD
+// ET YYYY-MM-DD from Date
 function etYmd(d: Date) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
@@ -53,50 +45,38 @@ function etYmd(d: Date) {
     month: "2-digit",
     day: "2-digit",
   }).formatToParts(d);
-  const y = parts.find(p => p.type === "year")!.value;
-  const m = parts.find(p => p.type === "month")!.value;
-  const day = parts.find(p => p.type === "day")!.value;
+  const y = parts.find((p) => p.type === "year")!.value;
+  const m = parts.find((p) => p.type === "month")!.value;
+  const day = parts.find((p) => p.type === "day")!.value;
   return `${y}-${m}-${day}`;
 }
 
-// Turn many possible timestamp shapes into a Date (null if nothing usable)
+// Parse many possible timestamp shapes
 function toDate(x: string | number | undefined): Date | null {
   if (x == null) return null;
-  if (typeof x === "number") return new Date(x); // epoch ms
+  if (typeof x === "number") return new Date(x < 1e12 ? x * 1000 : x);
   const d = new Date(x);
   return isNaN(d.getTime()) ? null : d;
 }
 
-// Get the best ET day key for a trade
+// Best ET-day key for a trade
 function tradeETKey(t: Trade): string | null {
-  // If backend already sent an ET day key, trust it.
   if (typeof t.ymdET === "string" && /^\d{4}-\d{2}-\d{2}$/.test(t.ymdET)) return t.ymdET;
 
   const cand =
     toDate(t.createdAt) ||
     toDate(t.filledAt) ||
-    toDate(t.openedAt) ||
-    toDate(t.submittedAt) ||
-    toDate(t.executedAt) ||
-    toDate(t.timestamp) ||
-    toDate(t.time);
+    toDate(t.at) ||
+    toDate(t.time) ||
+    toDate(t.executedAt);
 
   return cand ? etYmd(cand) : null;
 }
 
 let printedOnce = false;
 
-/* ===========================
-   Hook
-=========================== */
+/* ========= Hook ========= */
 
-/**
- * Polls /api/bot/tick and /api/trades.
- * Returns:
- *  - tick (latest bot status)
- *  - trades (all returned by API)
- *  - tradesToday (subset whose ET day matches server ET today)
- */
 export function useBotPoll(intervalMs = 5000) {
   const [tick, setTick] = useState<TickPayload | null>(null);
   const [trades, setTrades] = useState<Trade[] | null>(null);
@@ -130,7 +110,9 @@ export function useBotPoll(intervalMs = 5000) {
     try {
       const [t, tr] = await Promise.all([
         getJSON<TickPayload>("/api/bot/tick", { signal: abortTickRef.current.signal } as any),
-        getJSON<TradesPayload>("/api/trades", { signal: abortTradesRef.current.signal } as any),
+        getJSON<TradesPayload>("/api/trades?days=7&limit=2000", {
+          signal: abortTradesRef.current.signal,
+        } as any),
       ]);
 
       setTick(t || null);
@@ -143,19 +125,17 @@ export function useBotPoll(intervalMs = 5000) {
 
       setTrades(all);
 
-      // Use the server's ET clock for "today" (fallback: client now)
+      // Use server ET clock if provided
       const nowETKey = etYmd(t?.serverTimeET ? new Date(t.serverTimeET) : new Date());
 
-      // Build ET day keys for each trade and filter
       const todayList =
-        all?.filter(trd => {
+        all?.filter((trd) => {
           const k = tradeETKey(trd);
           return k ? k === nowETKey : false;
         }) ?? null;
 
       setTradesToday(todayList);
 
-      // One-time debug so you can verify what dates your API is returning
       if (all && !printedOnce) {
         const counts = all.reduce<Record<string, number>>((acc, trd) => {
           const k = tradeETKey(trd) ?? "UNKNOWN";
