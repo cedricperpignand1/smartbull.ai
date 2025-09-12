@@ -1,6 +1,8 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useBotPoll } from "../components/useBotPoll";
+
 
 /* ================= Types ================= */
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
@@ -43,26 +45,16 @@ const isMarketHoursET = (nowUTC = new Date()) => {
   return mins >= 9 * 60 + 30 && mins <= 16 * 60;
 };
 
-const isBeforeETClose = (nowUTC = new Date()) => {
-  const et = toET(nowUTC);
-  const mins = et.getHours() * 60 + et.getMinutes();
-  return mins <= 16 * 60;
-};
-
 /* ================= VWAP ================= */
 function computeSessionVWAP(candles: Candle[], dayYMD: string) {
-  let pv = 0,
-    vol = 0;
+  let pv = 0, vol = 0;
   const out: { time: number; value: number }[] = [];
   for (const c of candles) {
     const d = toET(new Date(c.date));
     const mins = d.getHours() * 60 + d.getMinutes();
     if (!isSameETDay(d, dayYMD) || mins < 9 * 60 + 30) continue;
 
-    const h = +c.high,
-      l = +c.low,
-      cl = +c.close,
-      v = +c.volume;
+    const h = +c.high, l = +c.low, cl = +c.close, v = +c.volume;
     if (![h, l, cl, v].every(Number.isFinite)) continue;
 
     const typical = (h + l + cl) / 3;
@@ -90,42 +82,24 @@ async function fetchJSON<T>(url: string): Promise<T> {
   return (await r.json()) as T;
 }
 
-const POS_EMPTY: PositionWire = {
-  open: false,
-  ticker: null,
-  shares: null,
-  entryPrice: null,
-  entryAt: null,
-  stopLoss: null,
-  takeProfit: null,
-};
-
-function useOpenPosition(pollMsWhileOpen = 20000) {
-  const visible = useVisibility();
-  const [pos, setPos] = useState<PositionWire | null>(null);
-
-  async function refresh() {
-    try {
-      setPos(await fetchJSON<PositionWire>("/api/positions/open"));
-    } catch {
-      setPos(POS_EMPTY);
-      console.warn("[TradeChartPanel] /api/positions/open failed");
-    }
-  }
-
-  useEffect(() => {
-    refresh();
-  }, []);
-
-  useEffect(() => {
-    if (!visible) return;
-    const id = setInterval(refresh, pollMsWhileOpen);
-    return () => clearInterval(id);
-  }, [visible, pollMsWhileOpen]);
-
-  return pos;
+/** Build a PositionWire view from bot tick payload (if any) */
+function usePositionFromTick(tick: any): PositionWire | null {
+  return useMemo(() => {
+    const p = tick?.position || null;
+    if (!p) return null;
+    return {
+      open: true,
+      ticker: p.ticker ?? null,
+      shares: Number(p.shares ?? 0) || null,
+      entryPrice: Number(p.entryPrice ?? 0) || null,
+      entryAt: p.entryAt ?? null,
+      stopLoss: p.stopLoss != null ? Number(p.stopLoss) : null,
+      takeProfit: p.takeProfit != null ? Number(p.takeProfit) : null,
+    };
+  }, [tick?.position]);
 }
 
+/* ---- Trades (today) for a symbol ---- */
 function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000, paused = false) {
   const visible = useVisibility();
   const [rows, setRows] = useState<TradeWire[] | null>(null);
@@ -192,6 +166,7 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000, paused 
   return rows;
 }
 
+/* ---- 1m candles for a symbol ---- */
 function useCandles1m(
   symbol: string | null,
   isActiveFast: boolean,
@@ -256,7 +231,7 @@ function useCandles1m(
   }, [symbol]);
 
   useEffect(() => {
-    if (!symbol || !visible || !isMarketHoursET() || paused) return;
+    if (!symbol || !visible || paused) return;
     const ms = isActiveFast ? pollMsFast : pollMsSlow;
     const id = setInterval(() => load(symbol), ms);
     return () => clearInterval(id);
@@ -274,13 +249,10 @@ function useAlpacaDayPnL(pollMs = 15000) {
     const run = async () => {
       try {
         const j = await fetchJSON<any>("/api/alpaca/account");
-        const val =
-          j?.ok && j?.account && (j.account.day_pnl != null ? Number(j.account.day_pnl) : null);
+        const val = j?.ok && j?.account && (j.account.day_pnl != null ? Number(j.account.day_pnl) : null);
         if (val == null || Number.isNaN(val)) return;
         setPnl(val);
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     };
     run();
     id = setInterval(run, pollMs);
@@ -412,8 +384,7 @@ async function ensureLWv4(): Promise<any | null> {
   if (window.LightweightCharts?.createChart) return window.LightweightCharts;
   await new Promise<void>((res, rej) => {
     const s = document.createElement("script");
-    s.src =
-      "https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js";
+    s.src = "https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js";
     s.async = true;
     s.onload = () => res();
     s.onerror = () => rej();
@@ -561,9 +532,7 @@ function ChartView({
 
     if (!candles?.length) {
       cs.setData([]);
-      try {
-        vs?.setData?.([]);
-      } catch {}
+      try { vs?.setData?.([]); } catch {}
       cs.setMarkers([]);
       return;
     }
@@ -626,8 +595,9 @@ function ChartView({
       const sells = todayTrades.filter((t) => String(t.side).toUpperCase() === "SELL");
       if (sells.length) {
         const totalSold = sells.reduce((s, r) => s + (+r.shares || 0), 0);
-        const wAvgExit =
-          totalSold > 0 ? sells.reduce((s, r) => s + (+r.price || 0) * (+r.shares || 0), 0) / totalSold : null;
+        const wAvgExit = totalSold > 0
+          ? sells.reduce((s, r) => s + (+r.price || 0) * (+r.shares || 0), 0) / totalSold
+          : null;
 
         if (wAvgExit != null && Number.isFinite(wAvgExit)) {
           const pl = cs.createPriceLine({ price: wAvgExit, title: "Exit avg", lineWidth: 1, color: "#f59e0b" });
@@ -691,9 +661,9 @@ function ChartView({
       {/* Chart canvas */}
       <div ref={containerRef} className="w-full min-h-0" style={{ height, lineHeight: 0 }} />
 
-      {/* Overlays (z-index high to stay in front of the chart) */}
+      {/* Overlays */}
       <div className="pointer-events-none absolute inset-0 z-[60]">
-        {/* OHLC/VWAP (top-right) */}
+        {/* OHLC / VWAP */}
         <div className="absolute right-3 top-3 rounded-md bg-slate-800/80 px-3 py-2 text-[11px] leading-4 text-slate-200">
           {hover ? (
             <>
@@ -714,25 +684,13 @@ function ChartView({
           )}
         </div>
 
-        {/* PnL + Panic Sell (bottom-right) */}
+        {/* PnL + Panic Sell */}
         <div className="absolute bottom-2 right-2 pointer-events-auto flex items-center gap-2">
-          <div
-            className={[
-              "px-3 py-1.5 rounded-full text-xs font-semibold shadow-lg",
-              dayPnl == null
-                ? "bg-slate-600 text-white"
-                : dayPnl >= 0
-                ? "bg-emerald-600 text-white"
-                : "bg-rose-600 text-white",
-            ].join(" ")}
-            title="Today's PnL (Alpaca)"
-          >
-            {dayPnl == null ? "—" : `${dayPnl >= 0 ? "+" : "-"}$${Math.abs(dayPnl).toFixed(2)}`}
-          </div>
+          <DayPnlBadge />
           <PanicSellButton disabled={panicDisabled} />
         </div>
 
-        {/* Pop Out (bottom-left) / Close (top-right) */}
+        {/* Pop Out / Close */}
         {showPopOut && (
           <div className="absolute bottom-2 left-2 pointer-events-auto">
             <button
@@ -760,98 +718,62 @@ function ChartView({
   );
 }
 
-/* ================= Component (fetching + modal) ================= */
+/* Separate PnL pill so we don’t double-fetch */
+function DayPnlBadge() {
+  const pnl = useAlpacaDayPnL(15000);
+  return (
+    <div
+      className={[
+        "px-3 py-1.5 rounded-full text-xs font-semibold shadow-lg",
+        pnl == null ? "bg-slate-600 text-white" : pnl >= 0 ? "bg-emerald-600 text-white" : "bg-rose-600 text-white",
+      ].join(" ")}
+      title="Today's PnL (Alpaca)"
+    >
+      {pnl == null ? "—" : `${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toFixed(2)}`}
+    </div>
+  );
+}
+
+/* ================= Component (now powered by useBotPoll) ================= */
 export default function TradeChartPanel({
   height = 360,
+  /** Optional fallback symbol to show when truly idle (e.g., SPY) */
   symbolWhenFlat,
 }: {
   height?: number;
   symbolWhenFlat?: string | null | undefined;
 }) {
-  const pos = useOpenPosition(20000);
+  // Poll bot/tick + trades cache
+  const { tick, tradesToday, currentSymbol } = useBotPoll(5000);
 
-  // 4pm ET gate for fallback
-  const [beforeCloseFlag, setBeforeCloseFlag] = useState(isBeforeETClose());
-  useEffect(() => {
-    const id = setInterval(() => setBeforeETClose(isBeforeETClose()), 60_000);
-    function setBeforeETClose(v: boolean) {
-      setBeforeCloseFlag(v);
-    }
-    return () => clearInterval(id);
-  }, []);
+  // Position view derived from tick (if any)
+  const pos = usePositionFromTick(tick);
 
-  // sticky symbol for the day
-  const dayYMD = useMemo(() => yyyyMmDdET(new Date()), []);
-  const [stickySymbol, setStickySymbol] = useState<string | null>(null);
-  const [stickyDay, setStickyDay] = useState<string | null>(null);
-  useEffect(() => {
-    try {
-      const s = sessionStorage.getItem("chartSticky");
-      if (s) {
-        const obj = JSON.parse(s);
-        if (obj?.symbol && obj?.day === dayYMD && isBeforeETClose()) {
-          setStickySymbol(obj.symbol);
-          setStickyDay(obj.day);
-        }
-      }
-    } catch {}
-  }, [dayYMD]);
-
-  const hasOpen = !!pos?.open && !!pos?.ticker;
-  useEffect(() => {
-    if (!hasOpen) return;
-    const t = String(pos!.ticker);
-    setStickySymbol(t);
-    setStickyDay(dayYMD);
-    try {
-      sessionStorage.setItem("chartSticky", JSON.stringify({ symbol: t, day: dayYMD }));
-    } catch {}
-  }, [hasOpen, pos?.ticker, dayYMD]);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (!isBeforeETClose() && stickySymbol) {
-        setStickySymbol(null);
-        setStickyDay(null);
-        try {
-          sessionStorage.removeItem("chartSticky");
-        } catch {}
-      }
-    }, 60_000);
-    return () => clearInterval(id);
-  }, [stickySymbol]);
-
-  const stickyActive = !!stickySymbol && stickyDay === dayYMD && beforeCloseFlag;
+  // Which symbol to chart:
+  // 1) server-pinned view/currentSymbol (kept until 23:59 ET)
+  // 2) else optional fallback (e.g., SPY) while market is open
   const symbol: string | null =
-    hasOpen
-      ? (pos!.ticker as string)
-      : stickyActive
-      ? stickySymbol
-      : beforeCloseFlag && symbolWhenFlat
-      ? String(symbolWhenFlat)
-      : null;
+    currentSymbol ?? (isMarketHoursET() && symbolWhenFlat ? String(symbolWhenFlat) : null);
 
-  // Big view (modal). While open, pause polling in hooks below.
+  // Big view (modal). While open, pause candles/trades polling (we still show same data).
   const [bigOpen, setBigOpen] = useState(false);
   const paused = bigOpen;
 
-  const { candles } = useCandles1m(symbol, hasOpen || stickyActive, 30000, 120000, 240, paused);
+  const hasOpen = !!pos?.open && !!pos?.ticker;
+  const { candles } = useCandles1m(symbol, hasOpen || !!currentSymbol, 30000, 120000, 240, paused);
   const todayTrades = useTodayTrades(symbol, 30000, paused);
-
-  // Day PnL (shared by both views, no duplicate calls)
-  const dayPnl = useAlpacaDayPnL(15000);
 
   return (
     <>
-      {/* Inline chart with Pop Out button (bottom-left) */}
+      {/* Inline chart with Pop Out */}
       {symbol ? (
         <ChartView
           height={height}
           symbol={symbol}
           candles={candles}
-          todayTrades={todayTrades}
+          todayTrades={todayTrades as any}
           pos={pos}
-          dayPnl={dayPnl}
+          dayPnl={null}   // handled in DayPnlBadge inside ChartView
           showPopOut
           onPopOut={() => setBigOpen(true)}
         />
@@ -861,12 +783,12 @@ export default function TradeChartPanel({
             <div className="text-slate-200 font-medium">1-min Chart</div>
           </div>
           <div className="flex items-center justify-center h-[260px] md:h-[300px] text-slate-400 text-sm">
-            No open positions yet. I’ll pop a live 1-min chart here when we enter.
+            Idle for now. I’ll pop a live 1-min chart when we enter a trade.
           </div>
         </div>
       )}
 
-      {/* Full-screen big chart (no extra polling; reuses data) */}
+      {/* Full-screen big chart (reuses same data) */}
       {bigOpen && (
         <div
           className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4"
@@ -879,9 +801,9 @@ export default function TradeChartPanel({
               height={820}
               symbol={symbol}
               candles={candles}
-              todayTrades={todayTrades}
+              todayTrades={todayTrades as any}
               pos={pos}
-              dayPnl={dayPnl}
+              dayPnl={null}
               showClose
               onClose={() => setBigOpen(false)}
             />

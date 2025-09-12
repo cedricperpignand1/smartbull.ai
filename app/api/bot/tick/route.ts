@@ -1169,11 +1169,29 @@ async function handle(req: Request) {
         if (p != null) livePrice = p;
       }
 
+      /* ---------------------- VIEW SYMBOL UNTIL 23:59 ET ---------------------- */
+      const etNow = new Date(nowET().toLocaleString("en-US", { timeZone: "America/New_York" }));
+      const dayStartET = new Date(etNow); dayStartET.setHours(0, 0, 0, 0);
+      const endOfDayET = new Date(etNow); endOfDayET.setHours(23, 59, 0, 0);
+
+      // Most recent BUY today (even if already sold)
+      const lastBuyToday = await prisma.trade.findFirst({
+        where: { side: "BUY", at: { gte: dayStartET } },
+        orderBy: { at: "desc" },
+      });
+
+      const viewSymbol = openPos?.ticker ?? lastBuyToday?.ticker ?? null;
+
       return {
         state,
         lastRec,
         position: openPos,
         live: { ticker: openPos?.ticker ?? lastRec?.ticker ?? null, price: livePrice },
+        // 👇 exposes the chart symbol the UI should keep showing until 23:59 ET
+        view: {
+          symbol: viewSymbol,
+          untilET: endOfDayET.toISOString(),
+        },
         serverTimeET: nowET().toISOString(),
         account: alpacaAccount,
         budget: { investPerTrade: INVEST_BUDGET },

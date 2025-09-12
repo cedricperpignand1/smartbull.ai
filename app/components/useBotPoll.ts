@@ -9,6 +9,10 @@ export type TickPayload = {
   lastRec?: { ticker: string; price: number; at?: string } | any;
   position?: { ticker: string; entryPrice: number; shares: number } | any;
   live?: { ticker: string | null; price: number | null } | null;
+
+  /** Server-pinned chart symbol + expiry (ET) — e.g. keep last trade visible until 23:59 ET */
+  view?: { symbol: string | null; untilET: string } | null;
+
   serverTimeET?: string;
   info?: { inEntryWindow?: boolean; snapshotAgeMs?: number } | any;
   signals?: any;
@@ -30,7 +34,8 @@ export type Trade = {
   time?: string | number;
   executedAt?: string | number;
 
-  ymdET?: string; // server may send this; we’ll honor it if present
+  /** Optional precomputed ET date key from server */
+  ymdET?: string;
 };
 
 type TradesPayload = { trades: Trade[]; openPos?: any } | Trade[];
@@ -81,6 +86,7 @@ export function useBotPoll(intervalMs = 5000) {
   const [tick, setTick] = useState<TickPayload | null>(null);
   const [trades, setTrades] = useState<Trade[] | null>(null);
   const [tradesToday, setTradesToday] = useState<Trade[] | null>(null);
+  const [currentSymbol, setCurrentSymbol] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -126,7 +132,8 @@ export function useBotPoll(intervalMs = 5000) {
       setTrades(all);
 
       // Use server ET clock if provided
-      const nowETKey = etYmd(t?.serverTimeET ? new Date(t.serverTimeET) : new Date());
+      const nowET = t?.serverTimeET ? new Date(t.serverTimeET) : new Date();
+      const nowETKey = etYmd(nowET);
 
       const todayList =
         all?.filter((trd) => {
@@ -146,6 +153,21 @@ export function useBotPoll(intervalMs = 5000) {
         console.info("[useBotPoll] Trade date buckets (ET):", counts, "today=", nowETKey);
         printedOnce = true;
       }
+
+      // ---- NEW: decide which symbol the chart should display ----
+      // Prefer pinned `view.symbol` while it's still valid; otherwise fall back to live ticker.
+      const viewSymbol = t?.view?.symbol ?? null;
+      const viewUntilMs =
+        t?.view?.untilET && !Number.isNaN(new Date(t.view.untilET).getTime())
+          ? new Date(t.view.untilET).getTime()
+          : 0;
+      const nowMs = nowET.getTime();
+
+      const pinnedActive = viewSymbol && nowMs <= viewUntilMs;
+      const liveSymbol = t?.live?.ticker ?? null;
+
+      setCurrentSymbol((pinnedActive ? viewSymbol : liveSymbol) ?? null);
+      // -----------------------------------------------------------
 
       setError(null);
       backoffRef.current = null;
@@ -187,5 +209,5 @@ export function useBotPoll(intervalMs = 5000) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intervalMs]);
 
-  return { tick, trades, tradesToday, error };
+  return { tick, trades, tradesToday, currentSymbol, error };
 }
