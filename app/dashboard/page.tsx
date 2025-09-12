@@ -861,17 +861,29 @@ export default function Home() {
     return botPick || firstGainer || "AAPL";
   }, [botData?.lastRec?.ticker, stocks]);
 
-  // === NEW: Only allow fallback BEFORE 4:00 PM ET (so it clears at 4pm) ===
-  const beforeCloseET = useMemo(() => {
+ // Recompute before-close every minute (so fallback clears at 4pm ET)
+const [beforeCloseET, setBeforeCloseET] = useState<boolean>(() => {
+  const d = nowET();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  return mins <= 16 * 60; // 4:00pm ET
+});
+useEffect(() => {
+  const id = setInterval(() => {
     const d = nowET();
     const mins = d.getHours() * 60 + d.getMinutes();
-    return mins <= 16 * 60; // 4:00pm ET
-  }, []);
+    setBeforeCloseET(mins <= 16 * 60);
+  }, 60_000);
+  return () => clearInterval(id);
+}, []);
 
-  const fallbackSymbolBeforeClose =
-    beforeCloseET
-      ? (posChartSymbol || l2Choice || stocks[0]?.ticker?.toUpperCase() || "AAPL")
-      : undefined;
+// Keep your existing posChartSymbol (you already have it above)
+// const posChartSymbol = useMemo(() => (tradeData?.openPos?.ticker ? ... ), [ ... ]);
+
+const fallbackSymbolBeforeClose =
+  beforeCloseET
+    ? (posChartSymbol || l2Choice || (stocks[0]?.ticker && String(stocks[0].ticker).toUpperCase()) || "AAPL")
+    : undefined;
+
 
   return (
     <main

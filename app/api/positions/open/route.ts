@@ -41,15 +41,28 @@ export async function GET(req: Request) {
   const debug = searchParams.get("debug") === "1";
 
   try {
-    const row: any = await prisma.position.findFirst({
-      where: { open: true },
-      orderBy: { id: "desc" },
-    });
+    // some users name the model "positions" instead of "position"
+    const models: any[] = [];
+    if ((prisma as any).position) models.push((prisma as any).position);
+    if ((prisma as any).positions) models.push((prisma as any).positions);
 
-    if (debug) {
-      // NOTE: only logs server-side; helpful in Vercel logs/dev console
-      console.log("[/api/positions/open] raw row:", row);
+    if (models.length === 0) {
+      const msg = "Prisma model not found: position/positions";
+      if (debug) console.error("[/api/positions/open]", msg);
+      return NextResponse.json({ ...EMPTY, error: msg }, { status: 200, headers: { "Cache-Control": "no-store" } });
     }
+
+    // search the most recent open position on whichever model exists
+    let row: any = null;
+    for (const model of models) {
+      row = await model.findFirst({
+        where: { open: true },
+        orderBy: { id: "desc" },
+      });
+      if (row) break;
+    }
+
+    if (debug) console.log("[/api/positions/open] raw row:", row);
 
     // No open position → return EMPTY (200) so the UI shows the placeholder.
     if (!row) {
@@ -69,29 +82,24 @@ export async function GET(req: Request) {
         ? tickerRaw.trim().toUpperCase()
         : null;
 
-    // Validate: when open === true, we MUST have a ticker and entryPrice.
+    // Be tolerant: only require ticker + entryPrice to consider "open"
     const problems: string[] = [];
     if (!ticker) problems.push("missing ticker");
     if (entryPx == null) problems.push("missing entryPrice");
-    if (enteredAt == null) problems.push("missing entryAt");
-    if (sharesNum == null || sharesNum <= 0) problems.push("missing/invalid shares");
 
     if (problems.length > 0) {
-      const msg = `Open position row is malformed: ${problems.join(", ")}`;
-      if (debug) console.error("[/api/positions/open]", msg, { row });
-      // Return 500 so the frontend fetch throws and you notice it.
-      return NextResponse.json(
-        { ...EMPTY, error: msg },
-        { status: 500, headers: { "Cache-Control": "no-store" } }
-      );
+      const msg = `Open position row looks incomplete: ${problems.join(", ")}`;
+      if (debug) console.warn("[/api/positions/open]", msg, { row });
+      // Do NOT 500 — return EMPTY with error so UI can still fallback/sticky
+      return NextResponse.json({ ...EMPTY, error: msg }, { headers: { "Cache-Control": "no-store" } });
     }
 
     const payload: PositionWire = {
       open: true,
       ticker,
-      shares: Math.floor(sharesNum!),
+      shares: sharesNum != null ? Math.floor(sharesNum) : null,
       entryPrice: entryPx,
-      entryAt: enteredAt,
+      entryAt: enteredAt, // may be null; chart handles missing marker
       stopLoss: sl,
       takeProfit: tp,
     };
@@ -100,10 +108,7 @@ export async function GET(req: Request) {
   } catch (e: any) {
     const msg = e?.message || "failed to load position";
     if (debug) console.error("[/api/positions/open] ERROR", msg);
-    // Use 500 here so your frontend sees an error (fetchJSON throws) instead of quietly “open: false”
-    return NextResponse.json(
-      { ...EMPTY, error: msg },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
-    );
+    // Return a *200* with EMPTY so the UI keeps working (and shows placeholder/fallback).
+    return NextResponse.json({ ...EMPTY, error: msg }, { headers: { "Cache-Control": "no-store" } });
   }
 }

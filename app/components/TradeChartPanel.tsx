@@ -20,6 +20,7 @@ type PositionWire = {
   entryAt: string | null; // ISO
   stopLoss: number | null;
   takeProfit: number | null;
+  error?: string;
 };
 
 type TradeWire = {
@@ -104,6 +105,17 @@ async function fetchJSON<T>(url: string): Promise<T> {
   return (await r.json()) as T;
 }
 
+/** SAFE fallback for position when API errors */
+const POS_EMPTY: PositionWire = {
+  open: false,
+  ticker: null,
+  shares: null,
+  entryPrice: null,
+  entryAt: null,
+  stopLoss: null,
+  takeProfit: null,
+};
+
 /** Poll open position lightly (pauses when tab hidden). */
 function useOpenPosition(pollMsWhileOpen = 20000) {
   const visible = useVisibility();
@@ -113,7 +125,12 @@ function useOpenPosition(pollMsWhileOpen = 20000) {
     try {
       const data = await fetchJSON<PositionWire>("/api/positions/open");
       setPos(data);
-    } catch {}
+    } catch (e) {
+      // ← Previously left pos=null (which kills sticky). Keep a safe value.
+      setPos(POS_EMPTY);
+      // Optional: surface in console for quick diagnosis
+      console.warn("[TradeChartPanel] failed to fetch /api/positions/open");
+    }
   }
 
   useEffect(() => {
@@ -141,7 +158,9 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
         `/api/trades/today?symbol=${encodeURIComponent(symbol)}`
       );
       setRows(Array.isArray(j?.trades) ? j.trades : []);
-    } catch {}
+    } catch {
+      // keep previous trades on error
+    }
   }
 
   // Initial load
@@ -182,30 +201,30 @@ function useCandles1m(
     try {
       const data = await fetchJSON<{ candles: Candle[] }>(url);
 
-      // Normalize to numbers & drop any bad rows
-     const raw = Array.isArray((data as any).candles) ? (data as any).candles : [];
-
-const clean: Candle[] = raw
-  .map((k: Partial<Candle>) => ({
-    date: String(k.date ?? ""),
-    open: Number(k.open),
-    high: Number(k.high),
-    low: Number(k.low),
-    close: Number(k.close),
-    volume: Number(k.volume),
-  }))
-  .filter(
-    (k: Candle) =>
-      Number.isFinite(k.open) &&
-      Number.isFinite(k.high) &&
-      Number.isFinite(k.low) &&
-      Number.isFinite(k.close) &&
-      Number.isFinite(k.volume)
-  );
-
+      const raw = Array.isArray((data as any).candles) ? (data as any).candles : [];
+      const clean: Candle[] = raw
+        .map((k: Partial<Candle>) => ({
+          date: String(k.date ?? ""),
+          open: Number(k.open),
+          high: Number(k.high),
+          low: Number(k.low),
+          close: Number(k.close),
+          volume: Number(k.volume),
+        }))
+        .filter(
+          (k: Candle) =>
+            Number.isFinite(k.open) &&
+            Number.isFinite(k.high) &&
+            Number.isFinite(k.low) &&
+            Number.isFinite(k.close) &&
+            Number.isFinite(k.volume)
+        );
 
       setCandles(clean);
-    } catch {}
+    } catch {
+      // keep old candles on error (prevents blanking on transient issues)
+      console.warn("[TradeChartPanel] failed to fetch candles");
+    }
   }
 
   // initial fetch
@@ -225,7 +244,7 @@ const clean: Candle[] = raw
     return () => clearInterval(id);
   }, [symbol, isActiveFast, visible, pollMsFast, pollMsSlow]);
 
-  return { candles };
+  return { candles, reload: load };
 }
 
 /* ───────────────── Main component ───────────────── */
@@ -234,9 +253,16 @@ export default function TradeChartPanel({
   symbolWhenFlat, // optional fallback when there's never been an entry today
 }: {
   height?: number;
-  symbolWhenFlat?: string;
+  symbolWhenFlat?: string | undefined | null;
 }) {
   const pos = useOpenPosition(20000);
+
+  // live 4pm gate (recomputes every minute so fallback clears correctly)
+  const [beforeCloseFlag, setBeforeCloseFlag] = useState<boolean>(isBeforeETClose());
+  useEffect(() => {
+    const id = setInterval(() => setBeforeCloseFlag(isBeforeETClose()), 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   // ── Sticky-until-close state (persists for the day in sessionStorage)
   const dayYMD = useMemo(() => yyyyMmDdET(new Date()), []);
@@ -257,8 +283,9 @@ export default function TradeChartPanel({
     } catch {}
   }, [dayYMD]);
 
-  // when we FIRST observe an open position today, start sticky until 16:00 ET
   const hasOpen = !!pos?.open && !!pos?.ticker;
+
+  // when we FIRST observe an open position today, start sticky until 16:00 ET
   useEffect(() => {
     if (!hasOpen) return;
     const t = String(pos!.ticker);
@@ -286,15 +313,16 @@ export default function TradeChartPanel({
   // which symbol to display:
   //  - if open → current position
   //  - else if sticky for today & before 4pm → that ticker
-  //  - else, optional fallback (symbolWhenFlat), otherwise empty (placeholder)
-  const stickyActive = !!stickySymbol && stickyDay === dayYMD && isBeforeETClose();
-  const symbol: string | null = hasOpen
-    ? (pos!.ticker as string)
-    : stickyActive
-    ? stickySymbol
-    : symbolWhenFlat
-    ? symbolWhenFlat
-    : null;
+  //  - else, optional fallback (symbolWhenFlat) *but only before 4pm*, otherwise empty
+  const stickyActive = !!stickySymbol && stickyDay === dayYMD && beforeCloseFlag;
+  const symbol: string | null =
+    hasOpen
+      ? (pos!.ticker as string)
+      : stickyActive
+      ? stickySymbol
+      : beforeCloseFlag && symbolWhenFlat
+      ? String(symbolWhenFlat)
+      : null;
 
   // data
   const { candles } = useCandles1m(symbol, hasOpen || stickyActive, 30000, 120000, 240);
