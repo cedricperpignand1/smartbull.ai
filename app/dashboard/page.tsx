@@ -9,11 +9,11 @@ import { useBotPoll } from "../components/useBotPoll";
 
 /* =========================================================
    Lazy components (no SSR)
-   ========================================================= */
-const TradeChartPanel = dynamic<{ height?: number; symbolWhenFlat?: string }>(
-  () => import("../components/TradeChartPanel"),
-  { ssr: false }
-);
+========================================================= */
+const TradeChartPanel = dynamic<{
+  height?: number;
+  symbolWhenFlat?: string;
+}>(() => import("../components/TradeChartPanel"), { ssr: false });
 
 const TradingViewChart = dynamic<
   {
@@ -27,18 +27,13 @@ const TradingViewChart = dynamic<
   ssr: false,
 });
 
-const Level2Panel = dynamic(() => import("../components/Level2Panel"), {
-  ssr: false,
-});
+const Level2Panel = dynamic(() => import("../components/Level2Panel"), { ssr: false });
 
 /* =========================================================
-   Constants
-   ========================================================= */
+   Constants & ET helpers
+========================================================= */
 const CHAT_FIXED_HEIGHT_PX = 1100;
 
-/* =========================================================
-   ET helpers
-   ========================================================= */
 function nowET(): Date {
   return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
@@ -59,8 +54,8 @@ function inNarrationWindowET(d = nowET()): boolean {
 }
 
 /* =========================================================
-   OPAQUE Panel
-   ========================================================= */
+   OPAQUE Panel shell
+========================================================= */
 function Panel({
   title,
   color = "blue",
@@ -100,7 +95,7 @@ function Panel({
 
 /* =========================================================
    GLASS Panel (AI Chat)
-   ========================================================= */
+========================================================= */
 function GlassPanel({
   title,
   color = "cyan",
@@ -139,8 +134,8 @@ function GlassPanel({
 }
 
 /* =========================================================
-   Floating Narrator (mic + captions)
-   ========================================================= */
+   Floating Narrator (kept unchanged)
+========================================================= */
 function FloatingNarrator() {
   const [speaking, setSpeaking] = useState(false);
   const [caption, setCaption] = useState<string>("Narrator idle. Tap the mic to start.");
@@ -282,8 +277,475 @@ function FloatingNarrator() {
 }
 
 /* =========================================================
-   AI Chat
-   ========================================================= */
+   Types for the rest of the page
+========================================================= */
+interface Stock {
+  ticker: string;
+  price: number;
+  changesPercentage: number;
+  marketCap: number | null;
+  sharesOutstanding: number | null;
+  volume: number | null;
+  avgVolume?: number | null;
+  employees?: number | null;
+}
+interface Trade {
+  id: number | string;
+  side: "BUY" | "SELL";
+  ticker: string;
+  price: number;
+  shares: number;
+  createdAt?: string | number | null;
+  time?: string | number | null;
+  ts?: number | null;
+  at?: string | number | null;
+  filledAt?: string | number | null;
+  executedAt?: string | number | null;
+}
+interface TradePayload {
+  trades: Trade[];
+  openPos: { ticker: string; entryPrice: number; shares: number } | null;
+}
+type AlpacaAccount = {
+  cash: number | null;
+  equity: number | null;
+  last_equity: number | null;
+  buying_power: number | null;
+  day_pnl: number | null;
+  day_pnl_pct: number | null;
+  timestampET: string;
+};
+
+/* =========================================================
+   Time helpers (for counts)
+========================================================= */
+function pickMs(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
+  const n = Number(v);
+  if (Number.isFinite(n)) return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
+  const t = new Date(String(v)).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+function formatETFromTrade(t: Trade): string {
+  const ms =
+    pickMs(t.createdAt) ??
+    pickMs(t.time) ??
+    pickMs(t.ts) ??
+    pickMs(t.at) ??
+    pickMs(t.filledAt) ??
+    pickMs(t.executedAt);
+  if (!ms) return "-";
+  return new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York" });
+}
+function ymdET(d: Date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const y = parts.find((p) => p.type === "year")!.value;
+  const m = parts.find((p) => p.type === "month")!.value;
+  const day = parts.find((p) => p.type === "day")!.value;
+  return `${y}-${m}-${day}`;
+}
+
+/* =========================================================
+   Page (positions chart + modal TV chart)
+========================================================= */
+export default function Home() {
+  const { data: session, status } = useSession();
+  if (status === "loading") return <div className="flex items-center justify-center h-screen">Loading...</div>;
+  if (!session)
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <p className="text-lg font-bold">You need to log in to access this page.</p>
+      </div>
+    );
+
+  const OPEN_BG = "/bluebackground.jpg";
+  const CLOSED_BG = "/nightbackground.png";
+  const [bgUrl, setBgUrl] = useState<string>(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
+
+  useEffect(() => {
+    const i1 = new Image(); i1.src = OPEN_BG;
+    const i2 = new Image(); i2.src = CLOSED_BG;
+
+    const update = () => setBgUrl(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
+    update();
+    const id = setInterval(update, 30_000);
+    const onVis = () => document.visibilityState === "visible" && update();
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
+  }, []);
+
+  // Stocks & AI analysis
+  const [stocks, setStocks] = useState<Stock[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [dataSource, setDataSource] = useState<string>("");
+  const [recommendation, setRecommendation] = useState<string | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [topPicks, setTopPicks] = useState<string[]>([]);
+
+  // Modal (TradingView)
+  const [selectedStock, setSelectedStock] = useState<string | null>(null);
+  const [chartVisible, setChartVisible] = useState(false);
+  const [agentResult, setAgentResult] = useState<string | null>(null);
+
+  // Bot / trades
+  const [botData, setBotData] = useState<any>(null);
+  const [tradeData, setTradeData] = useState<TradePayload | null>(null);
+  const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
+
+  // Alpaca account (for PnL pill)
+  const [alpaca, setAlpaca] = useState<AlpacaAccount | null>(null);
+
+  // SSE: stocks
+  useEffect(() => {
+    const es = new EventSource("/api/stocks/stream");
+    es.onmessage = (evt) => {
+      try {
+        const obj = JSON.parse(evt.data);
+        setStocks(obj?.stocks ?? []);
+        setDataSource("FMP (stream)");
+        setErrorMessage(null);
+        setLoading(false);
+      } catch {}
+    };
+    es.onerror = () => setErrorMessage("Live stream error. Retrying...");
+    return () => es.close();
+  }, []);
+
+  // Poll /api/bot/tick
+  useEffect(() => {
+    let id: any;
+    const run = async () => {
+      try {
+        const r = await fetch("/api/bot/tick", { cache: "no-store" });
+        const j = await r.json();
+        setBotData(j);
+      } catch {}
+    };
+    run();
+    id = setInterval(run, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Poll /api/trades
+  useEffect(() => {
+    let id: any;
+    const run = async () => {
+      try {
+        const r = await fetch("/api/trades", { cache: "no-store" });
+        const j = await r.json();
+        if (!j.errorMessage) setTradeData(j);
+      } catch {}
+    };
+    run();
+    id = setInterval(run, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Poll Alpaca account (for live day PnL)
+  useEffect(() => {
+    let id: any;
+    const run = async () => {
+      try {
+        const r = await fetch("/api/alpaca/account", { cache: "no-store" });
+        const j = await r.json();
+        if (j?.ok && j?.account) setAlpaca(j.account as AlpacaAccount);
+      } catch {}
+    };
+    run();
+    id = setInterval(run, 10_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Ask AI recs
+  const askAIRecommendation = async () => {
+    try {
+      setAnalyzing(true);
+      setRecommendation(null);
+      const res = await fetch("/api/recommendation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stocks: stocks.slice(0, 20), topN: 2 }),
+      });
+      const data = await res.json();
+
+      if (!res.ok || data?.errorMessage) {
+        setRecommendation(`Error: ${data?.errorMessage || res.statusText}`);
+        setTopPicks([]);
+        return;
+      }
+
+      const picks: string[] = Array.isArray(data?.picks) ? data.picks : [];
+      const reasons: Record<string, string[]> = data?.reasons || {};
+      const risk: string = data?.risk || "";
+
+      setTopPicks(picks.slice(0, 2).map((t) => String(t).toUpperCase()));
+
+      const lines: string[] = [];
+      if (picks[0]) {
+        lines.push(`Top 1: ${picks[0]}`);
+        if (Array.isArray(reasons[picks[0]]) && reasons[picks[0]].length)
+          lines.push(`  • ${reasons[picks[0]].join("\n  • ")}`);
+      }
+      if (picks[1]) {
+        lines.push("");
+        lines.push(`Top 2: ${picks[1]}`);
+        if (Array.isArray(reasons[picks[1]]) && reasons[picks[1]].length)
+          lines.push(`  • ${reasons[picks[1]].join("\n  • ")}`);
+      }
+      if (risk) {
+        lines.push("");
+        lines.push(`Risk: ${risk}`);
+      }
+      setRecommendation(lines.join("\n") || "No recommendation.");
+    } catch {
+      setRecommendation("Failed to analyze stocks. Check server logs.");
+      setTopPicks([]);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  /* ===========================
+     Chart behaviors (DECOUPLED)
+  =========================== */
+  const handleStockClick = (ticker: string) => {
+    setSelectedStock(ticker);
+    setChartVisible(true);
+    setAgentResult(null);
+  };
+  const closeChart = () => {
+    setChartVisible(false);
+    setSelectedStock(null);
+    setAgentResult(null);
+  };
+
+  const posChartSymbol = useMemo(
+    () => (tradeData?.openPos?.ticker ? String(tradeData.openPos.ticker).toUpperCase() : undefined),
+    [tradeData?.openPos?.ticker]
+  );
+
+  const tieA = useMemo(() => (topPicks[0] || stocks[0]?.ticker || "AAPL").toUpperCase(), [topPicks, stocks]);
+  const tieB = useMemo(() => {
+    let candidate =
+      topPicks[1] ||
+      stocks.find((s) => s.ticker && s.ticker.toUpperCase() !== tieA)?.ticker ||
+      "MSFT";
+    candidate = String(candidate).toUpperCase();
+    if (candidate === tieA) candidate = "MSFT";
+    return candidate;
+  }, [topPicks, stocks, tieA]);
+
+  type L2QuickStat = {
+    symbol: string;
+    buyCount: number;
+    sellCount: number;
+    buyNotional: number;
+    sellNotional: number;
+  };
+  const [l2Choice, setL2Choice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let timer: any;
+    async function fetchStats(a: string, b: string) {
+      try {
+        const q = [a, b].filter(Boolean).join(",");
+        if (!q) return;
+        const res = await fetch(`/api/level2/quick-stats?symbols=${encodeURIComponent(q)}`, { cache: "no-store" });
+        const data = await res.json();
+        const stats: Record<string, L2QuickStat> = data?.stats || {};
+        const sa = stats[a];
+        const sb = stats[b];
+
+        let pick = a;
+        if (sa && sb) {
+          if ((sb.buyNotional ?? 0) > (sa.buyNotional ?? 0)) pick = b;
+          else if ((sb.buyNotional ?? 0) === (sa.buyNotional ?? 0)) {
+            if ((sb.buyCount ?? 0) > (sa.buyCount ?? 0)) pick = b;
+          }
+        } else if (!sa && sb) {
+          pick = b;
+        } else {
+          pick = a;
+        }
+        setL2Choice(String(pick).toUpperCase());
+      } catch {}
+    }
+    const run = () => fetchStats(tieA, tieB);
+    run();
+    timer = setInterval(run, 5000);
+    return () => clearInterval(timer);
+  }, [tieA, tieB]);
+
+  // today's trades count for the status card
+  const todayTradeCount = useMemo(() => {
+    const fromStatus = Array.isArray(statusTradesToday) ? statusTradesToday.length : null;
+    if (fromStatus != null) return fromStatus;
+    const all = tradeData?.trades || [];
+    if (!all.length) return 0;
+    const todayKey = ymdET(new Date());
+    let n = 0;
+    for (const t of all) {
+      const ms =
+        pickMs(t.createdAt) ??
+        pickMs(t.time) ??
+        pickMs(t.ts) ??
+        pickMs(t.at) ??
+        pickMs(t.filledAt) ??
+        pickMs(t.executedAt);
+      if (!ms) continue;
+      if (ymdET(new Date(ms)) === todayKey) n++;
+    }
+    return n;
+  }, [statusTradesToday, tradeData]);
+
+  const l2SymbolDefault = useMemo(() => {
+    const botPick = botData?.lastRec?.ticker ? String(botData.lastRec.ticker).toUpperCase() : null;
+    const firstGainer = stocks[0]?.ticker ? String(stocks[0].ticker).toUpperCase() : null;
+    return botPick || firstGainer || "AAPL";
+  }, [botData?.lastRec?.ticker, stocks]);
+
+  // before-close fallback symbol
+  const [beforeCloseET, setBeforeCloseET] = useState<boolean>(() => {
+    const d = nowET();
+    const mins = d.getHours() * 60 + d.getMinutes();
+    return mins <= 16 * 60; // 4:00pm ET
+  });
+  useEffect(() => {
+    const id = setInterval(() => {
+      const d = nowET();
+      const mins = d.getHours() * 60 + d.getMinutes();
+      setBeforeCloseET(mins <= 16 * 60);
+    }, 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const fallbackSymbolBeforeClose =
+    beforeCloseET
+      ? (posChartSymbol || l2Choice || (stocks[0]?.ticker && String(stocks[0].ticker).toUpperCase()) || "AAPL")
+      : undefined;
+
+  const dayPnl = alpaca?.day_pnl ?? botData?.state?.pnl ?? null; // still used in info cards
+
+  return (
+    <main
+      className="min-h-screen w-full flex flex-col"
+      style={{
+        backgroundImage: `url(${bgUrl})`,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        backgroundRepeat: "no-repeat",
+        backgroundAttachment: "fixed",
+        transition: "background-image 300ms ease-in-out",
+      }}
+    >
+      <Navbar />
+
+      <div className="flex-1 px-4 pt-20 pb-6">
+        <div className="mb-10 md:mb-14">
+          <FloatingNarrator />
+        </div>
+
+        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1">
+          {/* LEFT: AI Chat */}
+          <div>
+            <GlassPanel title="AI Chat" color="cyan" dense>
+              <ChatBox />
+            </GlassPanel>
+          </div>
+
+          {/* MIDDLE: Top Gainers + Level 2 */}
+          <div className="grid gap-5">
+            <TopGainers
+              loading={loading}
+              errorMessage={errorMessage}
+              stocks={stocks}
+              dataSource={dataSource}
+              onAskAI={askAIRecommendation}
+              analyzing={analyzing}
+              onPick={handleStockClick}
+            />
+
+            <Level2Panel symbol={(l2Choice || l2SymbolDefault)} mock={true} height={225} />
+          </div>
+
+          {/* RIGHT: Positions chart + status cards */}
+          <div className="grid gap-5">
+            <div className="relative">
+              {/* TradeChartPanel now owns its own pop-out and includes the Panic Sell next to PnL */}
+              <TradeChartPanel
+                height={720}
+                symbolWhenFlat={fallbackSymbolBeforeClose}
+              />
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch">
+              <AIRecommendation
+                botData={botData}
+                alpaca={alpaca}
+                analyzing={analyzing}
+                askAI={askAIRecommendation}
+                stocksCount={stocks.length}
+                recommendation={recommendation}
+              />
+              <BotStatus statusError={statusError} statusTick={statusTick} todayTradeCount={todayTradeCount} />
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-5 w-full xl:max-w-[960px] xl:ml-auto">
+          <TradeLog tradeData={tradeData} slim />
+        </div>
+      </div>
+
+      {/* (Your existing TradingView modal is kept as-is if you still use it) */}
+      {chartVisible && selectedStock && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/50 p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) closeChart(); }}
+        >
+          <div className="w-full max-w-6xl bg-white rounded-2xl shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b">
+              <div className="font-semibold text-slate-800">
+                {selectedStock} — TradingView
+              </div>
+              <button
+                onClick={closeChart}
+                className="rounded-md px-3 py-1.5 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800"
+              >
+                Close
+              </button>
+            </div>
+            <div className="h-[680px]">
+              <TradingViewChart key={selectedStock} symbol={selectedStock} height={680} />
+            </div>
+            <div className="px-4 py-3 border-t bg-slate-50 flex items-center gap-3">
+              <Button className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 text-sm rounded-md">
+                Analyze This Chart
+              </Button>
+              {agentResult && (
+                <pre className="text-xs whitespace-pre-wrap bg-white rounded-md p-2 ring-1 ring-slate-200 flex-1 overflow-auto max-h-40">
+                  {agentResult}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}
+
+/* =========================================================
+   Chat + TopGainers + TradeLog + AIRecommendation + BotStatus
+========================================================= */
+
 function ChatBox() {
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
   const [input, setInput] = useState("");
@@ -376,633 +838,6 @@ function ChatBox() {
   );
 }
 
-/* =========================================================
-   Types
-   ========================================================= */
-interface Stock {
-  ticker: string;
-  price: number;
-  changesPercentage: number;
-  marketCap: number | null;
-  sharesOutstanding: number | null;
-  volume: number | null;
-  avgVolume?: number | null;
-  employees?: number | null;
-}
-interface Trade {
-  id: number | string;
-  side: "BUY" | "SELL";
-  ticker: string;
-  price: number;
-  shares: number;
-  createdAt?: string | number | null;
-  time?: string | number | null;
-  ts?: number | null;
-  at?: string | number | null;
-  filledAt?: string | number | null;
-  executedAt?: string | number | null;
-}
-interface TradePayload {
-  trades: Trade[];
-  openPos: { ticker: string; entryPrice: number; shares: number } | null;
-}
-type AlpacaAccount = {
-  cash: number | null;
-  equity: number | null;
-  last_equity: number | null;
-  buying_power: number | null;
-  day_pnl: number | null;
-  day_pnl_pct: number | null;
-  timestampET: string;
-};
-
-/* =========================================================
-   Time helpers
-   ========================================================= */
-function pickMs(v: unknown): number | null {
-  if (v == null) return null;
-  if (typeof v === "number" && Number.isFinite(v)) return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
-  const n = Number(v);
-  if (Number.isFinite(n)) return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
-  const t = new Date(String(v)).getTime();
-  return Number.isFinite(t) ? t : null;
-}
-function formatETFromTrade(t: Trade): string {
-  const ms =
-    pickMs(t.createdAt) ??
-    pickMs(t.time) ??
-    pickMs(t.ts) ??
-    pickMs(t.at) ??
-    pickMs(t.filledAt) ??
-    pickMs(t.executedAt);
-  if (!ms) return "-";
-  return new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York" });
-}
-function ymdET(d: Date) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(d);
-  const y = parts.find((p) => p.type === "year")!.value;
-  const m = parts.find((p) => p.type === "month")!.value;
-  const day = parts.find((p) => p.type === "day")!.value;
-  return `${y}-${m}-${day}`;
-}
-
-/* =========================================================
-   Panic Sell button
-   ========================================================= */
-function PanicSellButton({ disabled }: { disabled: boolean }) {
-  const [open, setOpen] = useState(false);
-  const [key, setKey] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
-
-  const PASSKEY = "9340";
-
-  const confirm = async () => {
-    if (key.trim() !== PASSKEY) {
-      setMsg("❌ Incorrect passkey.");
-      return;
-    }
-    setBusy(true);
-    setMsg(null);
-    try {
-      let res = await fetch("/api/bot/panic-sell", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: key.trim() }),
-      });
-
-      let data: any = {};
-      try {
-        data = await res.json();
-      } catch {}
-
-      if (!res.ok || !(data?.ok ?? false)) {
-        const reason =
-          data?.error ||
-          data?.message ||
-          (typeof data === "string" ? data : "") ||
-          `HTTP ${res.status}`;
-        setMsg(`Panic sell failed: ${reason}`);
-        return;
-      }
-
-      setMsg("✅ Sent market-close for all positions.");
-      setTimeout(() => {
-        setOpen(false);
-        window.location.reload();
-      }, 700);
-    } catch {
-      setMsg("Network error during panic sell.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <>
-      <button
-        onClick={() => setOpen(true)}
-        disabled={disabled}
-        className={`rounded-lg px-3 py-1 text-sm font-semibold shadow
-          ${disabled ? "bg-gray-300 text-gray-600 cursor-not-allowed"
-                     : "bg-red-600 text-white hover:bg-red-700 active:scale-[.99]"}`}
-        title={disabled ? "No open position to close" : "Market close ALL positions"}
-      >
-        PANIC SELL
-      </button>
-
-      {open && (
-        <div
-          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4"
-          onClick={(e) => { if (e.target === e.currentTarget && !busy) setOpen(false); }}
-        >
-          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
-            <div className="text-lg font-semibold text-slate-800">Panic Sell — Close ALL Positions</div>
-            <p className="mt-1 text-sm text-slate-600">Sends market orders to flatten every open position.</p>
-
-            <label className="block mt-4 text-sm text-slate-700">Passkey</label>
-            <input
-              type="password"
-              autoFocus
-              className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-red-500"
-              placeholder="Enter passkey (4 digits)"
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && key) confirm();
-                if (e.key === "Escape" && !busy) setOpen(false);
-              }}
-            />
-
-            {msg && <div className="mt-3 text-sm">{msg}</div>}
-
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                disabled={busy}
-                onClick={() => setOpen(false)}
-                className="rounded-xl px-3 py-1.5 text-sm font-medium border border-slate-300 text-slate-700 hover:bg-slate-50"
-              >
-                Cancel
-              </button>
-              <button
-                disabled={busy || key.length === 0}
-                onClick={confirm}
-                className="rounded-xl px-3 py-1.5 text-sm font-semibold bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
-              >
-                {busy ? "Sending…" : "Confirm Panic Sell"}
-              </button>
-            </div>
-
-            <div className="mt-3 text-xs text-slate-500">
-              Hint: passkey is <span className="font-semibold">9340</span>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
-/* =========================================================
-   Page (positions chart + modal TV chart)
-   ========================================================= */
-export default function Home() {
-  const { data: session, status } = useSession();
-  if (status === "loading") return <div className="flex items-center justify-center h-screen">Loading...</div>;
-  if (!session)
-    return (
-      <div className="flex items-center justify-center h-screen">
-        <p className="text-lg font-bold">You need to log in to access this page.</p>
-      </div>
-    );
-
-  const OPEN_BG = "/bluebackground.jpg";
-  const CLOSED_BG = "/nightbackground.png";
-  const [bgUrl, setBgUrl] = useState<string>(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
-
-  useEffect(() => {
-    const i1 = new Image(); i1.src = OPEN_BG;
-    const i2 = new Image(); i2.src = CLOSED_BG;
-
-    const update = () => setBgUrl(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
-    update();
-    const id = setInterval(update, 30_000);
-    const onVis = () => document.visibilityState === "visible" && update();
-    document.addEventListener("visibilitychange", onVis);
-    return () => { clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
-  }, []);
-
-  // Stocks & AI analysis
-  const [stocks, setStocks] = useState<Stock[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [dataSource, setDataSource] = useState<string>("");
-  const [recommendation, setRecommendation] = useState<string | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-
-  // Keep the two AI picks (for Level-2 tie-breaker)
-  const [topPicks, setTopPicks] = useState<string[]>([]);
-
-  // Modal (TradingView)
-  const [selectedStock, setSelectedStock] = useState<string | null>(null);
-  const [chartVisible, setChartVisible] = useState(false);
-  const [agentResult, setAgentResult] = useState<string | null>(null);
-
-  // Bot / trades
-  const [botData, setBotData] = useState<any>(null);
-  const [tradeData, setTradeData] = useState<TradePayload | null>(null);
-  const { tick: statusTick, tradesToday: statusTradesToday, error: statusError } = useBotPoll(5000);
-
-  // Alpaca account
-  const [alpaca, setAlpaca] = useState<AlpacaAccount | null>(null);
-
-  // SSE: stocks
-  useEffect(() => {
-    const es = new EventSource("/api/stocks/stream");
-    es.onmessage = (evt) => {
-      try {
-        const obj = JSON.parse(evt.data);
-        setStocks(obj?.stocks ?? []);
-        setDataSource("FMP (stream)");
-        setErrorMessage(null);
-        setLoading(false);
-      } catch {}
-    };
-    es.onerror = () => setErrorMessage("Live stream error. Retrying...");
-    return () => es.close();
-  }, []);
-
-  // Poll /api/bot/tick
-  useEffect(() => {
-    let id: any;
-    const run = async () => {
-      try {
-        const r = await fetch("/api/bot/tick", { cache: "no-store" });
-        const j = await r.json();
-        setBotData(j);
-      } catch {}
-    };
-    run();
-    id = setInterval(run, 5000);
-    return () => clearInterval(id);
-  }, []);
-
-  // Poll /api/trades
-  useEffect(() => {
-    let id: any;
-    const run = async () => {
-      try {
-        const r = await fetch("/api/trades", { cache: "no-store" });
-        const j = await r.json();
-        if (!j.errorMessage) setTradeData(j);
-      } catch {}
-    };
-    run();
-    id = setInterval(run, 5000);
-    return () => clearInterval(id);
-  }, []);
-
-  // Poll Alpaca account
-  useEffect(() => {
-    let id: any;
-    const run = async () => {
-      try {
-        const r = await fetch("/api/alpaca/account", { cache: "no-store" });
-        const j = await r.json();
-        if (j?.ok && j?.account) setAlpaca(j.account as AlpacaAccount);
-      } catch {}
-    };
-    run();
-    id = setInterval(run, 10_000);
-    return () => clearInterval(id);
-  }, []);
-
-  // Ask AI recs
-  const askAIRecommendation = async () => {
-    try {
-      setAnalyzing(true);
-      setRecommendation(null);
-      const res = await fetch("/api/recommendation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks: stocks.slice(0, 20), topN: 2 }),
-      });
-      const data = await res.json();
-
-      if (!res.ok || data?.errorMessage) {
-        setRecommendation(`Error: ${data?.errorMessage || res.statusText}`);
-        setTopPicks([]);
-        return;
-      }
-
-      const picks: string[] = Array.isArray(data?.picks) ? data.picks : [];
-      const reasons: Record<string, string[]> = data?.reasons || {};
-      const risk: string = data?.risk || "";
-
-      setTopPicks(picks.slice(0, 2).map((t) => String(t).toUpperCase()));
-
-      const lines: string[] = [];
-      if (picks[0]) {
-        lines.push(`Top 1: ${picks[0]}`);
-        if (Array.isArray(reasons[picks[0]]) && reasons[picks[0]].length)
-          lines.push(`  • ${reasons[picks[0]].join("\n  • ")}`);
-      }
-      if (picks[1]) {
-        lines.push("");
-        lines.push(`Top 2: ${picks[1]}`);
-        if (Array.isArray(reasons[picks[1]]) && reasons[picks[1]].length)
-          lines.push(`  • ${reasons[picks[1]].join("\n  • ")}`);
-      }
-      if (risk) {
-        lines.push("");
-        lines.push(`Risk: ${risk}`);
-      }
-      setRecommendation(lines.join("\n") || "No recommendation.");
-    } catch {
-      setRecommendation("Failed to analyze stocks. Check server logs.");
-      setTopPicks([]);
-    } finally {
-      setAnalyzing(false);
-    }
-  };
-
-  /* ===========================
-     Chart behaviors (DECOUPLED)
-     =========================== */
-  const handleStockClick = (ticker: string) => {
-    setSelectedStock(ticker);
-    setChartVisible(true);
-    setAgentResult(null);
-  };
-  const closeChart = () => {
-    setChartVisible(false);
-    setSelectedStock(null);
-    setAgentResult(null);
-  };
-
-  const posChartSymbol = useMemo(
-    () => (tradeData?.openPos?.ticker ? String(tradeData.openPos.ticker).toUpperCase() : undefined),
-    [tradeData?.openPos?.ticker]
-  );
-
-  // Fallback symbols for tie-breaker (if AI hasn't picked yet)
-  const tieA = useMemo(() => {
-    const a = topPicks[0] || stocks[0]?.ticker || "AAPL";
-    return a.toUpperCase();
-  }, [topPicks, stocks]);
-  const tieB = useMemo(() => {
-    let candidate =
-      topPicks[1] ||
-      stocks.find((s) => s.ticker && s.ticker.toUpperCase() !== tieA)?.ticker ||
-      "MSFT";
-    candidate = String(candidate).toUpperCase();
-    if (candidate === tieA) candidate = "MSFT";
-    return candidate;
-  }, [topPicks, stocks, tieA]);
-
-  // Level-2 symbol pick via quick stats
-  type L2QuickStat = {
-    symbol: string;
-    buyCount: number;
-    sellCount: number;
-    buyNotional: number;
-    sellNotional: number;
-  };
-  const [l2Choice, setL2Choice] = useState<string | null>(null);
-
-  useEffect(() => {
-    let timer: any;
-
-    async function fetchStats(a: string, b: string) {
-      try {
-        const q = [a, b].filter(Boolean).join(",");
-        if (!q) return;
-        const res = await fetch(`/api/level2/quick-stats?symbols=${encodeURIComponent(q)}`, { cache: "no-store" });
-        const data = await res.json();
-
-        const stats: Record<string, L2QuickStat> = data?.stats || {};
-        const sa = stats[a];
-        const sb = stats[b];
-
-        let pick = a;
-        if (sa && sb) {
-          if ((sb.buyNotional ?? 0) > (sa.buyNotional ?? 0)) pick = b;
-          else if ((sb.buyNotional ?? 0) === (sa.buyNotional ?? 0)) {
-            if ((sb.buyCount ?? 0) > (sa.buyCount ?? 0)) pick = b;
-          }
-        } else if (!sa && sb) {
-          pick = b;
-        } else {
-          pick = a;
-        }
-
-        setL2Choice(String(pick).toUpperCase());
-      } catch {
-        // keep previous choice on error
-      }
-    }
-
-    const run = () => fetchStats(tieA, tieB);
-    run();
-    timer = setInterval(run, 5000);
-    return () => clearInterval(timer);
-  }, [tieA, tieB]);
-
-  const handleAgent = async () => {
-    try {
-      const res = await fetch("/api/chart-analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ticker: selectedStock }),
-      });
-      if (!res.ok) throw new Error("Failed to analyze chart");
-      const data = await res.json();
-      setAgentResult(
-        `Buy at: ${data.bestBuyPrice}\nSell target: ${data.sellPrice || "Not provided"}\n\n${data.reason}\n\nPrediction: ${data.prediction || "N/A"}`
-      );
-    } catch {
-      alert("Error analyzing the chart.");
-    }
-  };
-
-  // today's trades count
-  const todayTradeCount = useMemo(() => {
-    const fromStatus = Array.isArray(statusTradesToday) ? statusTradesToday.length : null;
-    if (fromStatus != null) return fromStatus;
-    const all = tradeData?.trades || [];
-    if (!all.length) return 0;
-    const todayKey = ymdET(new Date());
-    let n = 0;
-    for (const t of all) {
-      const ms =
-        pickMs(t.createdAt) ??
-        pickMs(t.time) ??
-        pickMs(t.ts) ??
-        pickMs(t.at) ??
-        pickMs(t.filledAt) ??
-        pickMs(t.executedAt);
-      if (!ms) continue;
-      if (ymdET(new Date(ms)) === todayKey) n++;
-    }
-    return n;
-  }, [statusTradesToday, tradeData]);
-
-  const hasOpenPos = !!tradeData?.openPos && Number(tradeData.openPos.shares) !== 0;
-
-  // Symbol to show if tie-breaker hasn't produced a choice yet
-  const l2SymbolDefault = useMemo(() => {
-    const botPick = botData?.lastRec?.ticker ? String(botData.lastRec.ticker).toUpperCase() : null;
-    const firstGainer = stocks[0]?.ticker ? String(stocks[0].ticker).toUpperCase() : null;
-    return botPick || firstGainer || "AAPL";
-  }, [botData?.lastRec?.ticker, stocks]);
-
- // Recompute before-close every minute (so fallback clears at 4pm ET)
-const [beforeCloseET, setBeforeCloseET] = useState<boolean>(() => {
-  const d = nowET();
-  const mins = d.getHours() * 60 + d.getMinutes();
-  return mins <= 16 * 60; // 4:00pm ET
-});
-useEffect(() => {
-  const id = setInterval(() => {
-    const d = nowET();
-    const mins = d.getHours() * 60 + d.getMinutes();
-    setBeforeCloseET(mins <= 16 * 60);
-  }, 60_000);
-  return () => clearInterval(id);
-}, []);
-
-// Keep your existing posChartSymbol (you already have it above)
-// const posChartSymbol = useMemo(() => (tradeData?.openPos?.ticker ? ... ), [ ... ]);
-
-const fallbackSymbolBeforeClose =
-  beforeCloseET
-    ? (posChartSymbol || l2Choice || (stocks[0]?.ticker && String(stocks[0].ticker).toUpperCase()) || "AAPL")
-    : undefined;
-
-
-  return (
-    <main
-      className="min-h-screen w-full flex flex-col"
-      style={{
-        backgroundImage: `url(${bgUrl})`,
-        backgroundSize: "cover",
-        backgroundPosition: "center",
-        backgroundRepeat: "no-repeat",
-        backgroundAttachment: "fixed",
-        transition: "background-image 300ms ease-in-out",
-      }}
-    >
-      <Navbar />
-
-      <div className="flex-1 px-4 pt-20 pb-6">
-        <div className="mb-10 md:mb-14">
-          <FloatingNarrator />
-        </div>
-
-        <div className="grid gap-5 xl:grid-cols-[460px_minmax(720px,1fr)_960px] lg:grid-cols-1">
-          {/* LEFT: AI Chat */}
-          <div>
-            <GlassPanel title="AI Chat" color="cyan" dense>
-              <ChatBox />
-            </GlassPanel>
-          </div>
-
-          {/* MIDDLE: Top Gainers + Level 2 */}
-          <div className="grid gap-5">
-            <TopGainers
-              loading={loading}
-              errorMessage={errorMessage}
-              stocks={stocks}
-              dataSource={dataSource}
-              onAskAI={askAIRecommendation}
-              analyzing={analyzing}
-              onPick={handleStockClick}
-            />
-
-            {/* Level-2 (use tie-breaker choice if available) */}
-            <Level2Panel symbol={(l2Choice || l2SymbolDefault)} mock={true} height={225} />
-          </div>
-
-          {/* RIGHT: Positions chart + status cards */}
-          <div className="grid gap-5">
-            <div className="relative">
-              <TradeChartPanel
-                height={720}
-                // Fallback only before 4:00pm ET; after 4pm, panel clears unless a position is open
-                symbolWhenFlat={fallbackSymbolBeforeClose}
-              />
-              <div className="absolute right-4 top-3 z-10">
-                <PanicSellButton disabled={!hasOpenPos} />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch">
-              <AIRecommendation
-                botData={botData}
-                alpaca={alpaca}
-                analyzing={analyzing}
-                askAI={askAIRecommendation}
-                stocksCount={stocks.length}
-                recommendation={recommendation}
-              />
-              <BotStatus statusError={statusError} statusTick={statusTick} todayTradeCount={todayTradeCount} />
-            </div>
-          </div>
-        </div>
-
-        <div className="mt-5 w-full xl:max-w-[960px] xl:ml-auto">
-          <TradeLog tradeData={tradeData} slim />
-        </div>
-      </div>
-
-      {/* ===== Modal: TradingViewChart ===== */}
-      {chartVisible && selectedStock && (
-        <div
-          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/50 p-4"
-          onClick={(e) => { if (e.target === e.currentTarget) closeChart(); }}
-        >
-          <div className="w-full max-w-6xl bg-white rounded-2xl shadow-2xl overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-3 border-b">
-              <div className="font-semibold text-slate-800">
-                {selectedStock} — TradingView
-              </div>
-              <button
-                onClick={closeChart}
-                className="rounded-md px-3 py-1.5 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800"
-              >
-                Close
-              </button>
-            </div>
-
-            <div className="h-[680px]">
-              <TradingViewChart key={selectedStock} symbol={selectedStock} height={680} />
-            </div>
-
-            <div className="px-4 py-3 border-t bg-slate-50 flex items-center gap-3">
-              <Button onClick={handleAgent} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 text-sm rounded-md">
-                Analyze This Chart
-              </Button>
-              {agentResult && (
-                <pre className="text-xs whitespace-pre-wrap bg-white rounded-md p-2 ring-1 ring-slate-200 flex-1 overflow-auto max-h-40">
-                  {agentResult}
-                </pre>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-    </main>
-  );
-}
-
-/* =========================================================
-   Subpanels
-   ========================================================= */
 function TopGainers({
   loading,
   errorMessage,

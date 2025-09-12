@@ -126,7 +126,7 @@ function useOpenPosition(pollMsWhileOpen = 20000) {
   return pos;
 }
 
-function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
+function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000, paused = false) {
   const visible = useVisibility();
   const [rows, setRows] = useState<TradeWire[] | null>(null);
 
@@ -184,10 +184,10 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
   }, [symbol]);
 
   useEffect(() => {
-    if (!symbol || !visible || !isMarketHoursET()) return;
+    if (!symbol || !visible || !isMarketHoursET() || paused) return;
     const id = setInterval(load, pollMsWhenActive);
     return () => clearInterval(id);
-  }, [symbol, visible, pollMsWhenActive]);
+  }, [symbol, visible, pollMsWhenActive, paused]);
 
   return rows;
 }
@@ -197,7 +197,8 @@ function useCandles1m(
   isActiveFast: boolean,
   pollMsFast = 30000,
   pollMsSlow = 120000,
-  limit = 240
+  limit = 240,
+  paused = false
 ) {
   const visible = useVisibility();
   const [candles, setCandles] = useState<Candle[] | null>(null);
@@ -255,13 +256,149 @@ function useCandles1m(
   }, [symbol]);
 
   useEffect(() => {
-    if (!symbol || !visible || !isMarketHoursET()) return;
+    if (!symbol || !visible || !isMarketHoursET() || paused) return;
     const ms = isActiveFast ? pollMsFast : pollMsSlow;
     const id = setInterval(() => load(symbol), ms);
     return () => clearInterval(id);
-  }, [symbol, isActiveFast, visible, pollMsFast, pollMsSlow]);
+  }, [symbol, isActiveFast, visible, pollMsFast, pollMsSlow, paused]);
 
   return { candles };
+}
+
+/* ================= Alpaca day PnL ================= */
+function useAlpacaDayPnL(pollMs = 15000) {
+  const [pnl, setPnl] = useState<number | null>(null);
+
+  useEffect(() => {
+    let id: any;
+    const run = async () => {
+      try {
+        const j = await fetchJSON<any>("/api/alpaca/account");
+        const val =
+          j?.ok && j?.account && (j.account.day_pnl != null ? Number(j.account.day_pnl) : null);
+        if (val == null || Number.isNaN(val)) return;
+        setPnl(val);
+      } catch {
+        /* ignore */
+      }
+    };
+    run();
+    id = setInterval(run, pollMs);
+    return () => clearInterval(id);
+  }, [pollMs]);
+
+  return pnl;
+}
+
+/* ================= Panic Sell button ================= */
+function PanicSellButton({ disabled }: { disabled: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [key, setKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const PASSKEY = "9340";
+
+  const confirm = async () => {
+    if (key.trim() !== PASSKEY) {
+      setMsg("❌ Incorrect passkey.");
+      return;
+    }
+    setBusy(true);
+    setMsg(null);
+    try {
+      let res = await fetch("/api/bot/panic-sell", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: key.trim() }),
+      });
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {}
+      if (!res.ok || !(data?.ok ?? false)) {
+        const reason =
+          data?.error ||
+          data?.message ||
+          (typeof data === "string" ? data : "") ||
+          `HTTP ${res.status}`;
+        setMsg(`Panic sell failed: ${reason}`);
+        return;
+      }
+      setMsg("✅ Sent market-close for all positions.");
+      setTimeout(() => {
+        setOpen(false);
+        window.location.reload();
+      }, 700);
+    } catch {
+      setMsg("Network error during panic sell.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        onClick={() => setOpen(true)}
+        disabled={disabled}
+        className={`rounded-lg px-3 py-1.5 text-xs font-semibold shadow
+          ${disabled ? "bg-gray-400/70 text-white/80 cursor-not-allowed"
+                     : "bg-red-600 text-white hover:bg-red-700 active:scale-[.99]"}`}
+        title={disabled ? "No open position to close" : "Market close ALL positions"}
+      >
+        PANIC SELL
+      </button>
+
+      {open && (
+        <div
+          className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 p-4"
+          onClick={(e) => { if (e.target === e.currentTarget && !busy) setOpen(false); }}
+        >
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
+            <div className="text-lg font-semibold text-slate-800">Panic Sell — Close ALL Positions</div>
+            <p className="mt-1 text-sm text-slate-600">Sends market orders to flatten every open position.</p>
+
+            <label className="block mt-4 text-sm text-slate-700">Passkey</label>
+            <input
+              type="password"
+              autoFocus
+              className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-red-500"
+              placeholder="Enter passkey (4 digits)"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && key) confirm();
+                if (e.key === "Escape" && !busy) setOpen(false);
+              }}
+            />
+
+            {msg && <div className="mt-3 text-sm">{msg}</div>}
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                disabled={busy}
+                onClick={() => setOpen(false)}
+                className="rounded-xl px-3 py-1.5 text-sm font-medium border border-slate-300 text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={busy || key.length === 0}
+                onClick={confirm}
+                className="rounded-xl px-3 py-1.5 text-sm font-semibold bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
+              >
+                {busy ? "Sending…" : "Confirm Panic Sell"}
+              </button>
+            </div>
+
+            <div className="mt-3 text-xs text-slate-500">
+              Hint: passkey is <span className="font-semibold">9340</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
 /* ================= lightweight-charts v4 ONLY (CDN) ================= */
@@ -270,7 +407,6 @@ declare global {
     LightweightCharts?: any;
   }
 }
-
 async function ensureLWv4(): Promise<any | null> {
   if (typeof window === "undefined") return null;
   if (window.LightweightCharts?.createChart) return window.LightweightCharts;
@@ -286,114 +422,55 @@ async function ensureLWv4(): Promise<any | null> {
   return window.LightweightCharts?.createChart ? window.LightweightCharts : null;
 }
 
-/* ================= Component ================= */
-export default function TradeChartPanel({
-  height = 360,
-  symbolWhenFlat,
+/* ================= Reusable chart view (no fetching) ================= */
+function ChartView({
+  height,
+  symbol,
+  candles,
+  todayTrades,
+  pos,
+  dayPnl,
+  showPopOut,
+  onPopOut,
+  showClose,
+  onClose,
 }: {
-  height?: number;
-  symbolWhenFlat?: string | null | undefined;
+  height: number;
+  symbol: string | null;
+  candles: Candle[] | null;
+  todayTrades: TradeWire[] | null;
+  pos: PositionWire | null;
+  dayPnl: number | null;
+  showPopOut?: boolean;
+  onPopOut?: () => void;
+  showClose?: boolean;
+  onClose?: () => void;
 }) {
-  const pos = useOpenPosition(20000);
-
-  // 4pm ET gate for fallback
-  const [beforeCloseFlag, setBeforeCloseFlag] = useState(isBeforeETClose());
-  useEffect(() => {
-    const id = setInterval(() => setBeforeCloseFlag(isBeforeETClose()), 60_000);
-    return () => clearInterval(id);
-  }, []);
-
-  // sticky symbol for the day
-  const dayYMD = useMemo(() => yyyyMmDdET(new Date()), []);
-  const [stickySymbol, setStickySymbol] = useState<string | null>(null);
-  const [stickyDay, setStickyDay] = useState<string | null>(null);
-  useEffect(() => {
-    try {
-      const s = sessionStorage.getItem("chartSticky");
-      if (s) {
-        const obj = JSON.parse(s);
-        if (obj?.symbol && obj?.day === dayYMD && isBeforeETClose()) {
-          setStickySymbol(obj.symbol);
-          setStickyDay(obj.day);
-        }
-      }
-    } catch {}
-  }, [dayYMD]);
-
-  const hasOpen = !!pos?.open && !!pos?.ticker;
-  useEffect(() => {
-    if (!hasOpen) return;
-    const t = String(pos!.ticker);
-    setStickySymbol(t);
-    setStickyDay(dayYMD);
-    try {
-      sessionStorage.setItem("chartSticky", JSON.stringify({ symbol: t, day: dayYMD }));
-    } catch {}
-  }, [hasOpen, pos?.ticker, dayYMD]);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (!isBeforeETClose() && stickySymbol) {
-        setStickySymbol(null);
-        setStickyDay(null);
-        try {
-          sessionStorage.removeItem("chartSticky");
-        } catch {}
-      }
-    }, 60_000);
-    return () => clearInterval(id);
-  }, [stickySymbol]);
-
-  const stickyActive = !!stickySymbol && stickyDay === dayYMD && beforeCloseFlag;
-  const symbol: string | null =
-    hasOpen
-      ? (pos!.ticker as string)
-      : stickyActive
-      ? stickySymbol
-      : beforeCloseFlag && symbolWhenFlat
-      ? String(symbolWhenFlat)
-      : null;
-
-  const { candles } = useCandles1m(symbol, hasOpen || stickyActive, 30000, 120000, 240);
-  const todayTrades = useTodayTrades(symbol, 30000);
-
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const createdRef = useRef(false); // single-create guard
+  const createdRef = useRef(false);
   const chartRef = useRef<any>(null);
   const candleSeriesRef = useRef<any>(null);
   const vwapSeriesRef = useRef<any>(null);
   const priceLinesRef = useRef<any[]>([]);
-  const [hover, setHover] = useState<{
-    price?: number;
-    o?: number;
-    h?: number;
-    l?: number;
-    c?: number;
-    vwap?: number;
-  } | null>(null);
+  const [hover, setHover] = useState<{ price?: number; o?: number; h?: number; l?: number; c?: number; vwap?: number } | null>(null);
 
-  // debug
-  useEffect(() => {
-    console.log("[TradeChartPanel] symbol:", symbol, "candles:", candles?.length ?? 0);
-  }, [symbol, candles?.length]);
+  const headerLeft = symbol ? `${symbol} • 1-min • VWAP` : "1-min Chart";
+  const dayYMD = yyyyMmDdET(new Date());
 
-  /* -------- Create chart (v4 only; single-run; clears container) -------- */
+  /* create chart once */
   useEffect(() => {
     let cleanup = () => {};
-
     (async () => {
-      if (!containerRef.current) return;
-      if (createdRef.current) return; // prevent double mount
+      if (!containerRef.current || createdRef.current) return;
       createdRef.current = true;
 
-      // clear any leftover canvases
       containerRef.current.innerHTML = "";
       containerRef.current.style.height = `${height}px`;
 
       const L = await ensureLWv4();
       if (!L?.createChart) {
         createdRef.current = false;
-        console.error("[TradeChartPanel] LW v4 not loaded");
+        console.error("[ChartView] LW v4 not loaded");
         return;
       }
 
@@ -462,21 +539,19 @@ export default function TradeChartPanel({
         ro.disconnect();
         chart.unsubscribeCrosshairMove(onMove);
         chart.remove?.();
-        createdRef.current = false; // allow clean remounts
+        createdRef.current = false;
       };
     })();
-
     return () => cleanup();
   }, [height]);
 
-  /* -------- Update data/lines/markers -------- */
+  /* update data/lines/markers */
   useEffect(() => {
     const cs = candleSeriesRef.current;
     const vs = vwapSeriesRef.current;
     const chart = chartRef.current;
     if (!cs || !chart) return;
 
-    // remove old price lines
     for (const pl of priceLinesRef.current) {
       try {
         cs.removePriceLine(pl);
@@ -503,7 +578,7 @@ export default function TradeChartPanel({
     cs.setData(seriesData);
 
     if (vs) {
-      const vwap = computeSessionVWAP(candles, yyyyMmDdET(new Date()));
+      const vwap = computeSessionVWAP(candles, dayYMD);
       vs.setData(Array.isArray(vwap) ? vwap : []);
     }
 
@@ -578,7 +653,6 @@ export default function TradeChartPanel({
     cs.setMarkers(markers);
   }, [candles, todayTrades, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.entryAt, pos?.open, pos?.ticker]);
 
-  // R:R legend
   const rr = useMemo(() => {
     if (!(pos?.open && pos?.entryPrice && pos?.stopLoss)) return null;
     const risk = Math.abs(pos.entryPrice - pos.stopLoss);
@@ -589,67 +663,231 @@ export default function TradeChartPanel({
     return { rToStop: (p - pos.stopLoss) / risk, rToTP: tp != null ? (tp - p) / risk : undefined };
   }, [hover?.price, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.open]);
 
-  const showChart = !!symbol;
-  const headerLeft = showChart ? `${symbol} • 1-min • VWAP` : "1-min Chart";
+  const panicDisabled = !(pos?.open && (pos.shares ?? 0) !== 0);
 
   return (
-    <div className="w-full">
-      <div className="relative rounded-2xl border border-slate-700 bg-slate-900/70 shadow p-4">
-        <div className="flex items-center justify-between mb-3">
-          <div className="text-slate-200 font-medium">{headerLeft}</div>
-          {hasOpen && pos?.entryPrice != null ? (
-            <div className="text-xs text-slate-400">
-              Entry <span className="text-slate-200">${Number(pos.entryPrice).toFixed(2)}</span>
-              {pos.stopLoss != null && (
-                <>
-                  <span className="mx-2">•</span>
-                  SL <span className="text-red-400">${Number(pos.stopLoss).toFixed(2)}</span>
-                </>
+    <div className="relative rounded-2xl border border-slate-700 bg-slate-900/70 shadow p-4">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-slate-200 font-medium">{headerLeft}</div>
+        {pos?.open && pos?.entryPrice != null ? (
+          <div className="text-xs text-slate-400">
+            Entry <span className="text-slate-200">${Number(pos.entryPrice).toFixed(2)}</span>
+            {pos.stopLoss != null && (
+              <>
+                <span className="mx-2">•</span>
+                SL <span className="text-red-400">${Number(pos.stopLoss).toFixed(2)}</span>
+              </>
+            )}
+            {pos.takeProfit != null && (
+              <>
+                <span className="mx-2">•</span>
+                TP <span className="text-green-400">${Number(pos.takeProfit).toFixed(2)}</span>
+              </>
+            )}
+          </div>
+        ) : null}
+      </div>
+
+      {/* Chart canvas */}
+      <div ref={containerRef} className="w-full min-h-0" style={{ height, lineHeight: 0 }} />
+
+      {/* Overlays (z-index high to stay in front of the chart) */}
+      <div className="pointer-events-none absolute inset-0 z-[60]">
+        {/* OHLC/VWAP (top-right) */}
+        <div className="absolute right-3 top-3 rounded-md bg-slate-800/80 px-3 py-2 text-[11px] leading-4 text-slate-200">
+          {hover ? (
+            <>
+              <div>
+                O {hover.o?.toFixed(2)} H {hover.h?.toFixed(2)} L {hover.l?.toFixed(2)} C {hover.c?.toFixed(2)}
+              </div>
+              <div>VWAP {hover.vwap != null ? hover.vwap.toFixed(2) : "—"}</div>
+              {rr ? (
+                <div className="text-slate-300">
+                  R→SL {rr.rToStop.toFixed(2)}x{rr.rToTP != null ? ` • R→TP ${rr.rToTP.toFixed(2)}x` : ""}
+                </div>
+              ) : (
+                <div className="text-slate-500">R:R —</div>
               )}
-              {pos.takeProfit != null && (
-                <>
-                  <span className="mx-2">•</span>
-                  TP <span className="text-green-400">${Number(pos.takeProfit).toFixed(2)}</span>
-                </>
-              )}
-            </div>
-          ) : stickyActive ? (
-            <div className="text-xs text-slate-400 italic">Position closed — showing last chart until 4:00 PM ET.</div>
-          ) : null}
+            </>
+          ) : (
+            <div className="text-slate-400">Hover for OHLC / VWAP</div>
+          )}
         </div>
 
-        {showChart ? (
-          <>
-            <div ref={containerRef} className="w-full min-h-0" style={{ height, lineHeight: 0 }} />
-            <div className="pointer-events-none absolute right-3 top-3 rounded-md bg-slate-800/80 px-3 py-2 text-[11px] leading-4 text-slate-200">
-              {hover ? (
-                <>
-                  <div>
-                    O {hover.o?.toFixed(2)} H {hover.h?.toFixed(2)} L {hover.l?.toFixed(2)} C {hover.c?.toFixed(2)}
-                  </div>
-                  <div>VWAP {hover.vwap != null ? hover.vwap.toFixed(2) : "—"}</div>
-                  {rr ? (
-                    <div className="text-slate-300">
-                      R→SL {rr.rToStop.toFixed(2)}x
-                      {rr.rToTP != null ? ` • R→TP ${rr.rToTP.toFixed(2)}x` : ""}
-                    </div>
-                  ) : (
-                    <div className="text-slate-500">R:R —</div>
-                  )}
-                </>
-              ) : (
-                <div className="text-slate-400">Hover for OHLC / VWAP</div>
-              )}
-            </div>
-          </>
-        ) : (
-          <div className="flex items-center justify-center h-[260px] md:h-[300px]">
-            <div className="text-slate-400 text-sm">
-              No open positions yet. I’ll pop a live 1-min chart here when we enter.
-            </div>
+        {/* PnL + Panic Sell (bottom-right) */}
+        <div className="absolute bottom-2 right-2 pointer-events-auto flex items-center gap-2">
+          <div
+            className={[
+              "px-3 py-1.5 rounded-full text-xs font-semibold shadow-lg",
+              dayPnl == null
+                ? "bg-slate-600 text-white"
+                : dayPnl >= 0
+                ? "bg-emerald-600 text-white"
+                : "bg-rose-600 text-white",
+            ].join(" ")}
+            title="Today's PnL (Alpaca)"
+          >
+            {dayPnl == null ? "—" : `${dayPnl >= 0 ? "+" : "-"}$${Math.abs(dayPnl).toFixed(2)}`}
+          </div>
+          <PanicSellButton disabled={panicDisabled} />
+        </div>
+
+        {/* Pop Out (bottom-left) / Close (top-right) */}
+        {showPopOut && (
+          <div className="absolute bottom-2 left-2 pointer-events-auto">
+            <button
+              onClick={onPopOut}
+              className="rounded-md bg-slate-800/90 text-white text-xs px-3 py-1.5 shadow hover:bg-slate-700"
+              title="Open big chart"
+            >
+              Pop Out
+            </button>
+          </div>
+        )}
+        {showClose && (
+          <div className="absolute top-2 right-2 pointer-events-auto">
+            <button
+              onClick={onClose}
+              className="rounded-md bg-slate-900 text-white text-xs px-3 py-1.5 shadow hover:bg-slate-800"
+              title="Close"
+            >
+              Close
+            </button>
           </div>
         )}
       </div>
     </div>
+  );
+}
+
+/* ================= Component (fetching + modal) ================= */
+export default function TradeChartPanel({
+  height = 360,
+  symbolWhenFlat,
+}: {
+  height?: number;
+  symbolWhenFlat?: string | null | undefined;
+}) {
+  const pos = useOpenPosition(20000);
+
+  // 4pm ET gate for fallback
+  const [beforeCloseFlag, setBeforeCloseFlag] = useState(isBeforeETClose());
+  useEffect(() => {
+    const id = setInterval(() => setBeforeETClose(isBeforeETClose()), 60_000);
+    function setBeforeETClose(v: boolean) {
+      setBeforeCloseFlag(v);
+    }
+    return () => clearInterval(id);
+  }, []);
+
+  // sticky symbol for the day
+  const dayYMD = useMemo(() => yyyyMmDdET(new Date()), []);
+  const [stickySymbol, setStickySymbol] = useState<string | null>(null);
+  const [stickyDay, setStickyDay] = useState<string | null>(null);
+  useEffect(() => {
+    try {
+      const s = sessionStorage.getItem("chartSticky");
+      if (s) {
+        const obj = JSON.parse(s);
+        if (obj?.symbol && obj?.day === dayYMD && isBeforeETClose()) {
+          setStickySymbol(obj.symbol);
+          setStickyDay(obj.day);
+        }
+      }
+    } catch {}
+  }, [dayYMD]);
+
+  const hasOpen = !!pos?.open && !!pos?.ticker;
+  useEffect(() => {
+    if (!hasOpen) return;
+    const t = String(pos!.ticker);
+    setStickySymbol(t);
+    setStickyDay(dayYMD);
+    try {
+      sessionStorage.setItem("chartSticky", JSON.stringify({ symbol: t, day: dayYMD }));
+    } catch {}
+  }, [hasOpen, pos?.ticker, dayYMD]);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!isBeforeETClose() && stickySymbol) {
+        setStickySymbol(null);
+        setStickyDay(null);
+        try {
+          sessionStorage.removeItem("chartSticky");
+        } catch {}
+      }
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [stickySymbol]);
+
+  const stickyActive = !!stickySymbol && stickyDay === dayYMD && beforeCloseFlag;
+  const symbol: string | null =
+    hasOpen
+      ? (pos!.ticker as string)
+      : stickyActive
+      ? stickySymbol
+      : beforeCloseFlag && symbolWhenFlat
+      ? String(symbolWhenFlat)
+      : null;
+
+  // Big view (modal). While open, pause polling in hooks below.
+  const [bigOpen, setBigOpen] = useState(false);
+  const paused = bigOpen;
+
+  const { candles } = useCandles1m(symbol, hasOpen || stickyActive, 30000, 120000, 240, paused);
+  const todayTrades = useTodayTrades(symbol, 30000, paused);
+
+  // Day PnL (shared by both views, no duplicate calls)
+  const dayPnl = useAlpacaDayPnL(15000);
+
+  return (
+    <>
+      {/* Inline chart with Pop Out button (bottom-left) */}
+      {symbol ? (
+        <ChartView
+          height={height}
+          symbol={symbol}
+          candles={candles}
+          todayTrades={todayTrades}
+          pos={pos}
+          dayPnl={dayPnl}
+          showPopOut
+          onPopOut={() => setBigOpen(true)}
+        />
+      ) : (
+        <div className="relative rounded-2xl border border-slate-700 bg-slate-900/70 shadow p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-slate-200 font-medium">1-min Chart</div>
+          </div>
+          <div className="flex items-center justify-center h-[260px] md:h-[300px] text-slate-400 text-sm">
+            No open positions yet. I’ll pop a live 1-min chart here when we enter.
+          </div>
+        </div>
+      )}
+
+      {/* Full-screen big chart (no extra polling; reuses data) */}
+      {bigOpen && (
+        <div
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setBigOpen(false);
+          }}
+        >
+          <div className="w-full max-w-[1400px]">
+            <ChartView
+              height={820}
+              symbol={symbol}
+              candles={candles}
+              todayTrades={todayTrades}
+              pos={pos}
+              dayPnl={dayPnl}
+              showClose
+              onClose={() => setBigOpen(false)}
+            />
+          </div>
+        </div>
+      )}
+    </>
   );
 }
