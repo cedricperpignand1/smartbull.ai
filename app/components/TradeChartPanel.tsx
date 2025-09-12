@@ -246,51 +246,147 @@ export default function TradeChartPanel({ height = 360, symbolWhenFlat }: { heig
   // debug
   useEffect(() => { console.log("[TradeChartPanel] symbol:", symbol, "candles:", candles?.length ?? 0); }, [symbol, candles?.length]);
 
-  // create chart (ESM → CDN)
-  useEffect(() => {
-    let cleanup = () => {};
-    (async () => {
-      if (!containerRef.current) return;
-      const lw = await loadLWAny();
-      if (!lw) { console.error("[TradeChartPanel] lightweight-charts not available"); return; }
+// create chart (handles v5 and v4 automatically; CDN fallback last resort)
+useEffect(() => {
+  let cleanup = () => {};
 
-      const chart = lw.createChart(containerRef.current, {
-        height,
-        layout: { textColor: "#e5e7eb", background: { type: lw.ColorType?.Solid ?? 0, color: "#0b1220" } },
-        grid: { vertLines: { visible: false }, horzLines: { visible: true, color: "#1f2a44" } },
-        rightPriceScale: { borderVisible: false },
-        timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
-        crosshair: { mode: lw.CrosshairMode?.Normal ?? 0 },
-      });
+  type LW = { createChart: any; CrosshairMode: any; ColorType: any };
 
-      const candleSeries = chart.addCandlestickSeries({});
-      candleSeries.applyOptions({
-        upColor: "#22c55e", downColor: "#ef4444", wickUpColor: "#22c55e", wickDownColor: "#ef4444", borderVisible: false,
-      });
+  const setupWith = (lw: LW) => {
+    const chart = lw.createChart(containerRef.current!, {
+      height,
+      layout: { textColor: "#e5e7eb", background: { type: lw.ColorType?.Solid ?? 0, color: "#0b1220" } },
+      grid: { vertLines: { visible: false }, horzLines: { visible: true, color: "#1f2a44" } },
+      rightPriceScale: { borderVisible: false },
+      timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
+      crosshair: { mode: lw.CrosshairMode?.Normal ?? 0 },
+    });
 
-      let vwapSeries: any = null;
-      try { vwapSeries = chart.addLineSeries({}); vwapSeries.applyOptions({ lineWidth: 2 }); } catch {}
+    // ---- add series: prefer v4 methods, fall back to v5 addSeries
+    let candleSeries: any;
+    if (typeof (chart as any).addCandlestickSeries === "function") {
+      candleSeries = (chart as any).addCandlestickSeries({});
+    } else if (typeof (chart as any).addSeries === "function") {
+      try {
+        candleSeries = (chart as any).addSeries({ type: "Candlestick" });
+      } catch {
+        candleSeries = (chart as any).addSeries("Candlestick");
+      }
+    } else {
+      throw new Error("No compatible method to add candlestick series");
+    }
 
-      const onMove = (p: any) => {
-        if (!p?.time) { setHover(null); return; }
-        const sd = p.seriesData as Map<any, any>;
-        const c = sd?.get(candleSeries); const v = vwapSeries ? sd?.get(vwapSeries) : null;
-        if (!c) { setHover(null); return; }
-        setHover({ o: c.open, h: c.high, l: c.low, c: c.close, price: c.close, vwap: typeof v?.value === "number" ? v.value : undefined });
-      };
-      chart.subscribeCrosshairMove(onMove);
+    candleSeries.applyOptions({
+      upColor: "#22c55e",
+      downColor: "#ef4444",
+      wickUpColor: "#22c55e",
+      wickDownColor: "#ef4444",
+      borderVisible: false,
+    });
 
-      chartRef.current = chart; candleSeriesRef.current = candleSeries; vwapSeriesRef.current = vwapSeries;
+    let vwapSeries: any = null;
+    if (typeof (chart as any).addLineSeries === "function") {
+      vwapSeries = (chart as any).addLineSeries({});
+    } else if (typeof (chart as any).addSeries === "function") {
+      try {
+        vwapSeries = (chart as any).addSeries({ type: "Line" });
+      } catch {
+        vwapSeries = (chart as any).addSeries("Line");
+      }
+    }
+    if (vwapSeries?.applyOptions) vwapSeries.applyOptions({ lineWidth: 2 });
 
-      const applyWidth = () => { if (!containerRef.current) return; chart.applyOptions({ width: containerRef.current.clientWidth }); };
-      applyWidth(); const ro = new ResizeObserver(applyWidth); ro.observe(containerRef.current!);
-      const onWinResize = () => applyWidth(); window.addEventListener("resize", onWinResize);
+    const onMove = (p: any) => {
+      if (!p?.time) { setHover(null); return; }
+      const sd = p.seriesData as Map<any, any>;
+      const c = sd?.get(candleSeries);
+      const v = vwapSeries ? sd?.get(vwapSeries) : null;
+      if (!c) { setHover(null); return; }
+      setHover({ o: c.open, h: c.high, l: c.low, c: c.close, price: c.close, vwap: typeof v?.value === "number" ? v.value : undefined });
+    };
+    chart.subscribeCrosshairMove(onMove);
 
-      cleanup = () => { window.removeEventListener("resize", onWinResize); ro.disconnect(); chart.unsubscribeCrosshairMove(onMove); chart.remove(); };
+    const applyWidth = () => { if (!containerRef.current) return; chart.applyOptions({ width: containerRef.current.clientWidth }); };
+    applyWidth();
+    const ro = new ResizeObserver(applyWidth);
+    ro.observe(containerRef.current!);
+    const onWinResize = () => applyWidth();
+    window.addEventListener("resize", onWinResize);
+
+    cleanup = () => {
+      window.removeEventListener("resize", onWinResize);
+      ro.disconnect();
+      chart.unsubscribeCrosshairMove(onMove);
+      chart.remove?.();
+    };
+
+    return { chart, candleSeries, vwapSeries };
+  };
+
+  (async () => {
+    if (!containerRef.current) return;
+
+    // 1) Try the installed module
+    let lw = await (async () => {
+      try {
+        const m: any = await import("lightweight-charts");
+        const root = m?.createChart ? m : m?.default;
+        if (!root?.createChart) return null;
+        return { createChart: root.createChart, CrosshairMode: root.CrosshairMode, ColorType: root.ColorType } as LW;
+      } catch { return null; }
     })();
 
-    return () => cleanup();
-  }, [height]);
+    // 2) If module missing, load the CDN (v4)
+    if (!lw) {
+      lw = await new Promise<LW | null>((resolve) => {
+        if (window.LightweightCharts?.createChart) {
+          const g = window.LightweightCharts;
+          resolve({ createChart: g.createChart, CrosshairMode: g.CrosshairMode, ColorType: g.ColorType });
+          return;
+        }
+        const s = document.createElement("script");
+        s.src = "https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js";
+        s.async = true;
+        s.onload = () => {
+          const g = (window as any).LightweightCharts;
+          resolve(g?.createChart ? { createChart: g.createChart, CrosshairMode: g.CrosshairMode, ColorType: g.ColorType } : null);
+        };
+        s.onerror = () => resolve(null);
+        document.head.appendChild(s);
+      });
+    }
+
+    if (!lw) { console.error("[TradeChartPanel] lightweight-charts not available"); return; }
+
+    // 3) Set up with whichever we have; if it still can’t add series, force CDN fallback.
+    let rig: any;
+    try {
+      rig = setupWith(lw);
+    } catch {
+      // Force CDN v4 fallback
+      const g = await new Promise<LW | null>((resolve) => {
+        const s = document.createElement("script");
+        s.src = "https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js";
+        s.async = true;
+        s.onload = () => {
+          const L = (window as any).LightweightCharts;
+          resolve(L?.createChart ? { createChart: L.createChart, CrosshairMode: L.CrosshairMode, ColorType: L.ColorType } : null);
+        };
+        s.onerror = () => resolve(null);
+        document.head.appendChild(s);
+      });
+      if (!g) { console.error("[TradeChartPanel] CDN fallback failed"); return; }
+      rig = setupWith(g);
+    }
+
+    chartRef.current = rig.chart;
+    candleSeriesRef.current = rig.candleSeries;
+    vwapSeriesRef.current = rig.vwapSeries;
+  })();
+
+  return () => cleanup();
+}, [height]);
+
 
   // update series with data + lines/markers
   useEffect(() => {
