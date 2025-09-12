@@ -125,10 +125,8 @@ function useOpenPosition(pollMsWhileOpen = 20000) {
     try {
       const data = await fetchJSON<PositionWire>("/api/positions/open");
       setPos(data);
-    } catch (e) {
-      // ← Previously left pos=null (which kills sticky). Keep a safe value.
+    } catch {
       setPos(POS_EMPTY);
-      // Optional: surface in console for quick diagnosis
       console.warn("[TradeChartPanel] failed to fetch /api/positions/open");
     }
   }
@@ -146,21 +144,64 @@ function useOpenPosition(pollMsWhileOpen = 20000) {
   return pos;
 }
 
-/** Today’s trades for a symbol (for exit markers/avg). */
+/** Today’s trades for a symbol (robust; works without /api/trades/today). */
 function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
   const visible = useVisibility();
   const [rows, setRows] = useState<TradeWire[] | null>(null);
 
+  const toYMD = (d: Date) => {
+    const et = new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const m = String(et.getMonth() + 1).padStart(2, "0");
+    const day = String(et.getDate()).padStart(2, "0");
+    return `${et.getFullYear()}-${m}-${day}`;
+  };
+
   async function load() {
     if (!symbol) return;
-    try {
-      const j = await fetchJSON<{ trades: TradeWire[] }>(
-        `/api/trades/today?symbol=${encodeURIComponent(symbol)}`
-      );
-      setRows(Array.isArray(j?.trades) ? j.trades : []);
-    } catch {
-      // keep previous trades on error
+
+    const enc = encodeURIComponent(symbol);
+    // Try the “today” route first; if 404, try generic and filter client-side
+    const candidates = [
+      `/api/trades/today?symbol=${enc}`,
+      `/api/trades?symbol=${enc}&today=1`,
+      `/api/trades?symbol=${enc}`,
+      `/api/trades`,
+    ];
+
+    for (const url of candidates) {
+      try {
+        const r = await fetch(url, { cache: "no-store" });
+        if (!r.ok) continue;
+        const j = await r.json();
+
+        // Accept {trades:[...]} or raw array
+        const raw: any[] = Array.isArray(j) ? j : Array.isArray(j?.trades) ? j.trades : [];
+        if (!raw.length) continue;
+
+        const todayKey = toYMD(new Date());
+        const norm: TradeWire[] = raw
+          .map((t: any) => ({
+            side: String(t.side ?? t.type ?? "").toUpperCase(),
+            ticker: String(t.ticker ?? t.symbol ?? "").toUpperCase(),
+            price: Number(t.price ?? t.p ?? t.fill_price),
+            shares: Number(t.shares ?? t.qty ?? t.quantity),
+            at: String(t.at ?? t.time ?? t.createdAt ?? t.filledAt ?? t.executedAt ?? ""),
+          }))
+          .filter((t) => t.ticker === symbol.toUpperCase());
+
+        const isToday = (iso: string) => {
+          const d = new Date(iso);
+          return toYMD(d) === todayKey;
+        };
+
+        setRows(norm.filter((t) => isToday(t.at)));
+        return;
+      } catch {
+        // try next candidate
+      }
     }
+
+    if (rows == null) setRows([]);
   }
 
   // Initial load
@@ -181,7 +222,7 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000) {
   return rows;
 }
 
-/** 1m candles: poll fast when “active” (open or sticky), slow when not; pause when hidden/outside hours. */
+/** 1m candles: robust endpoints & shapes; keep last data on errors. */
 function useCandles1m(
   symbol: string | null,
   isActiveFast: boolean,
@@ -192,45 +233,66 @@ function useCandles1m(
   const visible = useVisibility();
   const [candles, setCandles] = useState<Candle[] | null>(null);
 
-  const url = symbol
-    ? `/api/fmp/candles?symbol=${encodeURIComponent(symbol)}&interval=1min&limit=${limit}`
-    : null;
+  async function fetchCandles(sym: string) {
+    const enc = encodeURIComponent(sym);
+    const candidates = [
+      `/api/fmp/candles?ticker=${enc}&symbol=${enc}&interval=1min&limit=${limit}`,
+      `/api/fmp/bars?ticker=${enc}&symbol=${enc}&tf=1min&limit=${limit}`,
+      `/api/stocks/candles?ticker=${enc}&interval=1min&limit=${limit}`,
+      `/api/candles?ticker=${enc}&interval=1min&limit=${limit}`,
+    ];
+    for (const url of candidates) {
+      try {
+        const r = await fetch(url, { cache: "no-store" });
+        if (!r.ok) continue;
+        const data = await r.json();
 
-  async function load() {
-    if (!url) return;
-    try {
-      const data = await fetchJSON<{ candles: Candle[] }>(url);
+        const raw: any[] = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.candles)
+          ? data.candles
+          : Array.isArray(data?.bars)
+          ? data.bars
+          : [];
 
-      const raw = Array.isArray((data as any).candles) ? (data as any).candles : [];
-      const clean: Candle[] = raw
-        .map((k: Partial<Candle>) => ({
-          date: String(k.date ?? ""),
-          open: Number(k.open),
-          high: Number(k.high),
-          low: Number(k.low),
-          close: Number(k.close),
-          volume: Number(k.volume),
-        }))
-        .filter(
-          (k: Candle) =>
-            Number.isFinite(k.open) &&
-            Number.isFinite(k.high) &&
-            Number.isFinite(k.low) &&
-            Number.isFinite(k.close) &&
-            Number.isFinite(k.volume)
-        );
+        if (!raw.length) continue;
 
-      setCandles(clean);
-    } catch {
-      // keep old candles on error (prevents blanking on transient issues)
-      console.warn("[TradeChartPanel] failed to fetch candles");
+        const clean: Candle[] = raw
+          .map((k: any) => ({
+            date: String(k.date ?? k.time ?? k.t ?? ""),
+            open: Number(k.open ?? k.o),
+            high: Number(k.high ?? k.h),
+            low: Number(k.low ?? k.l),
+            close: Number(k.close ?? k.c),
+            volume: Number(k.volume ?? k.v),
+          }))
+          .filter(
+            (k) =>
+              !!k.date &&
+              Number.isFinite(k.open) &&
+              Number.isFinite(k.high) &&
+              Number.isFinite(k.low) &&
+              Number.isFinite(k.close) &&
+              Number.isFinite(k.volume)
+          );
+
+        if (clean.length) return clean;
+      } catch {
+        // try next
+      }
     }
+    return [];
+  }
+
+  async function load(sym: string) {
+    const out = await fetchCandles(sym);
+    if (out.length) setCandles(out);
   }
 
   // initial fetch
   useEffect(() => {
     setCandles(null);
-    if (symbol) load();
+    if (symbol) load(symbol);
   }, [symbol]);
 
   // polling
@@ -240,11 +302,11 @@ function useCandles1m(
     if (!isMarketHoursET()) return;
 
     const ms = isActiveFast ? pollMsFast : pollMsSlow;
-    const id = setInterval(load, ms);
+    const id = setInterval(() => load(symbol), ms);
     return () => clearInterval(id);
   }, [symbol, isActiveFast, visible, pollMsFast, pollMsSlow]);
 
-  return { candles, reload: load };
+  return { candles };
 }
 
 /* ───────────────── Main component ───────────────── */
@@ -341,6 +403,12 @@ export default function TradeChartPanel({
     c?: number;
     vwap?: number;
   } | null>(null);
+
+  // DEBUG: see if candles are arriving
+  useEffect(() => {
+    // eslint-disable-next-line no-console
+    console.log("[TradeChartPanel] symbol:", symbol, "candles:", candles?.length ?? 0);
+  }, [symbol, candles?.length]);
 
   // Create chart (compat shim v4/v5)
   useEffect(() => {
