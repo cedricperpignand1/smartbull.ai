@@ -1,19 +1,14 @@
 // app/lib/fmpCached.ts
 import { createTTLCache } from "./ttlCache";
 
-
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
 
 // ---- TTLs (tuneable) ----
-// Fundamentals / profile: essentially static intraday
-const TTL_PROFILE_MS = 60 * 60 * 1000;     // 60 min
-const TTL_RATIOS_MS  = 60 * 60 * 1000;     // 60 min
-// News can be shorter but doesn't need to be per-tick
-const TTL_NEWS_MS    = 15 * 60 * 1000;     // 15 min
-// Quotes change fast; small TTL to slash bursts across routes
-const TTL_QUOTE_MS   = 20 * 1000;          // 20 sec
-// AvgVolume: semi-static; prefer quote.avgVolume then fall back to historical
-const TTL_AVGVOL_MS  = 30 * 60 * 1000;     // 30 min
+const TTL_PROFILE_MS = 60 * 60 * 1000; // 60 min
+const TTL_RATIOS_MS  = 60 * 60 * 1000; // 60 min
+const TTL_NEWS_MS    = 15 * 60 * 1000; // 15 min
+const TTL_QUOTE_MS   = 20 * 1000;      // 20 sec
+const TTL_AVGVOL_MS  = 30 * 60 * 1000; // 30 min
 
 // ---- Caches ----
 const cacheProfile = createTTLCache<any>(TTL_PROFILE_MS);
@@ -22,43 +17,64 @@ const cacheNews    = createTTLCache<any>(TTL_NEWS_MS);
 const cacheQuote   = createTTLCache<any>(TTL_QUOTE_MS);
 const cacheAvgVol  = createTTLCache<number | null>(TTL_AVGVOL_MS);
 
-// ---- Bare fetchers (no caching) ----
+// ---- Minimal fetcher ----
 async function _fmpFetchJSON(url: string) {
   const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) throw new Error(`FMP ${r.status}`);
   return r.json();
 }
 
-// Profile
+// ---- Individual endpoints ----
 async function _profile(ticker: string) {
   const u = `https://financialmodelingprep.com/api/v3/profile/${ticker}?apikey=${FMP_API_KEY}`;
   const j = await _fmpFetchJSON(u);
   return Array.isArray(j) && j.length ? j[0] : null;
 }
 
-// Ratios TTM
 async function _ratiosTTM(ticker: string) {
   const u = `https://financialmodelingprep.com/api/v3/ratios-ttm/${ticker}?apikey=${FMP_API_KEY}`;
   const j = await _fmpFetchJSON(u);
   return Array.isArray(j) && j.length ? j[0] : null;
 }
 
-// News
 async function _news(ticker: string, limit: number) {
-  const lim = Math.max(1, Math.min(limit, 5)); // clamp for safety
+  const lim = Math.max(1, Math.min(limit, 5));
   const u = `https://financialmodelingprep.com/api/v3/stock_news?tickers=${ticker}&limit=${lim}&apikey=${FMP_API_KEY}`;
   const j = await _fmpFetchJSON(u);
   return Array.isArray(j) ? j : [];
 }
 
-// Quote
 async function _quote(ticker: string) {
   const u = `https://financialmodelingprep.com/api/v3/quote/${ticker}?apikey=${FMP_API_KEY}`;
   const j = await _fmpFetchJSON(u);
   return Array.isArray(j) && j.length ? j[0] : null;
 }
 
-// Historical as a fallback ONLY when quote lacks avgVolume
+// ---- NEW: batched quotes (1 call for many tickers) ----
+export async function fmpQuoteManyCached(tickers: string[]): Promise<Record<string, any>> {
+  const wanted = Array.from(new Set(tickers.map(t => String(t).toUpperCase()).filter(Boolean)));
+  if (!wanted.length) return {};
+
+  // Build the URL once
+  const u = `https://financialmodelingprep.com/api/v3/quote/${encodeURIComponent(wanted.join(","))}?apikey=${FMP_API_KEY}`;
+  const j = await _fmpFetchJSON(u);
+  const arr: any[] = Array.isArray(j) ? j : [];
+
+  // Normalize → map and hydrate per-ticker cache without extra network calls
+  const out: Record<string, any> = {};
+  for (const q of arr) {
+    const sym = String(q?.symbol || q?.ticker || "").toUpperCase();
+    if (!sym) continue;
+    out[sym] = q;
+
+    // Populate the per-ticker quote cache (no fetch) so future calls within 20s hit cache
+    const key = `quote:${sym}`;
+    await cacheQuote.getOrSet(key, async () => q, TTL_QUOTE_MS);
+  }
+  return out;
+}
+
+// ---- Historical avgVolume (fallback only) ----
 async function _avgVolFromHistory(ticker: string): Promise<number | null> {
   const u = `https://financialmodelingprep.com/api/v3/historical-price-full/${ticker}?serietype=line&timeseries=30&apikey=${FMP_API_KEY}`;
   const j = await _fmpFetchJSON(u);
@@ -72,7 +88,7 @@ async function _avgVolFromHistory(ticker: string): Promise<number | null> {
   return n ? Math.round(sum / n) : null;
 }
 
-// ---- Cached wrappers ----
+// ---- Cached wrappers (single) ----
 export async function fmpProfileCached(ticker: string) {
   const key = `profile:${ticker.toUpperCase()}`;
   return cacheProfile.getOrSet(key, () => _profile(ticker), TTL_PROFILE_MS).catch(() => null);
@@ -95,26 +111,23 @@ export async function fmpQuoteCached(ticker: string) {
 
 /**
  * Avg volume strategy:
- * 1) Try quote.avgVolume/volAvg/averageVolume (cheap; cached ~20s via quote cache)
- * 2) Only if missing, hit historical (expensive; cached 30 min)
+ * 1) Prefer avgVolume from a **provided quote** or from the quote cache (20s)
+ * 2) Only if missing, hit historical (heavy; 30m cache)
  */
-export async function fmpAvgVolumeSmartCached(ticker: string): Promise<number | null> {
+export async function fmpAvgVolumeSmartCached(ticker: string, preloadedQuote?: any): Promise<number | null> {
   const key = `avgvol:${ticker.toUpperCase()}`;
   return cacheAvgVol.getOrSet(
     key,
     async () => {
-      // Try quote first (uses its own 20s cache)
       try {
-        const q = await fmpQuoteCached(ticker);
+        const q = preloadedQuote ?? (await fmpQuoteCached(ticker));
         const direct =
           Number(q?.avgVolume) ??
           Number(q?.volAvg) ??
           Number(q?.averageVolume);
-
         if (Number.isFinite(direct)) return Number(direct);
       } catch { /* ignore */ }
 
-      // Fallback to historical (heavier; long TTL)
       try {
         return await _avgVolFromHistory(ticker);
       } catch {

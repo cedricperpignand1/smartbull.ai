@@ -1,27 +1,42 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
-    <meta charset="UTF-8" />
+    <meta charset="utf-8" />
     <title>Top Gainers Widget</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>html,body{margin:0;padding:0}</style>
   </head>
-  <body style="margin:0;padding:0;">
+  <body>
     <div class="tradingview-widget-container">
       <div class="tradingview-widget-container__widget"></div>
     </div>
 
-    <script
-      type="text/javascript"
-      src="https://s3.tradingview.com/external-embedding/embed-widget-market-movers.js"
-      async
-    >
+    <!-- JSON config lives here (no lint errors) -->
+    <script type="application/json" id="tv-market-movers-config">
     {
       "exchange": "NASDAQ",
       "type": "gainers",
-      "width": "900",
-      "height": "500",
+      "width": 900,
+      "height": 500,
       "colorTheme": "light",
       "locale": "en"
     }
+    </script>
+
+    <!-- Load the TradingView script and feed it the JSON -->
+    <script>
+      (function () {
+        var cfg = document.getElementById("tv-market-movers-config").textContent.trim();
+
+        var s = document.createElement("script");
+        s.src = "https://s3.tradingview.com/external-embedding/embed-widget-market-movers.js";
+        s.async = true;
+
+        // TradingView reads the JSON from the script element's text
+        s.innerHTML = cfg;
+
+        document.querySelector(".tradingview-widget-container__widget").appendChild(s);
+      })();
     </script>
   </body>
 </html>

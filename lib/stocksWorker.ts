@@ -9,9 +9,12 @@ const FMP = process.env.FMP_API_KEY || "";
 // ---------- Tunables ----------
 const TOP_N = 15;                       // show top 15
 const WATCHLIST_SIZE = 8;               // quote only first 8 each tick
-const QUOTE_INTERVAL_MS = 1500;         // ~1.5s for near real-time
+const QUOTE_INTERVAL_MS = 1500;         // ~1.5s for near real-time (watchlist)
 const GAINERS_INTERVAL_MS = 15000;      // refresh gainers every 15s
 const PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // profiles once/day
+
+// NEW: bulk refresh for the non-watchlist names so we get volume, etc.
+const BULK_NONWATCHLIST_MS = 30_000;    // every 30s is plenty
 
 // ---------- In-memory state (per server instance) ----------
 let gainers: any[] = [];
@@ -66,6 +69,8 @@ async function refreshGainers() {
     return;
   }
   try {
+    // NOTE: this endpoint often returns price/% and *may* include some volume fields,
+    // but we do not rely on it for volume.
     const url = `https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey=${FMP}`;
     const arr: any[] = await jfetch(url).catch((e) => {
       console.error("[stocksWorker] gainers fetch failed:", e?.message || e);
@@ -141,6 +146,32 @@ async function refreshQuotes() {
   }
 }
 
+// NEW: bulk quotes for the remaining gainers (so we get volume for them too)
+async function refreshNonWatchlistQuotes() {
+  if (!FMP) return;
+  try {
+    const allSyms = gainers
+      .map((r) => String(r.symbol || r.ticker || "").toUpperCase())
+      .filter(Boolean);
+
+    const rest = allSyms.filter((s) => !watchlist.includes(s));
+    if (!rest.length) return;
+
+    const qURL = `https://financialmodelingprep.com/api/v3/quote/${rest.join(",")}?apikey=${FMP}`;
+    const qArr: any[] = await jfetch(qURL, 8000).catch((e) => {
+      console.error("[stocksWorker] bulk non-watchlist quotes failed:", e?.message || e);
+      return [];
+    });
+
+    for (const q of Array.isArray(qArr) ? qArr : []) {
+      const sym = String(q.symbol || q.ticker || "").toUpperCase();
+      quotes.set(sym, { data: q, ts: Date.now() });
+    }
+  } catch (e: any) {
+    console.error("[stocksWorker] refreshNonWatchlistQuotes error:", e?.message || e);
+  }
+}
+
 // ---------- Payload builder & broadcaster ----------
 function buildPayload() {
   const symbols = gainers
@@ -153,12 +184,13 @@ function buildPayload() {
     const p = profiles.get(sym)?.data || {};
     return {
       ticker: sym,
-      price: num(g.price ?? q.price),
-      changesPercentage: num(g.changesPercentage),
-      marketCap: num(q.marketCap),
-      sharesOutstanding: num(q.sharesOutstanding),
-      volume: num(q.volume),
-      avgVolume: num(q.avgVolume ?? q.volAvg),
+      // Prefer the fresher quote values with fallbacks to gainers fields
+      price: num(q.price ?? g.price),
+      changesPercentage: num(g.changesPercentage ?? q.changesPercentage),
+      marketCap: num(q.marketCap ?? g.marketCap),
+      sharesOutstanding: num(q.sharesOutstanding ?? g.sharesOutstanding),
+      volume: num(q.volume ?? g.volume), // ⬅️ fallback to gainers volume if present
+      avgVolume: num(q.avgVolume ?? q.volAvg ?? g.avgVolume),
       employees: p?.fullTimeEmployees != null ? Number(p.fullTimeEmployees) : null,
     };
   });
@@ -175,7 +207,7 @@ function broadcast(payload: any) {
   for (const send of listeners) {
     try {
       send(payload);
-    } catch (e) {
+    } catch {
       // ignore subscriber errors
     }
   }
@@ -189,12 +221,19 @@ export function ensureStocksWorkerStarted() {
   if (!FMP) {
     console.error("[stocksWorker] FMP_API_KEY not set; worker will serve empty payloads.");
   } else {
-    console.log("[stocksWorker] starting with FMP key present. TOP_N:", TOP_N, "WATCHLIST:", WATCHLIST_SIZE);
+    console.log(
+      "[stocksWorker] starting. TOP_N:",
+      TOP_N,
+      "WATCHLIST:",
+      WATCHLIST_SIZE,
+      "bulk(non-watchlist) every:",
+      BULK_NONWATCHLIST_MS, "ms"
+    );
   }
 
   // Initial kick (async, no await so route can respond immediately)
   refreshGainers()
-    .then(() => refreshQuotes())
+    .then(() => Promise.all([refreshQuotes(), refreshNonWatchlistQuotes()]))
     .then(() => broadcast(buildPayload()))
     .catch((e) => console.error("[stocksWorker] initial kick failed:", e?.message || e));
 
@@ -202,14 +241,21 @@ export function ensureStocksWorkerStarted() {
   setInterval(async () => {
     await refreshGainers();
     await refreshQuotes();
+    await refreshNonWatchlistQuotes(); // keep rest fresh too
     broadcast(buildPayload());
   }, GAINERS_INTERVAL_MS);
 
-  // Quotes timer (every 1.5s)
+  // Quotes timer (every 1.5s) — watchlist only
   setInterval(async () => {
     await refreshQuotes();
     broadcast(buildPayload());
   }, QUOTE_INTERVAL_MS);
+
+  // NEW: Non-watchlist bulk quotes (every 30s) — ensures volume is present
+  setInterval(async () => {
+    await refreshNonWatchlistQuotes();
+    broadcast(buildPayload());
+  }, BULK_NONWATCHLIST_MS);
 }
 
 export function subscribe(onData: (payload: any) => void) {
@@ -236,5 +282,8 @@ export function setWatchlist(symbols: string[]) {
     .filter(Boolean)
     .slice(0, WATCHLIST_SIZE);
   // Immediately try to refresh quotes for new symbols (non-blocking)
-  refreshQuotes().then(() => broadcast(buildPayload())).catch(() => {});
+  refreshQuotes()
+    .then(() => refreshNonWatchlistQuotes())
+    .then(() => broadcast(buildPayload()))
+    .catch(() => {});
 }

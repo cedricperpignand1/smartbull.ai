@@ -27,8 +27,6 @@ const TradingViewChart = dynamic<
   ssr: false,
 });
 
-const Level2Panel = dynamic(() => import("../components/Level2Panel"), { ssr: false });
-
 /* =========================================================
    Constants & ET helpers
 ========================================================= */
@@ -134,7 +132,7 @@ function GlassPanel({
 }
 
 /* =========================================================
-   Floating Narrator (kept unchanged)
+   Floating Narrator (unchanged logic, small class fix)
 ========================================================= */
 function FloatingNarrator() {
   const [speaking, setSpeaking] = useState(false);
@@ -281,7 +279,7 @@ function FloatingNarrator() {
 ========================================================= */
 interface Stock {
   ticker: string;
-  price: number;
+  price: number | null;
   changesPercentage: number;
   marketCap: number | null;
   sharesOutstanding: number | null;
@@ -369,15 +367,20 @@ export default function Home() {
   const [bgUrl, setBgUrl] = useState<string>(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
 
   useEffect(() => {
-    const i1 = new Image(); i1.src = OPEN_BG;
-    const i2 = new Image(); i2.src = CLOSED_BG;
+    const i1 = new Image();
+    i1.src = OPEN_BG;
+    const i2 = new Image();
+    i2.src = CLOSED_BG;
 
     const update = () => setBgUrl(isMarketOpenET() ? OPEN_BG : CLOSED_BG);
     update();
     const id = setInterval(update, 30_000);
     const onVis = () => document.visibilityState === "visible" && update();
     document.addEventListener("visibilitychange", onVis);
-    return () => { clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
   }, []);
 
   // Stocks & AI analysis
@@ -412,7 +415,9 @@ export default function Home() {
         setDataSource("FMP (stream)");
         setErrorMessage(null);
         setLoading(false);
-      } catch {}
+      } catch {
+        // ignore parse errors
+      }
     };
     es.onerror = () => setErrorMessage("Live stream error. Retrying...");
     return () => es.close();
@@ -426,7 +431,9 @@ export default function Home() {
         const r = await fetch("/api/bot/tick", { cache: "no-store" });
         const j = await r.json();
         setBotData(j);
-      } catch {}
+      } catch {
+        // ignore
+      }
     };
     run();
     id = setInterval(run, 5000);
@@ -441,7 +448,9 @@ export default function Home() {
         const r = await fetch("/api/trades", { cache: "no-store" });
         const j = await r.json();
         if (!j.errorMessage) setTradeData(j);
-      } catch {}
+      } catch {
+        // ignore
+      }
     };
     run();
     id = setInterval(run, 5000);
@@ -456,14 +465,16 @@ export default function Home() {
         const r = await fetch("/api/alpaca/account", { cache: "no-store" });
         const j = await r.json();
         if (j?.ok && j?.account) setAlpaca(j.account as AlpacaAccount);
-      } catch {}
+      } catch {
+        // ignore
+      }
     };
     run();
     id = setInterval(run, 10_000);
     return () => clearInterval(id);
   }, []);
 
-  // Ask AI recs
+  // Ask AI recs — use only top 8 from (already filtered) stream list
   const askAIRecommendation = async () => {
     try {
       setAnalyzing(true);
@@ -471,7 +482,7 @@ export default function Home() {
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks: stocks.slice(0, 20), topN: 2 }),
+        body: JSON.stringify({ stocks: stocks.slice(0, 8), topN: 2 }),
       });
       const data = await res.json();
 
@@ -531,59 +542,26 @@ export default function Home() {
     [tradeData?.openPos?.ticker]
   );
 
-  const tieA = useMemo(() => (topPicks[0] || stocks[0]?.ticker || "AAPL").toUpperCase(), [topPicks, stocks]);
-  const tieB = useMemo(() => {
-    let candidate =
-      topPicks[1] ||
-      stocks.find((s) => s.ticker && s.ticker.toUpperCase() !== tieA)?.ticker ||
-      "MSFT";
-    candidate = String(candidate).toUpperCase();
-    if (candidate === tieA) candidate = "MSFT";
-    return candidate;
-  }, [topPicks, stocks, tieA]);
-
-  type L2QuickStat = {
-    symbol: string;
-    buyCount: number;
-    sellCount: number;
-    buyNotional: number;
-    sellNotional: number;
-  };
-  const [l2Choice, setL2Choice] = useState<string | null>(null);
-
+  // before-close fallback symbol (prefer open position, else first gainer)
+  const [beforeCloseET, setBeforeCloseET] = useState<boolean>(() => {
+    const d = nowET();
+    const mins = d.getHours() * 60 + d.getMinutes();
+    return mins <= 16 * 60; // 4:00pm ET
+  });
   useEffect(() => {
-    let timer: any;
-    async function fetchStats(a: string, b: string) {
-      try {
-        const q = [a, b].filter(Boolean).join(",");
-        if (!q) return;
-        const res = await fetch(`/api/level2/quick-stats?symbols=${encodeURIComponent(q)}`, { cache: "no-store" });
-        const data = await res.json();
-        const stats: Record<string, L2QuickStat> = data?.stats || {};
-        const sa = stats[a];
-        const sb = stats[b];
+    const id = setInterval(() => {
+      const d = nowET();
+      const mins = d.getHours() * 60 + d.getMinutes();
+      setBeforeCloseET(mins <= 16 * 60);
+    }, 60_000);
+    return () => clearInterval(id);
+  }, []);
 
-        let pick = a;
-        if (sa && sb) {
-          if ((sb.buyNotional ?? 0) > (sa.buyNotional ?? 0)) pick = b;
-          else if ((sb.buyNotional ?? 0) === (sa.buyNotional ?? 0)) {
-            if ((sb.buyCount ?? 0) > (sa.buyCount ?? 0)) pick = b;
-          }
-        } else if (!sa && sb) {
-          pick = b;
-        } else {
-          pick = a;
-        }
-        setL2Choice(String(pick).toUpperCase());
-      } catch {}
-    }
-    const run = () => fetchStats(tieA, tieB);
-    run();
-    timer = setInterval(run, 5000);
-    return () => clearInterval(timer);
-  }, [tieA, tieB]);
+  const fallbackSymbolBeforeClose =
+    beforeCloseET
+      ? (posChartSymbol || (stocks[0]?.ticker && String(stocks[0].ticker).toUpperCase()) || "AAPL")
+      : undefined;
 
-  // today's trades count for the status card
   const todayTradeCount = useMemo(() => {
     const fromStatus = Array.isArray(statusTradesToday) ? statusTradesToday.length : null;
     if (fromStatus != null) return fromStatus;
@@ -605,33 +583,7 @@ export default function Home() {
     return n;
   }, [statusTradesToday, tradeData]);
 
-  const l2SymbolDefault = useMemo(() => {
-    const botPick = botData?.lastRec?.ticker ? String(botData.lastRec.ticker).toUpperCase() : null;
-    const firstGainer = stocks[0]?.ticker ? String(stocks[0].ticker).toUpperCase() : null;
-    return botPick || firstGainer || "AAPL";
-  }, [botData?.lastRec?.ticker, stocks]);
-
-  // before-close fallback symbol
-  const [beforeCloseET, setBeforeCloseET] = useState<boolean>(() => {
-    const d = nowET();
-    const mins = d.getHours() * 60 + d.getMinutes();
-    return mins <= 16 * 60; // 4:00pm ET
-  });
-  useEffect(() => {
-    const id = setInterval(() => {
-      const d = nowET();
-      const mins = d.getHours() * 60 + d.getMinutes();
-      setBeforeCloseET(mins <= 16 * 60);
-    }, 60_000);
-    return () => clearInterval(id);
-  }, []);
-
-  const fallbackSymbolBeforeClose =
-    beforeCloseET
-      ? (posChartSymbol || l2Choice || (stocks[0]?.ticker && String(stocks[0].ticker).toUpperCase()) || "AAPL")
-      : undefined;
-
-  const dayPnl = alpaca?.day_pnl ?? botData?.state?.pnl ?? null; // still used in info cards
+  const dayPnl = alpaca?.day_pnl ?? botData?.state?.pnl ?? null;
 
   return (
     <main
@@ -660,7 +612,7 @@ export default function Home() {
             </GlassPanel>
           </div>
 
-          {/* MIDDLE: Top Gainers + Level 2 */}
+          {/* MIDDLE: Top Gainers + Trade Log (replacing Level 2) */}
           <div className="grid gap-5">
             <TopGainers
               loading={loading}
@@ -672,17 +624,14 @@ export default function Home() {
               onPick={handleStockClick}
             />
 
-            <Level2Panel symbol={(l2Choice || l2SymbolDefault)} mock={true} height={225} />
+            {/* Trade Log replaces Level 2 here at same height */}
+            <TradeLog tradeData={tradeData} height={225} />
           </div>
 
           {/* RIGHT: Positions chart + status cards */}
           <div className="grid gap-5">
             <div className="relative">
-              {/* TradeChartPanel now owns its own pop-out and includes the Panic Sell next to PnL */}
-              <TradeChartPanel
-                height={720}
-                symbolWhenFlat={fallbackSymbolBeforeClose}
-              />
+              <TradeChartPanel height={720} symbolWhenFlat={fallbackSymbolBeforeClose} />
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-5 items-stretch">
@@ -698,23 +647,19 @@ export default function Home() {
             </div>
           </div>
         </div>
-
-        <div className="mt-5 w-full xl:max-w-[960px] xl:ml-auto">
-          <TradeLog tradeData={tradeData} slim />
-        </div>
       </div>
 
-      {/* (Your existing TradingView modal is kept as-is if you still use it) */}
+      {/* TradingView modal */}
       {chartVisible && selectedStock && (
         <div
           className="fixed inset-0 z-[110] flex items-center justify-center bg-black/50 p-4"
-          onClick={(e) => { if (e.target === e.currentTarget) closeChart(); }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeChart();
+          }}
         >
           <div className="w-full max-w-6xl bg-white rounded-2xl shadow-2xl overflow-hidden">
             <div className="flex items-center justify-between px-4 py-3 border-b">
-              <div className="font-semibold text-slate-800">
-                {selectedStock} — TradingView
-              </div>
+              <div className="font-semibold text-slate-800">{selectedStock} — TradingView</div>
               <button
                 onClick={closeChart}
                 className="rounded-md px-3 py-1.5 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800"
@@ -899,7 +844,11 @@ function TopGainers({
             </thead>
             <tbody>
               {stocks.map((stock) => (
-                <tr key={stock.ticker} className="group cursor-pointer transition" onClick={() => onPick(stock.ticker)}>
+                <tr
+                  key={stock.ticker}
+                  className="group cursor-pointer transition"
+                  onClick={() => onPick(stock.ticker)}
+                >
                   <td className="px-3 py-2 bg-white ring-1 ring-gray-200 first:rounded-l-xl group-hover:shadow-md">
                     {stock.ticker}
                   </td>
@@ -938,18 +887,32 @@ function TopGainers({
   );
 }
 
-function TradeLog({ tradeData, slim = false }: { tradeData: TradePayload | null; slim?: boolean }) {
+function TradeLog({
+  tradeData,
+  slim = false,
+  height,
+}: {
+  tradeData: TradePayload | null;
+  slim?: boolean;
+  height?: number;
+}) {
+  const wrapperClass = slim ? "overflow-auto" : "h-full overflow-auto";
+  const style = height ? { height } : undefined;
+
   return (
     <Panel title="Trade Log" color="orange" dense>
       {!tradeData?.trades?.length ? (
         <p className="text-gray-500 text-sm">No trades yet.</p>
       ) : (
-        <div className={slim ? "overflow-auto max-h-56" : "h-full overflow-auto"}>
+        <div className={wrapperClass} style={style}>
           <table className="min-w-full text-xs sm:text-sm border-separate border-spacing-y-2">
             <thead>
               <tr className="bg-black text-white">
                 {["Time (ET)", "Side", "Ticker", "Price", "Shares"].map((h, idx, arr) => (
-                  <th key={h} className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}>
+                  <th
+                    key={h}
+                    className={`p-2 ${idx === 0 ? "rounded-l-xl" : idx === arr.length - 1 ? "rounded-r-xl" : ""}`}
+                  >
                     {h}
                   </th>
                 ))}
@@ -1002,8 +965,13 @@ function AIRecommendation({
     <Panel title="AI Recommendation" color="blue" dense>
       {botData?.lastRec ? (
         <div className="mb-3 text-sm border border-gray-200 rounded p-2 bg-gray-50">
-          <div><b>AI Pick:</b> {botData.lastRec.ticker}</div>
-          <div><b>Price:</b> {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}</div>
+          <div>
+            <b>AI Pick:</b> {botData.lastRec.ticker}
+          </div>
+          <div>
+            <b>Price:</b>{" "}
+            {typeof botData.lastRec.price === "number" ? `$${Number(botData.lastRec.price).toFixed(2)}` : "—"}
+          </div>
           <div>
             <b>Time:</b>{" "}
             {botData.lastRec.at
@@ -1027,13 +995,24 @@ function AIRecommendation({
 
             return (
               <>
-                <div>Money I Have: <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b> {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}</div>
-                <div>Equity: <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b> {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}</div>
-                <div>PNL: <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
-                  {dayPnl != null ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}` : "—"}</b>{" "}
+                <div>
+                  Money I Have: <b>{money != null ? `$${Number(money).toFixed(2)}` : "—"}</b>{" "}
+                  {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
+                </div>
+                <div>
+                  Equity: <b>{eq != null ? `$${Number(eq).toFixed(2)}` : "—"}</b>{" "}
+                  {alpaca && <span className="text-xs text-gray-500">(Alpaca)</span>}
+                </div>
+                <div>
+                  PNL:{" "}
+                  <b className={Number(dayPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}>
+                    {dayPnl != null ? `${Number(dayPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(dayPnl)).toFixed(2)}` : "—"}
+                  </b>{" "}
                   {alpaca && <span className="text-xs text-gray-500">(Today, Alpaca)</span>}
                 </div>
-                {alpaca?.day_pnl_pct != null && <div className="text-xs text-gray-600">Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%</div>}
+                {alpaca?.day_pnl_pct != null && (
+                  <div className="text-xs text-gray-600">Day PnL %: {(alpaca.day_pnl_pct * 100).toFixed(2)}%</div>
+                )}
               </>
             );
           })()}
@@ -1050,13 +1029,14 @@ function AIRecommendation({
       </Button>
 
       {recommendation && (
-        <div className="mt-3 text-sm whitespace-pre-wrap max-h-48 overflow-y-auto pr-2">
-          {recommendation}
-        </div>
+        <div className="mt-3 text-sm whitespace-pre-wrap max-h-48 overflow-y-auto pr-2">{recommendation}</div>
       )}
 
       <div className="mt-2 text-xs text-gray-500">
-        Server ET: {botData?.serverTimeET ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "…"}
+        Server ET:{" "}
+        {botData?.serverTimeET
+          ? new Date(botData.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+          : "…"}
       </div>
     </Panel>
   );
@@ -1078,15 +1058,22 @@ function BotStatus({
       <div className="rounded-lg px-3 py-2 text-sm mb-2 bg-gray-50 border border-gray-200">
         {(statusTick as any)?.debug?.lastMessage ?? "Waiting for next update…"}
         <div className="mt-1 text-[11px] text-gray-500 space-x-3">
-          {typeof statusTick?.info?.snapshotAgeMs === "number" && <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>}
-          {typeof statusTick?.info?.inEntryWindow === "boolean" && <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>}
+          {typeof statusTick?.info?.snapshotAgeMs === "number" && (
+            <span>Snapshot age: {Math.round(statusTick.info.snapshotAgeMs)} ms</span>
+          )}
+          {typeof statusTick?.info?.inEntryWindow === "boolean" && (
+            <span>Entry window: {statusTick.info.inEntryWindow ? "OPEN" : "CLOSED"}</span>
+          )}
         </div>
       </div>
 
       <div className="text-sm bg-gray-50 border border-gray-200 rounded p-2 mb-2">
         <div>Live: {statusTick?.live?.ticker ? `${statusTick.live.ticker} @ ${statusTick.live.price ?? "—"}` : "—"}</div>
         <div>
-          Server (ET): {statusTick?.serverTimeET ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" }) : "—"}
+          Server (ET):{" "}
+          {statusTick?.serverTimeET
+            ? new Date(statusTick.serverTimeET).toLocaleTimeString("en-US", { timeZone: "America/New_York" })
+            : "—"}
         </div>
       </div>
 
@@ -1094,7 +1081,9 @@ function BotStatus({
         <div className="font-semibold mb-1">Last Recommendation</div>
         <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
           {statusTick?.lastRec
-            ? `Pick: ${statusTick.lastRec.ticker} @ ${typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"}`
+            ? `Pick: ${statusTick.lastRec.ticker} @ ${
+                typeof statusTick.lastRec.price === "number" ? `$${statusTick.lastRec.price.toFixed(2)}` : "—"
+              }`
             : "No recommendation yet — bot is waiting for a valid pick."}
         </div>
       </div>
@@ -1103,7 +1092,9 @@ function BotStatus({
         <div className="font-semibold mb-1">Open Position</div>
         <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
           {statusTick?.position
-            ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(statusTick.position.entryPrice).toFixed(2)}`
+            ? `Open: ${statusTick.position.ticker} x${statusTick.position.shares} @ $${Number(
+                statusTick.position.entryPrice
+              ).toFixed(2)}`
             : "No open position — bot will enter only if conditions are met during the entry window."}
         </div>
       </div>
@@ -1111,7 +1102,9 @@ function BotStatus({
       <div className="text-xs mt-2">
         <div className="font-semibold mb-1">Recent Trades</div>
         <div className="text-[11px] bg-gray-50 border border-gray-200 p-2 rounded">
-          {todayTradeCount ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).` : "No trades executed yet today."}
+          {todayTradeCount
+            ? `${todayTradeCount} trade${todayTradeCount === 1 ? "" : "s"} today (ET).`
+            : "No trades executed yet today."}
         </div>
       </div>
     </Panel>

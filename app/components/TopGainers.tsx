@@ -9,7 +9,7 @@ interface Stock {
   price: number;
   changesPercentage: number;
   marketCap: number | null;
-  sharesOutstanding: number | null; // Float
+  sharesOutstanding: number | null; // Float (proxy)
   volume: number | null;
   avgVolume?: number | null;
   employees?: number | null;
@@ -17,6 +17,13 @@ interface Stock {
   profitMargin?: number | null;
   netProfitMargin?: number | null;
 }
+
+/* ===========================
+   Config
+=========================== */
+const MIN_VOLUME = 300_000;   // ✅ filter threshold
+const DISPLAY_LIMIT = 15;     // ✅ show up to 15 after filtering
+const AI_LIMIT = 8;           // ✅ AI scans top 8 after filtering
 
 /* ===========================
    Small reusable smart-polling hook
@@ -140,6 +147,7 @@ export default function TopGainers() {
       abortRef.current = new AbortController();
 
       setLoading((prev) => (stocks.length ? prev : true)); // don't flash spinner if we already have data
+
       // Using the cached snapshot endpoint for huge API savings
       const res = await fetch(`/api/stocks/snapshot`, {
         cache: "no-store",
@@ -152,7 +160,12 @@ export default function TopGainers() {
         setStocks([]);
         setSourceUsed("");
       } else {
-        setStocks(data.stocks || []);
+        // ✅ Filter and trim here
+        const all: Stock[] = Array.isArray(data.stocks) ? data.stocks : [];
+        const filtered = all.filter((s) => ((s?.volume ?? 0) >= MIN_VOLUME));
+        const display = filtered.slice(0, DISPLAY_LIMIT);
+
+        setStocks(display);
         setSourceUsed(data.sourceUsed || data.source || "Auto");
         setUpdatedAt(data.updatedAt || "");
         setMarketOpen(typeof data.marketOpen === "boolean" ? data.marketOpen : null);
@@ -186,10 +199,12 @@ export default function TopGainers() {
     try {
       setAiLoading(true);
       setAiPick("");
+      // ✅ Only send the TOP 8 of the already-filtered list
+      const payload = { stocks: stocks.slice(0, AI_LIMIT) };
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stocks }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       setAiPick(data.recommendation || "No recommendation.");
@@ -207,6 +222,7 @@ export default function TopGainers() {
         <div className="flex items-center gap-3">
           <h2 className="font-bold text-lg">Top Gainers</h2>
 
+          {/* Source badge */}
           {sourceUsed && (
             <span
               className={`px-2 py-1 rounded text-xs font-semibold ${
@@ -225,6 +241,11 @@ export default function TopGainers() {
                 : sourceUsed}
             </span>
           )}
+
+          {/* Filter badge */}
+          <span className="px-2 py-1 rounded text-xs bg-gray-100 text-gray-700" title="Minimum day volume filter">
+            Vol ≥ {MIN_VOLUME.toLocaleString()}
+          </span>
 
           {marketOpen !== null && (
             <span className="px-2 py-1 rounded text-xs bg-gray-100 text-gray-700">
@@ -314,6 +335,7 @@ export default function TopGainers() {
               onClick={getRecommendation}
               className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm disabled:opacity-50 disabled:cursor-not-allowed"
               disabled={!stocks.length || aiLoading}
+              title={`AI scans top ${AI_LIMIT} from the filtered list`}
             >
               {aiLoading ? "Analyzing..." : "Get AI Pick"}
             </button>

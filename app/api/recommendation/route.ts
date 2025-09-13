@@ -32,10 +32,10 @@ const makeUrl = (p: string) => (BASE_URL ? `${BASE_URL}${p}` : p);
 /* ──────────────────────────────────────────────────────────
    Limits to control API usage
    ────────────────────────────────────────────────────────── */
-const MAX_INPUT = 20;        // read at most 20 incoming rows
-const FMP_ENRICH_LIMIT = 6;  // reduced to cut rate usage
-const PREMARKET_LIMIT = 8;   // analyze premarket for top 8 (single Alpaca call)
-const DEFAULT_TOP_N = 2;     // ⬅️ default to TWO picks
+const MAX_INPUT = 20;                 // read at most 20 incoming rows
+const PREMARKET_LIMIT = 8;            // analyze premarket for top 8 (single Alpaca call)
+const FMP_ENRICH_LIMIT = Math.max(8, PREMARKET_LIMIT); // ensure we enrich at least 8
+const DEFAULT_TOP_N = 2;              // default to TWO picks
 
 // Premarket+open window you want the model to consider
 const PM_START_H = 9, PM_START_M = 0;
@@ -369,7 +369,6 @@ function buildExplanationForPick(
 /* ──────────────────────────────────────────────────────────
    Soft preference helpers (Float ↓ strongest, Employees ↑, AvgVolume ↑)
    ────────────────────────────────────────────────────────── */
-// prefer smaller float most; employees still matters (log-scaled); avg volume modest.
 function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; employees?: number|null; avgVolume?: number|null }>) {
   const floats = rows.map(r => r.sharesOutstanding ?? null).filter((v): v is number => v != null && Number.isFinite(v));
   const emps   = rows.map(r => r.employees ?? null).filter((v): v is number => v != null && Number.isFinite(v));
@@ -460,6 +459,17 @@ function compareByPreference(a: any, b: any) {
   return ((b.softPref ?? 0) - (a.softPref ?? 0));
 }
 
+/* Small helper for fetch timeouts (used for OpenAI call) */
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 30_000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 /* ──────────────────────────────────────────────────────────
    Route
    ────────────────────────────────────────────────────────── */
@@ -474,7 +484,7 @@ export async function POST(req: Request) {
 
     const body = await req.json();
     const stocksIn = body.gainers || body.stocks;
-    const topN = Math.max(1, Math.min(2, Number(body.topN ?? DEFAULT_TOP_N))); // ⬅️ default TWO
+    const topN = Math.max(1, Math.min(2, Number(body.topN ?? DEFAULT_TOP_N))); // default TWO
 
     if (!stocksIn || !Array.isArray(stocksIn) || stocksIn.length === 0) {
       return NextResponse.json({ errorMessage: "No valid stock data provided to /api/recommendation." }, { status: 400 });
@@ -494,9 +504,10 @@ export async function POST(req: Request) {
         volume != null && sharesOutstanding != null && sharesOutstanding > 0
           ? volume / sharesOutstanding
           : null;
+      const avgVolume = num(s.avgVolume); // prefer upstream value if provided
       return {
         ticker, price, changesPercentage, marketCap, sharesOutstanding, volume, employees,
-        dollarVolume, relVolFloat,
+        dollarVolume, relVolFloat, avgVolume,
       };
     });
 
@@ -512,7 +523,7 @@ export async function POST(req: Request) {
           fmpProfileCached(row.ticker),
           fmpRatiosTTMCached(row.ticker),
           fmpNewsCached(row.ticker, 3),
-          fmpAvgVolumeSmartCached(row.ticker),
+          row.avgVolume ?? fmpAvgVolumeSmartCached(row.ticker), // ⬅️ use incoming avgVolume if present
           fmpQuoteCached(row.ticker),
         ]);
 
@@ -560,7 +571,7 @@ export async function POST(req: Request) {
       const p = s.price ?? 0;
       const passPrice     = p >= 1 && p <= 70;
       const passVenue     = !s.isEtf && !s.isOTC;
-      const passFloat     = (s.sharesOutstanding ?? 0) >= MIN_FLOAT; // ⬅️ enforce here
+      const passFloat     = (s.sharesOutstanding ?? 0) >= MIN_FLOAT;
       return passAvgVol && passRelVol && passDollarVol && passPrice && passVenue && passFloat;
     });
 
@@ -568,11 +579,11 @@ export async function POST(req: Request) {
     const enrichedPriceBand = enriched.filter((s) => {
       const p = s.price ?? 0;
       const f = s.sharesOutstanding ?? 0;
-      return p >= 1 && p <= 70 && f >= MIN_FLOAT; // ⬅️ enforce here too
+      return p >= 1 && p <= 70 && f >= MIN_FLOAT;
     });
 
     // Last-chance fallback that still respects float
-    const lastChance = enriched.filter((s) => (s.sharesOutstanding ?? 0) >= MIN_FLOAT); // ⬅️ enforce here
+    const lastChance = enriched.filter((s) => (s.sharesOutstanding ?? 0) >= MIN_FLOAT);
 
     // Sort helper: prioritize AM tone if available, then DollarVol, then SoftPref
     const byComposite = (arr: any[]) =>
@@ -705,7 +716,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     if (OPENAI_API_KEY.startsWith("sk-proj-")) headers["OpenAI-Project"] = OPENAI_PROJECT_ID;
     if (OPENAI_ORG) headers["OpenAI-Organization"] = OPENAI_ORG;
 
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    const res = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -718,7 +729,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
         max_tokens: 700,
         response_format: { type: "json_object" as const },
       }),
-    });
+    }, 30_000);
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
@@ -748,7 +759,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
 
     const validModel = picksFromModel.filter(p => {
       const c = byTicker[p];
-      return !!c && meetsFloat(c); // ⬅️ enforce here
+      return !!c && meetsFloat(c);
     });
 
     // Build final picks with POST-ENFORCEMENT of policy
@@ -827,7 +838,11 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     for (const sym of finalPicks) {
       const t = sym.toUpperCase();
       const c = (prefSorted as any[]).find((x: any) => String(x.ticker).toUpperCase() === t);
-      const priceNum = Number(c?.price ?? 0);
+
+      // ⬇️ don't force 0 — use null/omit if unknown
+      const priceNum = (c?.price != null && Number.isFinite(Number(c.price)))
+        ? Number(c.price)
+        : null;
 
       const expl = buildExplanationForPick(t, c as any, reasonsMap[t], risk);
 
@@ -835,7 +850,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
         const row = await prisma.recommendation.create({
           data: {
             ticker: t,
-            price: priceNum,
+            ...(priceNum != null ? { price: priceNum } : {}), // omit if null
             explanation: expl,
           },
         });

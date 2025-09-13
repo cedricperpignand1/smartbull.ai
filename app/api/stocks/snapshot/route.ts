@@ -3,8 +3,8 @@ import { NextResponse } from "next/server";
 /**
  * SELF-CONTAINED SNAPSHOT ROUTE
  * - Pulls a list of top symbols (FMP gainers) in ONE call
- * - Fetches quotes for all those symbols in ONE batched call
- * - Caches the whole snapshot in-memory for TTL_MS (default 5s)
+ * - Fetches quotes for all those symbols in ONE/FEW batched calls
+ * - Caches the whole snapshot in-memory (TTL is dynamic: open vs closed)
  * - Coalesces concurrent requests into ONE upstream call
  * - Backs off briefly on 429s and serves last good snapshot
  *
@@ -14,10 +14,16 @@ import { NextResponse } from "next/server";
 // =====================
 // Config
 // =====================
-const TTL_MS = 5000;         // how fresh clients need data
-const COOLDOWN_MS = 20_000;  // backoff if provider returns 429
-const GAINERS_LIMIT = 30;    // how many symbols to include (30 is plenty)
-const QUOTE_CHUNK = 100;     // FMP lets 100+ in one path; chunk to be safe
+const TTL_OPEN_MS = 5_000;     // during market hours
+const TTL_CLOSED_MS = 60_000;  // after-hours / weekends
+const COOLDOWN_MS = 20_000;    // backoff if provider returns 429
+
+// Oversample so that after filtering (vol >= 300k) we still have enough.
+const GAINERS_LIMIT = 120;
+const QUOTE_CHUNK = 100;       // FMP allows large batches; chunk conservatively
+
+// App rule: filter out thin names completely
+const MIN_VOLUME = 300_000;    // ✅ remove any stock below this intraday volume
 
 // =====================
 // Cache
@@ -29,6 +35,7 @@ type Stock = {
   volume: number | null;
   avgVolume?: number | null;
   marketCap?: number | null;
+  sharesOutstanding?: number | null; // for "Float" column
 };
 
 type Snap = {
@@ -65,10 +72,15 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-function getBaseUrl(headers: Headers) {
-  const proto = (headers.get("x-forwarded-proto") || "http").split(",")[0].trim();
-  const host = (headers.get("x-forwarded-host") || headers.get("host") || "").split(",")[0].trim();
-  return `${proto}://${host}`;
+// Quick market-open heuristic (ET hours)
+function isLikelyMarketOpenET(now = new Date()): boolean {
+  const estNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const day = estNow.getDay(); // 0 Sun .. 6 Sat
+  if (day === 0 || day === 6) return false;
+  const h = estNow.getHours();
+  const m = estNow.getMinutes();
+  const mins = h * 60 + m;
+  return mins >= 9 * 60 + 30 && mins <= 16 * 60; // 9:30–16:00 ET
 }
 
 // =====================
@@ -110,48 +122,42 @@ async function getBatchQuotes(symbols: string[]): Promise<Stock[]> {
     if (Array.isArray(j)) results.push(...j);
   }
 
-  // Normalize to your UI shape
-  const stocks: Stock[] = results.map((r: any) => ({
-    ticker: r?.symbol ?? "",
-    price: Number.isFinite(Number(r?.price)) ? Number(r.price) : null,
-    changesPercentage: Number.isFinite(Number(r?.changesPercentage))
-      ? Number(r.changesPercentage)
-      : null,
-    volume: Number.isFinite(Number(r?.volume)) ? Number(r.volume) : null,
-    avgVolume: Number.isFinite(Number(r?.avgVolume)) ? Number(r.avgVolume) : null,
-    marketCap: Number.isFinite(Number(r?.marketCap)) ? Number(r.marketCap) : null,
-  })).filter(s => s.ticker);
+  // Normalize to your UI shape (include sharesOutstanding)
+  const stocks: Stock[] = results
+    .map((r: any) => ({
+      ticker: r?.symbol ?? "",
+      price: Number.isFinite(Number(r?.price)) ? Number(r.price) : null,
+      changesPercentage: Number.isFinite(Number(r?.changesPercentage))
+        ? Number(r.changesPercentage)
+        : null,
+      volume: Number.isFinite(Number(r?.volume)) ? Number(r.volume) : null,
+      avgVolume: Number.isFinite(Number(r?.avgVolume)) ? Number(r.avgVolume) : null,
+      marketCap: Number.isFinite(Number(r?.marketCap)) ? Number(r.marketCap) : null,
+      sharesOutstanding: Number.isFinite(Number(r?.sharesOutstanding)) ? Number(r.sharesOutstanding) : null,
+    }))
+    .filter((s) => s.ticker);
 
   return stocks;
-}
-
-// Optional: quick market-open heuristic (ET hours)
-// Keeps your UI badge populated even without your market lib here.
-function isLikelyMarketOpenET(now = new Date()): boolean {
-  const estNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const day = estNow.getDay(); // 0 Sun .. 6 Sat
-  if (day === 0 || day === 6) return false;
-  const h = estNow.getHours();
-  const m = estNow.getMinutes();
-  const mins = h * 60 + m;
-  return mins >= 9 * 60 + 30 && mins <= 16 * 60; // 9:30–16:00 ET
 }
 
 // =====================
 // Snapshot builder
 // =====================
 async function fetchUpstreamSnapshot(): Promise<Snap> {
-  // 1) Get a list of symbols (single call)
+  // 1) Get a list of symbols (single call, oversampled)
   const symbols = await getTopGainersSymbols(GAINERS_LIMIT);
 
-  // 2) Get their quotes in a single batched call (or 2 if >100)
+  // 2) Get their quotes in batched calls
   const stocks = await getBatchQuotes(symbols);
 
-  // 3) Sort the way your UI expects (by % change desc)
+  // 3) Sort by % change desc (as the UI expects)
   stocks.sort((a, b) => (b.changesPercentage ?? -Infinity) - (a.changesPercentage ?? -Infinity));
 
+  // 4) ✅ Filter out low-volume names completely
+  const filtered = stocks.filter((s) => ((s.volume ?? 0) >= MIN_VOLUME));
+
   return {
-    stocks,
+    stocks: filtered,
     updatedAt: new Date().toISOString(),
     sourceUsed: "FMP",
     marketOpen: isLikelyMarketOpenET(),
@@ -161,8 +167,9 @@ async function fetchUpstreamSnapshot(): Promise<Snap> {
 // =====================
 // Route
 // =====================
-export async function GET(request: Request) {
+export async function GET(_request: Request) {
   const now = Date.now();
+  const effectiveTTL = isLikelyMarketOpenET() ? TTL_OPEN_MS : TTL_CLOSED_MS;
 
   // Respect cooldown after a 429
   if (now - cache.last429At < COOLDOWN_MS && cache.data) {
@@ -170,7 +177,7 @@ export async function GET(request: Request) {
   }
 
   // Serve fresh cache
-  if (cache.data && now - cache.t < TTL_MS) {
+  if (cache.data && now - cache.t < effectiveTTL) {
     return NextResponse.json(cache.data);
   }
 
