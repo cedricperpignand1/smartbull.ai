@@ -7,14 +7,17 @@ type ProfileMap = Map<string, { data: any; ts: number }>;
 const FMP = process.env.FMP_API_KEY || "";
 
 // ---------- Tunables ----------
-const TOP_N = 15;                       // show top 15
-const WATCHLIST_SIZE = 8;               // quote only first 8 each tick
-const QUOTE_INTERVAL_MS = 1500;         // ~1.5s for near real-time (watchlist)
-const GAINERS_INTERVAL_MS = 15000;      // refresh gainers every 15s
-const PROFILE_TTL_MS = 24 * 60 * 60 * 1000; // profiles once/day
+const TOP_N = 15;                            // show top 15
+const WATCHLIST_SIZE = 8;                    // quote only first 8 each tick
+const QUOTE_INTERVAL_MS = 1500;              // ~1.5s for near real-time (watchlist)
+const GAINERS_INTERVAL_MS = 15000;           // refresh gainers every 15s
+const PROFILE_TTL_MS = 24 * 60 * 60 * 1000;  // profiles once/day
 
-// NEW: bulk refresh for the non-watchlist names so we get volume, etc.
-const BULK_NONWATCHLIST_MS = 30_000;    // every 30s is plenty
+// Bulk refresh for the non-watchlist names so we get volume, etc.
+const BULK_NONWATCHLIST_MS = 30_000;         // every 30s is plenty
+
+// NEW: lightly enrich top rows with employees if missing (uses cached helper)
+const ENRICH_TOP_N = 12;
 
 // ---------- In-memory state (per server instance) ----------
 let gainers: any[] = [];
@@ -60,6 +63,46 @@ async function jfetch(url: string, timeoutMs = 12000) {
   } finally {
     clearTimeout(t);
   }
+}
+
+// ⬇️ cached FMP profile helper (uses your 60-min TTL cache)
+import { fmpProfileCached } from "./fmpCached";
+
+// Fill missing employees for the first ENRICH_TOP_N rows.
+// Uses fmpProfileCached (cheap; 60-min TTL) and also updates our local profiles map.
+async function fillEmployeesTopN(rows: Array<{ ticker: string; employees?: number | null }>) {
+  const top = rows.slice(0, ENRICH_TOP_N);
+  await Promise.all(
+    top.map(async (r) => {
+      if (r.employees != null) return;
+
+      // If we already have a fresh-ish profile in-memory, use it
+      const pMem = profiles.get(r.ticker);
+      if (pMem?.data?.fullTimeEmployees != null) {
+        const empMem = Number(pMem.data.fullTimeEmployees);
+        if (Number.isFinite(empMem)) {
+          r.employees = empMem;
+          return;
+        }
+      }
+
+      // Otherwise, grab via cached helper (no extra call if already cached)
+      try {
+        const p = await fmpProfileCached(r.ticker);
+        const emp = Number(p?.fullTimeEmployees);
+        if (Number.isFinite(emp)) {
+          r.employees = emp;
+          // update our local profile cache, too
+          profiles.set(r.ticker, {
+            data: { ...(pMem?.data ?? {}), ...(p ?? {}), symbol: r.ticker, fullTimeEmployees: emp },
+            ts: Date.now(),
+          });
+        }
+      } catch {
+        // ignore single-symbol failures
+      }
+    })
+  );
 }
 
 // ---------- Core refreshers (with logs) ----------
@@ -146,7 +189,7 @@ async function refreshQuotes() {
   }
 }
 
-// NEW: bulk quotes for the remaining gainers (so we get volume for them too)
+// Bulk quotes for the remaining gainers (so we get volume for them too)
 async function refreshNonWatchlistQuotes() {
   if (!FMP) return;
   try {
@@ -172,7 +215,7 @@ async function refreshNonWatchlistQuotes() {
   }
 }
 
-// ---------- Payload builder & broadcaster ----------
+// ---------- Payload builder ----------
 function buildPayload() {
   const symbols = gainers
     .map((r) => String(r.symbol || r.ticker || "").toUpperCase())
@@ -189,7 +232,7 @@ function buildPayload() {
       changesPercentage: num(g.changesPercentage ?? q.changesPercentage),
       marketCap: num(q.marketCap ?? g.marketCap),
       sharesOutstanding: num(q.sharesOutstanding ?? g.sharesOutstanding),
-      volume: num(q.volume ?? g.volume), // ⬅️ fallback to gainers volume if present
+      volume: num(q.volume ?? g.volume),
       avgVolume: num(q.avgVolume ?? q.volAvg ?? g.avgVolume),
       employees: p?.fullTimeEmployees != null ? Number(p.fullTimeEmployees) : null,
     };
@@ -202,6 +245,7 @@ function buildPayload() {
   };
 }
 
+// ---------- Broadcast helpers ----------
 function broadcast(payload: any) {
   lastPayload = payload;
   for (const send of listeners) {
@@ -211,6 +255,17 @@ function broadcast(payload: any) {
       // ignore subscriber errors
     }
   }
+}
+
+// Build → enrich top rows (employees) → broadcast
+async function buildEnrichAndBroadcast() {
+  const payload = buildPayload();
+  try {
+    await fillEmployeesTopN(payload.stocks);
+  } catch {
+    // enrichment is best-effort
+  }
+  broadcast(payload);
 }
 
 // ---------- Public API used by routes ----------
@@ -227,14 +282,15 @@ export function ensureStocksWorkerStarted() {
       "WATCHLIST:",
       WATCHLIST_SIZE,
       "bulk(non-watchlist) every:",
-      BULK_NONWATCHLIST_MS, "ms"
+      BULK_NONWATCHLIST_MS, "ms",
+      "enrichTopN:", ENRICH_TOP_N
     );
   }
 
   // Initial kick (async, no await so route can respond immediately)
   refreshGainers()
     .then(() => Promise.all([refreshQuotes(), refreshNonWatchlistQuotes()]))
-    .then(() => broadcast(buildPayload()))
+    .then(() => buildEnrichAndBroadcast())
     .catch((e) => console.error("[stocksWorker] initial kick failed:", e?.message || e));
 
   // Gainers timer (15s)
@@ -242,19 +298,19 @@ export function ensureStocksWorkerStarted() {
     await refreshGainers();
     await refreshQuotes();
     await refreshNonWatchlistQuotes(); // keep rest fresh too
-    broadcast(buildPayload());
+    await buildEnrichAndBroadcast();
   }, GAINERS_INTERVAL_MS);
 
   // Quotes timer (every 1.5s) — watchlist only
   setInterval(async () => {
     await refreshQuotes();
-    broadcast(buildPayload());
+    await buildEnrichAndBroadcast();
   }, QUOTE_INTERVAL_MS);
 
-  // NEW: Non-watchlist bulk quotes (every 30s) — ensures volume is present
+  // Non-watchlist bulk quotes (every 30s) — ensures volume is present
   setInterval(async () => {
     await refreshNonWatchlistQuotes();
-    broadcast(buildPayload());
+    await buildEnrichAndBroadcast();
   }, BULK_NONWATCHLIST_MS);
 }
 
@@ -284,6 +340,6 @@ export function setWatchlist(symbols: string[]) {
   // Immediately try to refresh quotes for new symbols (non-blocking)
   refreshQuotes()
     .then(() => refreshNonWatchlistQuotes())
-    .then(() => broadcast(buildPayload()))
+    .then(() => buildEnrichAndBroadcast())
     .catch(() => {});
 }

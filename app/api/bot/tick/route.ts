@@ -22,6 +22,33 @@ import {
 // ✅ Cached FMP helpers
 import { fmpQuoteCached } from "../../../../lib/fmpCached"
 
+/* -------------------------- micro-memo wrappers (safe, no behavior change) -------------------------- */
+const SPREAD_TTL_MS = 1200;  // reuse spread result for ~1.2s
+const ACCOUNT_TTL_MS = 3000; // reuse account snapshot for ~3s
+
+const _spreadMemo = new Map<string, { t: number; v: boolean }>();
+async function memoSpreadGuardOK(symbol: string, limitPct: number) {
+  const key = `${symbol}|${limitPct.toFixed(4)}`;
+  const now = Date.now();
+  const hit = _spreadMemo.get(key);
+  if (hit && now - hit.t < SPREAD_TTL_MS) return hit.v;
+
+  const v = await spreadGuardOK(symbol, limitPct);
+  _spreadMemo.set(key, { t: now, v });
+  return v;
+}
+
+let _acctMemo: { t: number; v: any } | null = null;
+async function memoGetAccount() {
+  const now = Date.now();
+  if (_acctMemo && now - _acctMemo.t < ACCOUNT_TTL_MS) return _acctMemo.v;
+
+  const v = await getAccount();
+  _acctMemo = { t: now, v };
+  return v;
+}
+/* ---------------------------------------------------------------------------------------------------- */
+
 /* -------------------------- small helpers -------------------------- */
 type SnapStock = {
   ticker: string;
@@ -560,7 +587,7 @@ async function evaluateEntrySignals(
     return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "price_band" }, debug: dbg };
   }
   const spreadLimit = dynamicSpreadLimitPct(nowET(), last?.close ?? null, "scan");
-  const spreadOK = await spreadGuardOK(ticker, spreadLimit);
+  const spreadOK = await memoSpreadGuardOK(ticker, spreadLimit); // ⬅️ memoized
   dbg.spread = { limitPct: spreadLimit, spreadOK };
   if (!spreadOK) {
     return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "spread_guard" }, debug: dbg };
@@ -717,9 +744,9 @@ async function handle(req: Request) {
       let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
       let livePrice: number | null = null;
 
-      // Real Alpaca balances (optional)
+      // Real Alpaca balances (optional) — now memoized (3s)
       let alpacaAccount: any = null;
-      try { alpacaAccount = await getAccount(); } catch {}
+      try { alpacaAccount = await memoGetAccount(); } catch {}
 
       const today = yyyyMmDdET();
 
@@ -935,7 +962,7 @@ async function handle(req: Request) {
               continue;
             }
             const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
-            const spreadOK = await spreadGuardOK(sym!, spreadLimit);
+            const spreadOK = await memoSpreadGuardOK(sym!, spreadLimit); // ⬅️ memoized
             if (!spreadOK) {
               debug.reasons.push(`force_spread_guard_fail_${sym}_limit=${(spreadLimit*100).toFixed(2)}%`);
               continue;
@@ -1025,7 +1052,7 @@ async function handle(req: Request) {
                 continue;
               }
               const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
-              const spreadOK = await spreadGuardOK(sym!, spreadLimit);
+              const spreadOK = await memoSpreadGuardOK(sym!, spreadLimit); // ⬅️ memoized
               if (!spreadOK) {
                 debug.reasons.push(`second_force_spread_guard_fail_${sym}_limit=${(spreadLimit * 100).toFixed(2)}%`);
                 continue;
