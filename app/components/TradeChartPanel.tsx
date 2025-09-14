@@ -3,7 +3,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useBotPoll } from "../components/useBotPoll";
 
-
 /* ================= Types ================= */
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
 type PositionWire = {
@@ -144,9 +143,7 @@ function useTodayTrades(symbol: string | null, pollMsWhenActive = 30000, paused 
 
         setRows(norm);
         return;
-      } catch {
-        /* try next */
-      }
+      } catch {}
     }
 
     if (rows == null) setRows([]);
@@ -172,7 +169,7 @@ function useCandles1m(
   isActiveFast: boolean,
   pollMsFast = 30000,
   pollMsSlow = 120000,
-  limit = 240,
+  limit = 180,
   paused = false
 ) {
   const visible = useVisibility();
@@ -213,9 +210,7 @@ function useCandles1m(
           .filter((k) => !!k.date && [k.open, k.high, k.low, k.close, k.volume].every(Number.isFinite));
 
         if (clean.length) return clean;
-      } catch {
-        /* try next */
-      }
+      } catch {}
     }
     return [];
   }
@@ -227,7 +222,7 @@ function useCandles1m(
 
   useEffect(() => {
     setCandles(null);
-    if (symbol) load(symbol);
+    if (symbol) load(symbol); // first paint even if paused
   }, [symbol]);
 
   useEffect(() => {
@@ -326,7 +321,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
           className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 p-4"
           onClick={(e) => { if (e.target === e.currentTarget && !busy) setOpen(false); }}
         >
-          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl">
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
             <div className="text-lg font-semibold text-slate-800">Panic Sell — Close ALL Positions</div>
             <p className="mt-1 text-sm text-slate-600">Sends market orders to flatten every open position.</p>
 
@@ -390,6 +385,9 @@ async function ensureLWv4(): Promise<any | null> {
     s.onerror = () => rej();
     document.head.appendChild(s);
   }).catch(() => {});
+  if (!window.LightweightCharts?.createChart) {
+    console.error("[ChartView] Failed to load lightweight-charts v4 (CDN).");
+  }
   return window.LightweightCharts?.createChart ? window.LightweightCharts : null;
 }
 
@@ -428,11 +426,15 @@ function ChartView({
   const headerLeft = symbol ? `${symbol} • 1-min • VWAP` : "1-min Chart";
   const dayYMD = yyyyMmDdET(new Date());
 
-  /* create chart once */
+  /* create chart once — delay 1 rAF to ensure width is real */
   useEffect(() => {
     let cleanup = () => {};
     (async () => {
       if (!containerRef.current || createdRef.current) return;
+
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      if (!containerRef.current || createdRef.current) return;
+
       createdRef.current = true;
 
       containerRef.current.innerHTML = "";
@@ -441,7 +443,6 @@ function ChartView({
       const L = await ensureLWv4();
       if (!L?.createChart) {
         createdRef.current = false;
-        console.error("[ChartView] LW v4 not loaded");
         return;
       }
 
@@ -524,9 +525,7 @@ function ChartView({
     if (!cs || !chart) return;
 
     for (const pl of priceLinesRef.current) {
-      try {
-        cs.removePriceLine(pl);
-      } catch {}
+      try { cs.removePriceLine(pl); } catch {}
     }
     priceLinesRef.current = [];
 
@@ -547,8 +546,13 @@ function ChartView({
     cs.setData(seriesData);
 
     if (vs) {
-      const vwap = computeSessionVWAP(candles, dayYMD);
-      vs.setData(Array.isArray(vwap) ? vwap : []);
+      // Lazy VWAP: compute after bars set, micro-delay to not block paint
+      setTimeout(() => {
+        try {
+          const vwap = computeSessionVWAP(candles, dayYMD);
+          vs.setData(Array.isArray(vwap) ? vwap : []);
+        } catch {}
+      }, 0);
     }
 
     chart.timeScale().fitContent();
@@ -734,15 +738,19 @@ function DayPnlBadge() {
   );
 }
 
-/* ================= Component (now powered by useBotPoll) ================= */
+/* ================= Component ================= */
 export default function TradeChartPanel({
   height = 360,
-  /** Optional fallback symbol to show when truly idle (e.g., SPY) */
   symbolWhenFlat,
 }: {
   height?: number;
   symbolWhenFlat?: string | null | undefined;
 }) {
+  // Pre-warm LW script
+  useEffect(() => {
+    ensureLWv4();
+  }, []);
+
   // Poll bot/tick + trades cache
   const { tick, tradesToday, currentSymbol } = useBotPoll(5000);
 
@@ -750,17 +758,15 @@ export default function TradeChartPanel({
   const pos = usePositionFromTick(tick);
 
   // Which symbol to chart:
-  // 1) server-pinned view/currentSymbol (kept until 23:59 ET)
-  // 2) else optional fallback (e.g., SPY) while market is open
   const symbol: string | null =
     currentSymbol ?? (isMarketHoursET() && symbolWhenFlat ? String(symbolWhenFlat) : null);
 
-  // Big view (modal). While open, pause candles/trades polling (we still show same data).
+  // We keep the big view mounted ALWAYS (hidden until open)
   const [bigOpen, setBigOpen] = useState(false);
-  const paused = bigOpen;
+  const paused = false; // ⬅️ do NOT pause; big chart stays hot
 
   const hasOpen = !!pos?.open && !!pos?.ticker;
-  const { candles } = useCandles1m(symbol, hasOpen || !!currentSymbol, 30000, 120000, 240, paused);
+  const { candles } = useCandles1m(symbol, hasOpen || !!currentSymbol, 30000, 120000, 180, paused);
   const todayTrades = useTodayTrades(symbol, 30000, paused);
 
   return (
@@ -773,7 +779,7 @@ export default function TradeChartPanel({
           candles={candles}
           todayTrades={todayTrades as any}
           pos={pos}
-          dayPnl={null}   // handled in DayPnlBadge inside ChartView
+          dayPnl={null}
           showPopOut
           onPopOut={() => setBigOpen(true)}
         />
@@ -788,28 +794,35 @@ export default function TradeChartPanel({
         </div>
       )}
 
-      {/* Full-screen big chart (reuses same data) */}
-      {bigOpen && (
+      {/* Always-mounted modal; we just toggle visibility for INSTANT open */}
+      <div
+        className={[
+          "fixed inset-0 z-[120] flex items-center justify-center p-4 transition-opacity duration-150",
+          bigOpen ? "bg-black/60 opacity-100 pointer-events-auto" : "bg-black/0 opacity-0 pointer-events-none",
+        ].join(" ")}
+        onClick={(e) => {
+          if (e.target === e.currentTarget) setBigOpen(false);
+        }}
+        aria-hidden={!bigOpen}
+      >
         <div
-          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setBigOpen(false);
-          }}
+          className="w-[min(100vw-2rem,1400px)]"
+          onClick={(e) => e.stopPropagation()}
         >
-          <div className="w-full max-w-[1400px]">
-            <ChartView
-              height={820}
-              symbol={symbol}
-              candles={candles}
-              todayTrades={todayTrades as any}
-              pos={pos}
-              dayPnl={null}
-              showClose
-              onClose={() => setBigOpen(false)}
-            />
-          </div>
+          <ChartView
+            // Keep a stable key so it stays mounted & hot
+            key={`big-static-${symbol ?? "none"}`}
+            height={820}
+            symbol={symbol}
+            candles={candles}
+            todayTrades={todayTrades as any}
+            pos={pos}
+            dayPnl={null}
+            showClose
+            onClose={() => setBigOpen(false)}
+          />
         </div>
-      )}
+      </div>
     </>
   );
 }
