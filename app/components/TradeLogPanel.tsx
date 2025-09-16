@@ -27,7 +27,6 @@ const LS_KEY = "tradeLog_allTime_v2_fifo";
 /** ===== NEW: table window (7 days) ===== */
 const WINDOW_DAYS = 7;
 const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
-const PANIC_PASSKEY = "9340";
 
 /** ===== Helpers ===== */
 function parseTs(input: any): number | null {
@@ -166,9 +165,9 @@ export default function TradeLogPanel() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
-  // Panic Sell UI
+  // Panic Sell UI (now uses admin password, same as reset)
   const [showPanic, setShowPanic] = useState(false);
-  const [panicKey, setPanicKey] = useState("");
+  const [panicPwd, setPanicPwd] = useState("");
   const [panicBusy, setPanicBusy] = useState(false);
   const [panicMsg, setPanicMsg] = useState<string | null>(null);
 
@@ -218,6 +217,9 @@ export default function TradeLogPanel() {
     [history]
   );
 
+  // => derive "has open positions" from FIFO lots (reliable, not quote-dependent)
+  const hasOpenPos = computedPos.length > 0;
+
   // ===== NEW: table rows filtered to the last 7 days =====
   const rows = useMemo(() => {
     const cutoff = Date.now() - WINDOW_MS;
@@ -231,21 +233,27 @@ export default function TradeLogPanel() {
         setPositions([]);
         return;
       }
-      const tickers = computedPos.map((p) => p.ticker).join(",");
-      const res = await fetch(
-        `https://financialmodelingprep.com/api/v3/quote/${tickers}?apikey=M0MLRDp8dLak6yJOfdv7joKaKGSje8pp`
-      );
-      const data = await res.json();
-      setPositions(
-        computedPos.map((pos) => {
-          const quote = data.find((q: any) => q.symbol === pos.ticker);
-          if (quote) {
-            const unrealized = (quote.price - pos.avgCost) * pos.qty;
-            return { ...pos, lastPrice: quote.price, unrealized };
-          }
-          return pos;
-        })
-      );
+      try {
+        const tickers = computedPos.map((p) => p.ticker).join(",");
+        const res = await fetch(
+          `https://financialmodelingprep.com/api/v3/quote/${tickers}?apikey=M0MLRDp8dLak6yJOfdv7joKaKGSje8pp`,
+          { cache: "no-store" }
+        );
+        const data = await res.json();
+        setPositions(
+          computedPos.map((pos) => {
+            const quote = data.find((q: any) => q.symbol === pos.ticker);
+            if (quote) {
+              const unrealized = (quote.price - pos.avgCost) * pos.qty;
+              return { ...pos, lastPrice: quote.price, unrealized };
+            }
+            return pos;
+          })
+        );
+      } catch {
+        // price fetch failure shouldn't block positions visibility
+        setPositions(computedPos);
+      }
     };
     loadPrices();
   }, [computedPos]);
@@ -266,9 +274,10 @@ export default function TradeLogPanel() {
       const res = await fetch("/api/bot/reset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ key: password }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok || !data?.ok) {
         setMsg("Incorrect password or reset failed.");
       } else {
@@ -277,7 +286,7 @@ export default function TradeLogPanel() {
         } catch {}
         setHistory([]);
         setPositions([]);
-        setMsg("✅ Reset complete.");
+        setMsg("Reset complete.");
         setTimeout(() => {
           setShowReset(false);
           window.location.reload();
@@ -292,18 +301,19 @@ export default function TradeLogPanel() {
 
   /** ===== PANIC SELL flow =====
    * Calls /api/bot/panic-sell { key } (preferred), falls back to /api/bot/close-all.
+   * Uses ADMIN PASSWORD (same as reset), not a 4-digit pin.
    */
   const openPanic = () => {
     setPanicMsg(null);
-    setPanicKey("");
+    setPanicPwd("");
     setShowPanic(true);
   };
   const closePanic = () => {
     if (!panicBusy) setShowPanic(false);
   };
   const confirmPanic = async () => {
-    if (panicKey.trim() !== PANIC_PASSKEY) {
-      setPanicMsg("❌ Incorrect passkey.");
+    if (!panicPwd.trim()) {
+      setPanicMsg("Please enter your admin password.");
       return;
     }
     setPanicBusy(true);
@@ -313,7 +323,8 @@ export default function TradeLogPanel() {
       let res = await fetch("/api/bot/panic-sell", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: panicKey.trim() }),
+        cache: "no-store",
+        body: JSON.stringify({ key: panicPwd.trim() }),
       });
 
       // Fallback if primary not present
@@ -321,15 +332,16 @@ export default function TradeLogPanel() {
         res = await fetch("/api/bot/close-all", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ key: panicKey.trim() }),
+          cache: "no-store",
+          body: JSON.stringify({ key: panicPwd.trim() }),
         });
       }
 
-      const data = await res.json().catch(() => ({}));
+      const data = await res.json().catch(() => ({} as any));
       if (!res.ok || !(data?.ok ?? true)) {
-        setPanicMsg("Panic sell failed. Check server logs.");
+        setPanicMsg(data?.error ?? "Panic sell failed. Check server logs.");
       } else {
-        setPanicMsg("✅ Sent market-close for all positions.");
+        setPanicMsg("Sent market-close for all positions.");
         setTimeout(() => {
           setShowPanic(false);
           window.location.reload();
@@ -387,16 +399,20 @@ export default function TradeLogPanel() {
 
       {/* TRADE LOG + ACTION BUTTONS */}
       <div className="relative">
-        {/* PANIC SELL (top-right) */}
+        {/* PANIC SELL (top-right) — enabled based on FIFO lots, not quotes */}
         <button
           onClick={openPanic}
-          disabled={positions.length === 0}
+          disabled={!hasOpenPos}
           className={`absolute top-2 right-40 z-50 rounded-lg px-3 py-1.5 text-sm font-semibold shadow
-            ${positions.length === 0
+            ${!hasOpenPos
               ? "bg-gray-300 text-gray-600 cursor-not-allowed"
               : "bg-red-600 text-white hover:bg-red-700 active:scale-[.99]"}
           `}
-          title={positions.length === 0 ? "No positions to close" : "Market close ALL positions"}
+          title={
+            hasOpenPos
+              ? "Market close ALL positions"
+              : "No open positions detected"
+          }
         >
           PANIC SELL
         </button>
@@ -490,12 +506,12 @@ export default function TradeLogPanel() {
               This wipes all trades, positions, and AI picks, and resets the bot balance.
             </p>
 
-            <label className="block mt-4 text-sm text-slate-700">Password</label>
+            <label className="block mt-4 text-sm text-slate-700">Admin password</label>
             <input
               type="password"
               autoFocus
               className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-rose-500"
-              placeholder="Enter password"
+              placeholder="Enter admin password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               onKeyDown={(e) => {
@@ -530,7 +546,7 @@ export default function TradeLogPanel() {
         </div>
       )}
 
-      {/* PANIC SELL MODAL */}
+      {/* PANIC SELL MODAL (uses admin password) */}
       {showPanic && (
         <div
           className="fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4"
@@ -546,16 +562,16 @@ export default function TradeLogPanel() {
               Sends market orders to close every open position immediately.
             </p>
 
-            <label className="block mt-4 text-sm text-slate-700">Passkey</label>
+            <label className="block mt-4 text-sm text-slate-700">Admin password</label>
             <input
               type="password"
               autoFocus
               className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:ring-2 focus:ring-red-500"
-              placeholder="Enter passkey (4 digits)"
-              value={panicKey}
-              onChange={(e) => setPanicKey(e.target.value)}
+              placeholder="Enter admin password"
+              value={panicPwd}
+              onChange={(e) => setPanicPwd(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && panicKey) confirmPanic();
+                if (e.key === "Enter" && panicPwd) confirmPanic();
                 if (e.key === "Escape") closePanic();
               }}
             />
@@ -571,7 +587,7 @@ export default function TradeLogPanel() {
                 Cancel
               </button>
               <button
-                disabled={panicBusy || panicKey.length === 0}
+                disabled={panicBusy || panicPwd.length === 0}
                 onClick={confirmPanic}
                 className="rounded-xl px-3 py-1.5 text-sm font-semibold bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
               >
@@ -580,7 +596,7 @@ export default function TradeLogPanel() {
             </div>
 
             <div className="mt-3 text-xs text-slate-500">
-              Hint: passkey is <span className="font-semibold">{PANIC_PASSKEY}</span>
+              Use the same password you use for Reset.
             </div>
           </div>
         </div>
