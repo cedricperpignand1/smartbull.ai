@@ -82,18 +82,43 @@ async function fetchJSON<T>(url: string): Promise<T> {
 }
 
 /** Build a PositionWire view from bot tick payload (if any) */
+function normalizeNum(n: any): number | null {
+  const v = Number(n);
+  return Number.isFinite(v) ? v : null;
+}
 function usePositionFromTick(tick: any): PositionWire | null {
   return useMemo(() => {
     const p = tick?.position || null;
     if (!p) return null;
+
+    // Robust field fallbacks for SL/TP and entry
+    const ticker =
+      p.ticker ?? p.symbol ?? p.asset ?? null;
+
+    const entryPrice =
+      normalizeNum(p.entryPrice ?? p.avgEntry ?? p.avg_price ?? p.avgCost ?? p.entry);
+
+    const entryAt =
+      p.entryAt ?? p.enteredAt ?? p.openedAt ?? null;
+
+    const stopLoss = normalizeNum(
+      p.stopLoss ?? p.stop ?? p.sl ?? p.stop_price ?? p.stopPrice
+    );
+
+    const takeProfit = normalizeNum(
+      p.takeProfit ?? p.take ?? p.tp ?? p.target ?? p.take_profit ?? p.takeProfitPrice
+    );
+
+    const shares = normalizeNum(p.shares ?? p.qty ?? p.quantity);
+
     return {
-      open: true,
-      ticker: p.ticker ?? null,
-      shares: Number(p.shares ?? 0) || null,
-      entryPrice: Number(p.entryPrice ?? 0) || null,
-      entryAt: p.entryAt ?? null,
-      stopLoss: p.stopLoss != null ? Number(p.stopLoss) : null,
-      takeProfit: p.takeProfit != null ? Number(p.takeProfit) : null,
+      open: Boolean(p.open ?? (shares && shares !== 0)),
+      ticker: ticker ? String(ticker).toUpperCase() : null,
+      shares,
+      entryPrice,
+      entryAt,
+      stopLoss,
+      takeProfit,
     };
   }, [tick?.position]);
 }
@@ -267,7 +292,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
 
   const confirm = async () => {
     if (key.trim() !== PASSKEY) {
-      setMsg("❌ Incorrect passkey.");
+      setMsg("Incorrect passkey.");
       return;
     }
     setBusy(true);
@@ -291,7 +316,7 @@ function PanicSellButton({ disabled }: { disabled: boolean }) {
         setMsg(`Panic sell failed: ${reason}`);
         return;
       }
-      setMsg("✅ Sent market-close for all positions.");
+      setMsg("Sent market-close for all positions.");
       setTimeout(() => {
         setOpen(false);
         window.location.reload();
@@ -579,22 +604,46 @@ function ChartView({
 
     const markers: any[] = [];
 
+    // ENTRY (normal weight)
     if (entryPrice != null) {
-      const pl = cs.createPriceLine({ price: entryPrice, title: "Entry", lineWidth: 1, color: "#9ca3af" });
+      const pl = cs.createPriceLine({
+        price: entryPrice,
+        title: "Entry",
+        lineWidth: 2,
+        color: "#9ca3af",
+        axisLabelVisible: true,
+      });
       priceLinesRef.current.push(pl);
       if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#9ca3af", shape: "arrowUp", text: "Entry" });
     }
+
+    // STOP LOSS (bold)
     if (stopLoss != null) {
-      const pl = cs.createPriceLine({ price: stopLoss, title: "Stop", lineWidth: 1, color: "#ef4444" });
+      const pl = cs.createPriceLine({
+        price: stopLoss,
+        title: "Stop",
+        lineWidth: 3,                // ⬅️ BOLDER
+        color: "#ef4444",
+        axisLabelVisible: true,
+      });
       priceLinesRef.current.push(pl);
       if (markerTime) markers.push({ time: markerTime, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SL" });
     }
+
+    // TAKE PROFIT (bold)
     if (takeProfit != null) {
-      const pl = cs.createPriceLine({ price: takeProfit, title: "Target", lineWidth: 1, color: "#22c55e" });
+      const pl = cs.createPriceLine({
+        price: takeProfit,
+        title: "Target",
+        lineWidth: 3,                // ⬅️ BOLDER
+        color: "#22c55e",
+        axisLabelVisible: true,
+      });
       priceLinesRef.current.push(pl);
       if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "TP" });
     }
 
+    // SELL markers + weighted average exit line (normal weight)
     if (Array.isArray(todayTrades) && todayTrades.length) {
       const sells = todayTrades.filter((t) => String(t.side).toUpperCase() === "SELL");
       if (sells.length) {
@@ -604,7 +653,13 @@ function ChartView({
           : null;
 
         if (wAvgExit != null && Number.isFinite(wAvgExit)) {
-          const pl = cs.createPriceLine({ price: wAvgExit, title: "Exit avg", lineWidth: 1, color: "#f59e0b" });
+          const pl = cs.createPriceLine({
+            price: wAvgExit,
+            title: "Exit avg",
+            lineWidth: 2,
+            color: "#f59e0b",
+            axisLabelVisible: true,
+          });
           priceLinesRef.current.push(pl);
         }
 
@@ -625,7 +680,16 @@ function ChartView({
     }
 
     cs.setMarkers(markers);
-  }, [candles, todayTrades, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.entryAt, pos?.open, pos?.ticker]);
+  }, [
+    candles,
+    todayTrades,
+    pos?.entryPrice,
+    pos?.stopLoss,
+    pos?.takeProfit,
+    pos?.entryAt,
+    pos?.open,
+    pos?.ticker,
+  ]);
 
   const rr = useMemo(() => {
     if (!(pos?.open && pos?.entryPrice && pos?.stopLoss)) return null;
@@ -763,7 +827,7 @@ export default function TradeChartPanel({
 
   // We keep the big view mounted ALWAYS (hidden until open)
   const [bigOpen, setBigOpen] = useState(false);
-  const paused = false; // ⬅️ do NOT pause; big chart stays hot
+  const paused = false; // keep hot
 
   const hasOpen = !!pos?.open && !!pos?.ticker;
   const { candles } = useCandles1m(symbol, hasOpen || !!currentSymbol, 30000, 120000, 180, paused);
@@ -794,7 +858,7 @@ export default function TradeChartPanel({
         </div>
       )}
 
-      {/* Always-mounted modal; we just toggle visibility for INSTANT open */}
+      {/* Always-mounted modal; toggle visibility for instant open */}
       <div
         className={[
           "fixed inset-0 z-[120] flex items-center justify-center p-4 transition-opacity duration-150",
@@ -810,7 +874,6 @@ export default function TradeChartPanel({
           onClick={(e) => e.stopPropagation()}
         >
           <ChartView
-            // Keep a stable key so it stays mounted & hot
             key={`big-static-${symbol ?? "none"}`}
             height={820}
             symbol={symbol}
