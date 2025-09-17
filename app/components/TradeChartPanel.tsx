@@ -91,23 +91,13 @@ function usePositionFromTick(tick: any): PositionWire | null {
     const p = tick?.position || null;
     if (!p) return null;
 
-    // Robust field fallbacks for SL/TP and entry
-    const ticker =
-      p.ticker ?? p.symbol ?? p.asset ?? null;
+    const ticker = p.ticker ?? p.symbol ?? p.asset ?? null;
+    const entryPrice = normalizeNum(p.entryPrice ?? p.avgEntry ?? p.avg_price ?? p.avgCost ?? p.entry);
+    const entryAt = p.entryAt ?? p.enteredAt ?? p.openedAt ?? null;
 
-    const entryPrice =
-      normalizeNum(p.entryPrice ?? p.avgEntry ?? p.avg_price ?? p.avgCost ?? p.entry);
-
-    const entryAt =
-      p.entryAt ?? p.enteredAt ?? p.openedAt ?? null;
-
-    const stopLoss = normalizeNum(
-      p.stopLoss ?? p.stop ?? p.sl ?? p.stop_price ?? p.stopPrice
-    );
-
-    const takeProfit = normalizeNum(
-      p.takeProfit ?? p.take ?? p.tp ?? p.target ?? p.take_profit ?? p.takeProfitPrice
-    );
+    // Try to pick broker-provided SL/TP; might be missing from your /tick
+    let stopLoss = normalizeNum(p.stopLoss ?? p.stop ?? p.sl ?? p.stop_price ?? p.stopPrice);
+    let takeProfit = normalizeNum(p.takeProfit ?? p.take ?? p.tp ?? p.target ?? p.take_profit ?? p.takeProfitPrice);
 
     const shares = normalizeNum(p.shares ?? p.qty ?? p.quantity);
 
@@ -194,7 +184,7 @@ function useCandles1m(
   isActiveFast: boolean,
   pollMsFast = 30000,
   pollMsSlow = 120000,
-  limit = 180,
+  limit = 240,                 // ⬅️ bump to keep more history (shows entry after exit)
   paused = false
 ) {
   const visible = useVisibility();
@@ -428,6 +418,7 @@ function ChartView({
   onPopOut,
   showClose,
   onClose,
+  tickInfo, // ⬅️ NEW for fallback TP/SL derivation
 }: {
   height: number;
   symbol: string | null;
@@ -439,6 +430,7 @@ function ChartView({
   onPopOut?: () => void;
   showClose?: boolean;
   onClose?: () => void;
+  tickInfo?: { stopPct?: number; targetPct?: number } | null;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const createdRef = useRef(false);
@@ -451,7 +443,7 @@ function ChartView({
   const headerLeft = symbol ? `${symbol} • 1-min • VWAP` : "1-min Chart";
   const dayYMD = yyyyMmDdET(new Date());
 
-  /* create chart once — delay 1 rAF to ensure width is real */
+  /* create chart once */
   useEffect(() => {
     let cleanup = () => {};
     (async () => {
@@ -571,7 +563,6 @@ function ChartView({
     cs.setData(seriesData);
 
     if (vs) {
-      // Lazy VWAP: compute after bars set, micro-delay to not block paint
       setTimeout(() => {
         try {
           const vwap = computeSessionVWAP(candles, dayYMD);
@@ -583,28 +574,61 @@ function ChartView({
     chart.timeScale().fitContent();
 
     const isOpen = !!pos?.open && !!pos?.ticker;
-    const entryPrice = isOpen ? pos?.entryPrice ?? null : null;
-    const stopLoss = isOpen ? pos?.stopLoss ?? null : null;
-    const takeProfit = isOpen ? pos?.takeProfit ?? null : null;
-    const entryAt = isOpen && pos?.entryAt ? toSec(pos.entryAt) : null;
 
-    let markerTime = entryAt;
-    if (entryAt && seriesData.length) {
+    // ---------- ENTRY (derive from pos or from today's BUY) ----------
+    let entryPrice: number | null =
+      (pos?.entryPrice ?? null) ||
+      (Array.isArray(todayTrades)
+        ? (() => {
+            const buy = todayTrades.find((t) => String(t.side).toUpperCase() === "BUY");
+            return buy ? Number(buy.price) : null;
+          })()
+        : null);
+
+    // Best-effort entry time from pos.entryAt; otherwise from first BUY trade
+    let entryAt: number | null =
+      (pos?.entryAt ? toSec(pos.entryAt) : null) ||
+      (Array.isArray(todayTrades)
+        ? (() => {
+            const buy = todayTrades.find((t) => String(t.side).toUpperCase() === "BUY");
+            return buy ? toSec(buy.at) : null;
+          })()
+        : null);
+
+    // Snap marker to nearest candle time (so arrows sit on visible bars)
+    const snapToSeries = (t: number | null) => {
+      if (!t || !seriesData.length) return null;
       let best = seriesData[0].time as number;
-      let bestDiff = Math.abs(best - entryAt);
+      let bestDiff = Math.abs(best - t);
       for (const pt of seriesData) {
-        const diff = Math.abs((pt.time as number) - entryAt);
+        const diff = Math.abs((pt.time as number) - t);
         if (diff < bestDiff) {
           best = pt.time as number;
           bestDiff = diff;
         }
       }
-      markerTime = best;
+      return best;
+    };
+    const entryMarkerTime = snapToSeries(entryAt);
+
+    // ---------- SL/TP (show when OPEN; derive if missing) ----------
+    let stopLoss: number | null = isOpen ? (pos?.stopLoss ?? null) : null;
+    let takeProfit: number | null = isOpen ? (pos?.takeProfit ?? null) : null;
+
+    if (isOpen && entryPrice != null) {
+      const stopPct = Number(tickInfo?.stopPct);
+      const targetPct = Number(tickInfo?.targetPct);
+      if ((stopLoss == null || !Number.isFinite(stopLoss)) && Number.isFinite(stopPct)) {
+        stopLoss = Math.round(entryPrice * (1 + stopPct) * 100) / 100;
+      }
+      if ((takeProfit == null || !Number.isFinite(takeProfit)) && Number.isFinite(targetPct)) {
+        takeProfit = Math.round(entryPrice * (1 + targetPct) * 100) / 100;
+      }
     }
 
     const markers: any[] = [];
 
-    // ENTRY (normal weight)
+    // ENTRY LINE + MARKER (always show if we can resolve it — even when FLAT)
     if (entryPrice != null) {
       const pl = cs.createPriceLine({
         price: entryPrice,
@@ -614,36 +638,36 @@ function ChartView({
         axisLabelVisible: true,
       });
       priceLinesRef.current.push(pl);
-      if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#9ca3af", shape: "arrowUp", text: "Entry" });
+      if (entryMarkerTime) markers.push({ time: entryMarkerTime, position: "belowBar", color: "#9ca3af", shape: "arrowUp", text: "Entry" });
     }
 
-    // STOP LOSS (bold)
-    if (stopLoss != null) {
+    // STOP LOSS (bold; only when open)
+    if (isOpen && stopLoss != null) {
       const pl = cs.createPriceLine({
         price: stopLoss,
         title: "Stop",
-        lineWidth: 3,                // ⬅️ BOLDER
+        lineWidth: 3,
         color: "#ef4444",
         axisLabelVisible: true,
       });
       priceLinesRef.current.push(pl);
-      if (markerTime) markers.push({ time: markerTime, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SL" });
+      if (entryMarkerTime) markers.push({ time: entryMarkerTime, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "SL" });
     }
 
-    // TAKE PROFIT (bold)
-    if (takeProfit != null) {
+    // TAKE PROFIT (bold; only when open)
+    if (isOpen && takeProfit != null) {
       const pl = cs.createPriceLine({
         price: takeProfit,
         title: "Target",
-        lineWidth: 3,                // ⬅️ BOLDER
+        lineWidth: 3,
         color: "#22c55e",
         axisLabelVisible: true,
       });
       priceLinesRef.current.push(pl);
-      if (markerTime) markers.push({ time: markerTime, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "TP" });
+      if (entryMarkerTime) markers.push({ time: entryMarkerTime, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "TP" });
     }
 
-    // SELL markers + weighted average exit line (normal weight)
+    // SELL markers + weighted average exit line (visible when there are sells — open OR flat)
     if (Array.isArray(todayTrades) && todayTrades.length) {
       const sells = todayTrades.filter((t) => String(t.side).toUpperCase() === "SELL");
       if (sells.length) {
@@ -664,17 +688,8 @@ function ChartView({
         }
 
         for (const s of sells) {
-          const t = toSec(s.at);
-          let best = seriesData[0].time as number;
-          let bestDiff = Math.abs(best - t);
-          for (const pt of seriesData) {
-            const diff = Math.abs((pt.time as number) - t);
-            if (diff < bestDiff) {
-              best = pt.time as number;
-              bestDiff = diff;
-            }
-          }
-          markers.push({ time: best, position: "aboveBar", color: "#f59e0b", shape: "arrowDown", text: `Exit ${s.shares}` });
+          const snapped = snapToSeries(toSec(s.at));
+          if (snapped) markers.push({ time: snapped, position: "aboveBar", color: "#f59e0b", shape: "arrowDown", text: `Exit ${s.shares}` });
         }
       }
     }
@@ -689,16 +704,18 @@ function ChartView({
     pos?.entryAt,
     pos?.open,
     pos?.ticker,
+    tickInfo?.stopPct,
+    tickInfo?.targetPct,
   ]);
 
   const rr = useMemo(() => {
-    if (!(pos?.open && pos?.entryPrice && pos?.stopLoss)) return null;
-    const risk = Math.abs(pos.entryPrice - pos.stopLoss);
+    if (!(pos?.open && pos?.entryPrice && (pos?.stopLoss ?? null) != null)) return null;
+    const risk = Math.abs(pos.entryPrice - (pos.stopLoss as number));
     if (risk <= 0) return null;
     const p = hover?.price;
     if (p == null) return null;
     const tp = pos.takeProfit ?? undefined;
-    return { rToStop: (p - pos.stopLoss) / risk, rToTP: tp != null ? (tp - p) / risk : undefined };
+    return { rToStop: (p - (pos.stopLoss as number)) / risk, rToTP: tp != null ? (tp - p) / risk : undefined };
   }, [hover?.price, pos?.entryPrice, pos?.stopLoss, pos?.takeProfit, pos?.open]);
 
   const panicDisabled = !(pos?.open && (pos.shares ?? 0) !== 0);
@@ -821,17 +838,31 @@ export default function TradeChartPanel({
   // Position view derived from tick (if any)
   const pos = usePositionFromTick(tick);
 
+  // Prefer server “sticky view” symbol so chart persists AFTER exit
+  const stickyViewSymbol: string | null = tick?.view?.symbol ?? null;
+
   // Which symbol to chart:
   const symbol: string | null =
-    currentSymbol ?? (isMarketHoursET() && symbolWhenFlat ? String(symbolWhenFlat) : null);
+    stickyViewSymbol ??
+    currentSymbol ??
+    (isMarketHoursET() && symbolWhenFlat ? String(symbolWhenFlat) : null);
 
-  // We keep the big view mounted ALWAYS (hidden until open)
+  // Keep the big view mounted ALWAYS (hidden until open)
   const [bigOpen, setBigOpen] = useState(false);
   const paused = false; // keep hot
 
   const hasOpen = !!pos?.open && !!pos?.ticker;
-  const { candles } = useCandles1m(symbol, hasOpen || !!currentSymbol, 30000, 120000, 180, paused);
+  const { candles } = useCandles1m(symbol, hasOpen || !!currentSymbol || !!stickyViewSymbol, 30000, 120000, 240, paused);
   const todayTrades = useTodayTrades(symbol, 30000, paused);
+
+  // Pass stop/target pct for fallback SL/TP drawing when backend omits them
+  const tickInfo = useMemo(
+    () => ({
+      stopPct: typeof tick?.info?.stopPct === "number" ? tick.info.stopPct : undefined,
+      targetPct: typeof tick?.info?.targetPct === "number" ? tick.info.targetPct : undefined,
+    }),
+    [tick?.info?.stopPct, tick?.info?.targetPct]
+  );
 
   return (
     <>
@@ -844,6 +875,7 @@ export default function TradeChartPanel({
           todayTrades={todayTrades as any}
           pos={pos}
           dayPnl={null}
+          tickInfo={tickInfo as any}
           showPopOut
           onPopOut={() => setBigOpen(true)}
         />
@@ -881,6 +913,7 @@ export default function TradeChartPanel({
             todayTrades={todayTrades as any}
             pos={pos}
             dayPnl={null}
+            tickInfo={tickInfo as any}
             showClose
             onClose={() => setBigOpen(false)}
           />
