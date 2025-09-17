@@ -187,6 +187,17 @@ async function hasBuyAfter946TodayDB(): Promise<boolean> {
   return !!buy;
 }
 
+/** NEW: daywide check – has any BUY occurred today (from 00:00 ET)? */
+async function hasAnyBuyTodayDB(): Promise<boolean> {
+  const etNow = new Date(nowET().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const dayStartET = new Date(etNow); dayStartET.setHours(0, 0, 0, 0);
+  const buy = await prisma.trade.findFirst({
+    where: { side: "BUY", at: { gte: dayStartET, lte: nowET() } },
+    orderBy: { at: "desc" },
+  });
+  return !!buy;
+}
+
 /* -------------------------- buy-the-dip -------------------------- */
 const DIP_MIN_PCT = 0.07;
 const DIP_MAX_PCT = 0.20;
@@ -401,7 +412,7 @@ function dipArmedNow(params: { candles: Candle[]; todayYMD: string; vwap: number
   const minLow = dayMinLowSoFar(candles, todayYMD);
   if (open930 == null || minLow == null || open930 <= 0) return { armed: false, meta: { reason: "missing_open_or_min" } };
   const pullbackPct = (open930 - minLow) / open930;
-  const withinDipBand = pullbackPct >= DIP_MIN_PCT && pullbackPct <= DIP_MAX_PCT;
+  const withinDipBand = pullbackPct >= DIP_MIN_PCT && DIP_MAX_PCT >= pullbackPct;
   const brokePrevHigh = last.close > prev.high;
   const reclaimedVWAP = vwap != null ? last.close >= vwap : false;
   const confirmOK = DIP_CONFIRM_EITHER ? (brokePrevHigh || reclaimedVWAP) : (brokePrevHigh && reclaimedVWAP);
@@ -915,97 +926,105 @@ async function handle(req: Request) {
         }
       }
 
-      // Force window 09:45–09:46
+      // Force window 09:45–09:46  (NOW GUARDED BY ANY-BUY-TODAY)
       if (!openPos && marketOpen && inForceWindow() && state!.lastRunDay !== today) {
-        let snapshot = await getSnapshot(base);
-        let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
-        if (!top.length && lastGoodSnapshot && lastGoodSnapshotDay === today) {
-          top = lastGoodSnapshot.stocks.slice(0, TOP_CANDIDATES);
-          debug.used_last_good_snapshot_force = true;
-        }
-        const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
-        const candidates = affordableTop.length ? affordableTop : top;
+        if (await hasAnyBuyTodayDB()) {
+          debug.reasons.push("force_skipped_buy_exists_today");
+        } else {
+          let snapshot = await getSnapshot(base);
+          let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
+          if (!top.length && lastGoodSnapshot && lastGoodSnapshotDay === today) {
+            top = lastGoodSnapshot.stocks.slice(0, TOP_CANDIDATES);
+            debug.used_last_good_snapshot_force = true;
+          }
+          const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
+          const candidates = affordableTop.length ? affordableTop : top;
 
-        debug.force_top = candidates.map((s) => s.ticker);
-        debug.force_affordable_count = affordableTop.length;
+          debug.force_top = candidates.map((s) => s.ticker);
+          debug.force_affordable_count = affordableTop.length;
 
-        const BURST_TRIES = 12;
-        const BURST_DELAY_MS = 300;
+          const BURST_TRIES = 12;
+          const BURST_DELAY_MS = 300;
 
-        for (let i = 0; i < BURST_TRIES && !openPos; i++) {
-          const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
-          if (lastRecRow?.ticker) lastRec = lastRecRow;
+          for (let i = 0; i < BURST_TRIES && !openPos; i++) {
+            const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
+            if (lastRecRow?.ticker) lastRec = lastRecRow;
 
-          const picks = [primary, secondary].filter(Boolean) as string[];
-          if (!picks.length) {
-            debug.reasons.push(`force_no_ai_pick_iter_${i}`);
+            const picks = [primary, secondary].filter(Boolean) as string[];
+            if (!picks.length) {
+              debug.reasons.push(`force_no_ai_pick_iter_${i}`);
+              await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
+              continue;
+            }
+
+            debug[`force_iter_${i}_picks`] = picks;
+
+            let entered = false;
+            for (const sym of picks) {
+              let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
+              if (!Number.isFinite(Number(ref))) {
+                const q = await fmpQuoteCached(sym!);
+                const p = priceFromFmp(q);
+                if (p != null) ref = p;
+              }
+              if (ref == null || !Number.isFinite(Number(ref))) {
+                debug.reasons.push(`force_no_price_for_entry_${sym}`);
+                continue;
+              }
+              if (ref < PRICE_MIN || ref > PRICE_MAX) {
+                debug.reasons.push(`force_price_band_fail_${sym}_${ref.toFixed(2)}`);
+                continue;
+              }
+              const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
+              const spreadOK = await memoSpreadGuardOK(sym!, spreadLimit); // ⬅️ memoized
+              if (!spreadOK) {
+                debug.reasons.push(`force_spread_guard_fail_${sym}_limit=${(spreadLimit*100).toFixed(2)}%`);
+                continue;
+              }
+
+              const claim = await prisma.botState.updateMany({
+                where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: yyyyMmDdET() } }] },
+                data: { lastRunDay: yyyyMmDdET() },
+              });
+              const claimed = claim.count === 1;
+              if (!claimed) continue;
+
+              const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+              if (already) continue;
+
+              const placed = await placeEntryNow(sym!, Number(ref), state!);
+              if (placed.ok) {
+                debug.lastMessage = `✅ 09:45 FORCE BUY (guards ok) ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares})`;
+                openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+                entered = true;
+                break;
+              } else {
+                debug.reasons.push(`force_place_entry_failed_${sym}:${placed.reason}`);
+                await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+              }
+            }
+            if (entered) break;
             await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
-            continue;
           }
-
-          debug[`force_iter_${i}_picks`] = picks;
-
-          let entered = false;
-          for (const sym of picks) {
-            let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
-            if (!Number.isFinite(Number(ref))) {
-              const q = await fmpQuoteCached(sym!);
-              const p = priceFromFmp(q);
-              if (p != null) ref = p;
-            }
-            if (ref == null || !Number.isFinite(Number(ref))) {
-              debug.reasons.push(`force_no_price_for_entry_${sym}`);
-              continue;
-            }
-            if (ref < PRICE_MIN || ref > PRICE_MAX) {
-              debug.reasons.push(`force_price_band_fail_${sym}_${ref.toFixed(2)}`);
-              continue;
-            }
-            const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
-            const spreadOK = await memoSpreadGuardOK(sym!, spreadLimit); // ⬅️ memoized
-            if (!spreadOK) {
-              debug.reasons.push(`force_spread_guard_fail_${sym}_limit=${(spreadLimit*100).toFixed(2)}%`);
-              continue;
-            }
-
-            const claim = await prisma.botState.updateMany({
-              where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: yyyyMmDdET() } }] },
-              data: { lastRunDay: yyyyMmDdET() },
-            });
-            const claimed = claim.count === 1;
-            if (!claimed) continue;
-
-            const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-            if (already) continue;
-
-            const placed = await placeEntryNow(sym!, Number(ref), state!);
-            if (placed.ok) {
-              debug.lastMessage = `✅ 09:45 FORCE BUY (guards ok) ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares})`;
-              openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-              entered = true;
-              break;
-            } else {
-              debug.reasons.push(`force_place_entry_failed_${sym}:${placed.reason}`);
-              await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-            }
-          }
-          if (entered) break;
-          await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
         }
       }
 
-      // End-of-force failsafe: clear lock
+      // End-of-force failsafe: clear lock ONLY if no buy happened today
       if (!openPos && inEndOfForceFailsafe()) {
-        if (state!.lastRunDay === yyyyMmDdET()) {
+        const anyBuyToday = await hasAnyBuyTodayDB();
+        if (!anyBuyToday && state!.lastRunDay === yyyyMmDdET()) {
           await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
           (debug.reasons as string[]).push("force_failsafe_cleared_day_lock");
+        } else {
+          (debug.reasons as string[]).push("force_failsafe_kept_day_lock_due_to_buy_today");
         }
       }
 
       /* --------------------- SECOND ATTEMPT 10:00–10:01 --------------------- */
       if (!openPos && marketOpen && inSecondForceWindow() && state!.lastRunDay !== today) {
-        if (await hasBuyAfter946TodayDB()) {
-          debug.reasons.push("second_force_skipped_buy_after_946");
+        // NEW: skip if ANY buy already occurred today (covers 9:45 fills)
+        if (await hasAnyBuyTodayDB()) {
+          debug.reasons.push("second_force_skipped_buy_exists_today");
         } else {
           let snapshot = await getSnapshot(base);
           let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
@@ -1086,11 +1105,14 @@ async function handle(req: Request) {
         }
       }
 
-      // End-of-second-force failsafe: clear day-lock if nothing filled by ~10:01:30
+      // End-of-second-force failsafe: clear day-lock ONLY if no buy happened today
       if (!openPos && inEndOfSecondForceFailsafe()) {
-        if (state!.lastRunDay === yyyyMmDdET()) {
+        const anyBuyToday = await hasAnyBuyTodayDB();
+        if (!anyBuyToday && state!.lastRunDay === yyyyMmDdET()) {
           await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
           debug.reasons.push("second_force_failsafe_cleared_day_lock");
+        } else {
+          debug.reasons.push("second_force_failsafe_kept_day_lock_due_to_buy_today");
         }
       }
 
