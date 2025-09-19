@@ -35,14 +35,11 @@ const MIN_TICK_MS = 200;
 
 const START_CASH = 4000;
 const INVEST_BUDGET = 4000;
-
-// NOTE: TARGET_PCT is still 10% as the "strong" default.
-// For weak setups we override per-trade TP to 5% (see placeEntryNow()).
-const TARGET_PCT = 0.10;   // strong TP default (+10% from fill)
-const STOP_PCT = -0.05;    // SL -5% from fill
+const TARGET_PCT = 0.10;   // +10% TP from *fill*
+const STOP_PCT = -0.05;    // -5% SL from fill (initial)
 const TOP_CANDIDATES = 8;
 
-/** Disable legacy ratchet/trailing */
+/** Disable any legacy ratchet so it doesn't interfere */
 const RATCHET_ENABLED = false;
 const RATCHET_STEP_PCT = 0.05;
 const RATCHET_LIFT_BROKER_CHILDREN = false;
@@ -81,8 +78,8 @@ const DIP_MAX_PCT = 0.20;          // up to 20% pullback
 const DIP_CONFIRM_EITHER = true;   // either prior-high break OR VWAP reclaim is enough
 
 /* -------------------------- spread/account memo -------------------------- */
-const SPREAD_TTL_MS = 1200;  // reuse spread result ~1.2s
-const ACCOUNT_TTL_MS = 3000; // reuse account snapshot ~3s
+const SPREAD_TTL_MS = 1200;  // reuse spread result for ~1.2s
+const ACCOUNT_TTL_MS = 3000; // reuse account snapshot for ~3s
 
 const _spreadMemo = new Map<string, { t: number; v: boolean }>();
 async function memoSpreadGuardOK(symbol: string, limitPct: number) {
@@ -90,6 +87,7 @@ async function memoSpreadGuardOK(symbol: string, limitPct: number) {
   const now = Date.now();
   const hit = _spreadMemo.get(key);
   if (hit && now - hit.t < SPREAD_TTL_MS) return hit.v;
+
   const v = await spreadGuardOK(symbol, limitPct);
   _spreadMemo.set(key, { t: now, v });
   return v;
@@ -99,6 +97,7 @@ let _acctMemo: { t: number; v: any } | null = null;
 async function memoGetAccount() {
   const now = Date.now();
   if (_acctMemo && now - _acctMemo.t < ACCOUNT_TTL_MS) return _acctMemo.v;
+
   const v = await getAccount();
   _acctMemo = { t: now, v };
   return v;
@@ -165,7 +164,7 @@ function isMandatoryExitET() {
   return mins >= (15 * 60 + 50);
 }
 
-/* >>>>>>>>>>>>>>> helper for early spread <<<<<<<<<<<<<<< */
+/* >>>>>>>>>>>>>>> constant spread helper (kept) <<<<<<<<<<<<<<< */
 function inWindow930to945ET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
@@ -186,12 +185,15 @@ async function hasBuyAfter946TodayDB(): Promise<boolean> {
   const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const start946 = new Date(etNow);
   start946.setHours(9, 46, 0, 0);
+
   const buy = await prisma.trade.findFirst({
     where: { side: "BUY", at: { gte: start946, lte: nowET() } },
     orderBy: { at: "desc" },
   });
   return !!buy;
 }
+
+/** NEW: daywide check – has any BUY occurred today (from 00:00 ET)? */
 async function hasAnyBuyTodayDB(): Promise<boolean> {
   const etNow = new Date(nowET().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const dayStartET = new Date(etNow); dayStartET.setHours(0, 0, 0, 0);
@@ -424,6 +426,22 @@ function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" |
   return toPct(base);
 }
 
+/* -------------------------- ratchet targets (kept but disabled) -------------------------- */
+function computeRatchetTargets(entry: number, dayHighSinceOpen: number) {
+  if (!RATCHET_ENABLED) return null;
+  if (!Number.isFinite(entry) || !Number.isFinite(dayHighSinceOpen) || entry <= 0) return null;
+  const upFromEntry = dayHighSinceOpen / entry - 1;
+  const step = Math.max(0.0001, RATCHET_STEP_PCT);
+  const steps = Math.max(0, Math.floor(upFromEntry / step));
+  const factor = Math.pow(1 + step, steps);
+  const initialSL = entry * (1 + STOP_PCT);
+  const initialTP = entry * (1 + TARGET_PCT);
+  const dynSL = Math.max(initialSL, initialSL * factor);
+  const dynTP = initialTP * factor;
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  return { steps, dynSL: round2(dynSL), dynTP: round2(dynTP), initialSL: round2(initialSL), initialTP: round2(initialTP) };
+}
+
 /* -------------------------- premarket memo -------------------------- */
 type PreMemo = { pmHigh: number; pmLow: number; pmVol: number; fetchedAt: number };
 const scanMemo: Record<string, PreMemo> = {};
@@ -553,8 +571,19 @@ function sizeForScoreOptionA(score: number): { sizeMult: number; label: "full"|"
   return { sizeMult: SIZE_MICRO, label: "micro" }; // score = 0
 }
 
-/* -------------------------- order helper (ACCEPTS sizeMult + tpPct) -------------------------- */
-async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult = 1.0, tpPct = TARGET_PCT) {
+/* Light eval for force windows (to get points for size) */
+async function quickScoreForSymbol(sym: string, snapshot: { stocks: SnapStock[] } | null, today: string, baseUrl: string) {
+  try {
+    const e = await evaluateEntrySignals(sym, snapshot, today, baseUrl);
+    const s = scoreSetup(e);
+    return { e, s };
+  } catch {
+    return { e: null, s: { score: 0, reasons: ["quickScore_error"] } as SetupScore };
+  }
+}
+
+/* -------------------------- order helper (ACCEPTS sizeMult) -------------------------- */
+async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult = 1.0) {
   const cashNum = Number(state!.cash);
 
   // base budget capped by INVEST_BUDGET, scaled by size tier
@@ -565,7 +594,7 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
   if (shares <= 0) return { ok: false, reason: `insufficient_cash_for_one_share_ref_${ticker}_${ref.toFixed(2)}` };
 
   // 1) Place temporary bracket off the ref (instant protection)
-  const tmpTp = ref * (1 + tpPct);
+  const tmpTp = ref * (1 + TARGET_PCT);
   const tmpSl = ref * (1 + STOP_PCT);
 
   let order;
@@ -597,7 +626,7 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
   if (!Number.isFinite(entry)) entry = ref; // fallback
 
   // 3) Recenter TP/SL from REAL fill (force=true to allow TP to go down)
-  const newTp = Math.round(entry * (1 + tpPct) * 100) / 100;
+  const newTp = Math.round(entry * (1 + TARGET_PCT) * 100) / 100;
   const newSl = Math.round(entry * (1 + STOP_PCT) * 100) / 100;
   try {
     await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true });
@@ -730,7 +759,7 @@ async function handle(req: Request) {
         } catch (e: any) { debug.reasons.push(`presc_exception:${e?.message || "unknown"}`); }
       }
 
-      // Scan 09:30–09:44 — Option A sizing + TP override (weak=5%)
+      // Scan 09:30–09:44 — Option A sizing
       if (!openPos && marketOpen && inScanWindow() && state!.lastRunDay !== today) {
         let snapshot = await getSnapshot(base);
         let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
@@ -804,12 +833,11 @@ async function handle(req: Request) {
                   const chosenEval = evals[chosen]!;
                   const { score, reasons } = scoreSetup(chosenEval);
                   const { sizeMult, label } = sizeForScoreOptionA(score);
-                  const tpPct = score >= 2 ? 0.10 : 0.05; // strong=10%, weak=5%
-                  debug.scan_choice_scoring = { chosen, score, sizeLabel: label, tpPct, reasons, ref };
+                  debug.scan_choice_scoring = { chosen, score, sizeLabel: label, reasons, ref };
 
-                  const placed = await placeEntryNow(chosen, Number(ref), state, sizeMult, tpPct);
+                  const placed = await placeEntryNow(chosen, Number(ref), state, sizeMult);
                   if (placed.ok) {
-                    debug.lastMessage = `BUY (${chosenEval.armedDip ? "Buy-the-Dip" : "Balanced"}) ${chosen} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
+                    debug.lastMessage = `BUY (${chosenEval.armedDip ? "Buy-the-Dip" : "Balanced"}) ${chosen} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score})`;
                     openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
                   } else {
                     debug.reasons.push(`scan_place_entry_failed_${chosen}:${placed.reason}`);
@@ -827,7 +855,7 @@ async function handle(req: Request) {
         }
       }
 
-      // Force window 09:45–09:46 — Option A sizing + TP override
+      // Force window 09:45–09:46 — Option A sizing
       if (!openPos && marketOpen && inForceWindow() && state!.lastRunDay !== today) {
         if (await hasAnyBuyTodayDB()) {
           debug.reasons.push("force_skipped_buy_exists_today");
@@ -893,26 +921,18 @@ async function handle(req: Request) {
               const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
               if (already) continue;
 
-              // quick score for size + tp
-              try {
-                const evalRes = await evaluateEntrySignals(sym!, snapshot, yyyyMmDdET(), base);
-                const { score, reasons } = scoreSetup(evalRes);
-                const { sizeMult, label } = sizeForScoreOptionA(score);
-                const tpPct = score >= 2 ? 0.10 : 0.05;
-                debug[`force_score_${sym}`] = { score, sizeLabel: label, reasons, ref, tpPct };
+              const { s } = await quickScoreForSymbol(sym!, snapshot, yyyyMmDdET(), base);
+              const { sizeMult, label } = sizeForScoreOptionA(s.score);
+              debug[`force_score_${sym}`] = { score: s.score, sizeLabel: label, reasons: s.reasons, ref };
 
-                const placed = await placeEntryNow(sym!, Number(ref), state!, sizeMult, tpPct);
-                if (placed.ok) {
-                  debug.lastMessage = `09:45 FORCE BUY ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
-                  openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-                  entered = true;
-                  break;
-                } else {
-                  debug.reasons.push(`force_place_entry_failed_${sym}:${placed.reason}`);
-                  await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-                }
-              } catch (e:any) {
-                debug.reasons.push(`force_eval_exception_${sym}:${e?.message||"unknown"}`);
+              const placed = await placeEntryNow(sym!, Number(ref), state!, sizeMult);
+              if (placed.ok) {
+                debug.lastMessage = `09:45 FORCE BUY ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${s.score})`;
+                openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+                entered = true;
+                break;
+              } else {
+                debug.reasons.push(`force_place_entry_failed_${sym}:${placed.reason}`);
                 await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
               }
             }
@@ -933,7 +953,7 @@ async function handle(req: Request) {
         }
       }
 
-      /* --------------------- SECOND ATTEMPT 10:00–10:01 (Option A + TP override) --------------------- */
+      /* --------------------- SECOND ATTEMPT 10:00–10:01 (Option A sizing) --------------------- */
       if (!openPos && marketOpen && inSecondForceWindow() && state!.lastRunDay !== today) {
         if (await hasAnyBuyTodayDB()) {
           debug.reasons.push("second_force_skipped_buy_exists_today");
@@ -999,25 +1019,18 @@ async function handle(req: Request) {
               const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
               if (already) continue;
 
-              try {
-                const evalRes = await evaluateEntrySignals(sym!, snapshot, yyyyMmDdET(), base);
-                const { score, reasons } = scoreSetup(evalRes);
-                const { sizeMult, label } = sizeForScoreOptionA(score);
-                const tpPct = score >= 2 ? 0.10 : 0.05;
-                debug[`second_force_score_${sym}`] = { score, sizeLabel: label, reasons, ref, tpPct };
+              const { s } = await quickScoreForSymbol(sym!, snapshot, yyyyMmDdET(), base);
+              const { sizeMult, label } = sizeForScoreOptionA(s.score);
+              debug[`second_force_score_${sym}`] = { score: s.score, sizeLabel: label, reasons: s.reasons, ref };
 
-                const placed = await placeEntryNow(sym!, Number(ref), state!, sizeMult, tpPct);
-                if (placed.ok) {
-                  debug.lastMessage = `10:00 SECOND FORCE BUY ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
-                  openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-                  entered = true;
-                  break;
-                } else {
-                  debug.reasons.push(`second_force_place_entry_failed_${sym}:${placed.reason}`);
-                  await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-                }
-              } catch (e:any) {
-                debug.reasons.push(`second_force_eval_exception_${sym}:${e?.message||"unknown"}`);
+              const placed = await placeEntryNow(sym!, Number(ref), state!, sizeMult);
+              if (placed.ok) {
+                debug.lastMessage = `10:00 SECOND FORCE BUY ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${s.score})`;
+                openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+                entered = true;
+                break;
+              } else {
+                debug.reasons.push(`second_force_place_entry_failed_${sym}:${placed.reason}`);
                 await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
               }
             }
