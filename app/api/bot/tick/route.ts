@@ -23,9 +23,9 @@ import {
 import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
 /* -------------------------- sizing tiers -------------------------- */
-const SIZE_FULL = 1.00;   // default
-const SIZE_HALF = 0.50;   // for clearly weak-but-not-awful
-const SIZE_MICRO = 0.25;  // for obvious garbage only
+const SIZE_FULL = 1.0;   // default
+const SIZE_HALF = 0.5;   // for clearly weak-but-not-awful
+const SIZE_MICRO = 0.25; // for obvious garbage only
 
 /* -------------------------- throttle & config -------------------------- */
 let lastTickAt = 0;
@@ -42,12 +42,26 @@ const TARGET_PCT = 0.10;   // strong TP default (+10% from fill)
 const STOP_PCT = -0.05;    // SL -5% from fill
 const TOP_CANDIDATES = 8;
 
-/** Disable legacy ratchet/trailing */
-const RATCHET_ENABLED = false;
+/** ENABLE the staircase ratchet (only raises stop) */
+const RATCHET_ENABLED = true;
+
+/** 5% staircase: +5% → BE, +10% → +5%, +15% → +10%, ... */
 const RATCHET_STEP_PCT = 0.05;
-const RATCHET_LIFT_BROKER_CHILDREN = false;
+
+/** We lift the broker OCO stop child in-place (no virtual exits) */
+const RATCHET_LIFT_BROKER_CHILDREN = true;
 const RATCHET_VIRTUAL_EXITS = false;
-const LIFT_COOLDOWN_MS = 6000;
+
+/** Cooldown between lifts to avoid thrash (ms) */
+const LIFT_COOLDOWN_MS = 12000;
+
+/** Max tightness: never place stop tighter than 5% below high-water */
+const MAX_TIGHTNESS_BEHIND_HIGH = 0.05;
+
+/** Require at least 2 cents improvement before lifting */
+const MIN_SL_IMPROVE_CENTS = 0.02;
+
+/** legacy ratchet memory (not used) */
 const ratchetLiftMemo: Record<string, { lastStep: number; lastLiftAt: number }> = {};
 
 /* -------------------------- dynamic thresholds -------------------------- */
@@ -120,6 +134,7 @@ function priceFromFmp(q: any): number | null {
   const n = Number(q?.price ?? q?.c ?? q?.close ?? q?.previousClose);
   return Number.isFinite(n) ? n : null;
 }
+function round2(x: number) { return Math.round(x * 100) / 100; }
 
 function getBaseUrl(req: Request) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
@@ -580,6 +595,8 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     });
   } catch (e: any) {
     const msg = e?.message || "unknown";
+    the: {
+    }
     const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
@@ -597,11 +614,15 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
   if (!Number.isFinite(entry)) entry = ref; // fallback
 
   // 3) Recenter TP/SL from REAL fill (force=true to allow TP to go down)
-  const newTp = Math.round(entry * (1 + tpPct) * 100) / 100;
-  const newSl = Math.round(entry * (1 + STOP_PCT) * 100) / 100;
+  const newTp = round2(entry * (1 + tpPct));
+  const newSl = round2(entry * (1 + STOP_PCT));
   try {
     await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true });
   } catch {}
+
+  // Initialize ratchet state + SL memo at entry
+  ratchetState[ticker] = { entry, high: entry, lastRung: 0, lastLiftAt: 0 };
+  lastDynSLMemo[ticker] = { day: yyyyMmDdET(), sl: newSl };
 
   // 4) Persist entry
   await prisma.position.create({ data: { ticker, entryPrice: entry, shares, open: true, brokerOrderId: order.id } });
@@ -614,11 +635,15 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
   return { ok: true, shares };
 }
 
-/* -------------------------- memos (no trailing/partials) -------------------------- */
+/* -------------------------- memos (ratchet + SL tracking) -------------------------- */
 const partialTPMemo: Record<string, { day: string; taken: boolean }> = {};
 const lastDynSLMemo: Record<string, { day: string; sl: number }> = {};
 type TrailState = { day: string; active: boolean; anchor: number };
 const trailHalfMemo: Record<string, TrailState> = {};
+
+// New: per-symbol ratchet state (entry, high-water, last rung hit, last lift time)
+type RatchetState = { entry: number; high: number; lastRung: number; lastLiftAt: number };
+const ratchetState: Record<string, RatchetState> = {};
 
 /* -------------------------- handlers -------------------------- */
 export async function GET(req: Request) { return handle(req); }
@@ -1039,7 +1064,7 @@ async function handle(req: Request) {
         }
       }
 
-      // Holding loop — exits handled ONLY by broker bracket (no trailing/partials)
+      // Holding loop — exits handled by broker bracket (PLUS: 5% staircase ratchet that only lifts SL)
       if (openPos) {
         const q = await fmpQuoteCached(openPos.ticker);
         const pParsed = priceFromFmp(q);
@@ -1051,6 +1076,76 @@ async function handle(req: Request) {
           if (Number(state!.equity) !== equityNow) {
             state = await prisma.botState.update({ where: { id: 1 }, data: { equity: equityNow } });
           }
+
+          // -------- 5% STAIRCASE RATCHET (only-up stop) --------
+          if (RATCHET_ENABLED && RATCHET_LIFT_BROKER_CHILDREN) {
+            const sym = openPos.ticker;
+            const entry = Number(openPos.entryPrice);
+            if (!ratchetState[sym]) {
+              ratchetState[sym] = { entry, high: Math.max(entry, p), lastRung: 0, lastLiftAt: 0 };
+            }
+            const rs = ratchetState[sym];
+            rs.high = Math.max(rs.high, p); // update high-water
+
+            const gainPct = (rs.high - rs.entry) / rs.entry;
+            const rungIndex = Math.floor(gainPct / RATCHET_STEP_PCT); // 0,1,2,...
+
+            // Determine staircase stop relative to entry:
+            // rung 0 => initial stop (-5%), rung 1 => 0% (BE), rung 2 => +5%, rung 3 => +10%, ...
+            const candidatePctFromEntry = Math.max(0, (rungIndex - 1) * RATCHET_STEP_PCT);
+            const candidateSL = round2(rs.entry * (1 + candidatePctFromEntry));
+
+            // Cap tightness: don't clamp tighter than 5% below high-water
+            const maxTightStop = round2(rs.high * (1 - MAX_TIGHTNESS_BEHIND_HIGH));
+            const targetSL = Math.min(candidateSL, maxTightStop);
+
+            // Current SL memo (or initial -5% if unset)
+            const curMemo = lastDynSLMemo[sym]?.sl ?? round2(rs.entry * (1 + STOP_PCT));
+
+            // Only lift if improved, rung advanced, and cooldown OK
+            const improvedBy = targetSL - curMemo;
+            const nowMs = Date.now();
+            const cooldownOK = nowMs - (rs.lastLiftAt || 0) >= LIFT_COOLDOWN_MS;
+
+            if (rungIndex > rs.lastRung && improvedBy >= MIN_SL_IMPROVE_CENTS && cooldownOK) {
+              try {
+                await (replaceTpSlIfBetter as any)({
+                  symbol: sym,
+                  newSl: targetSL,
+                  force: false, // NEVER lower stop
+                });
+                lastDynSLMemo[sym] = { day: yyyyMmDdET(), sl: targetSL };
+                rs.lastRung = rungIndex;
+                rs.lastLiftAt = nowMs;
+
+                debug.ratchet = {
+                  symbol: sym,
+                  entry: rs.entry,
+                  high: rs.high,
+                  rungIndex,
+                  candidatePctFromEntry: Number((candidatePctFromEntry * 100).toFixed(1)) + "%",
+                  targetSL,
+                  maxTightStop,
+                  improvedBy: Number(improvedBy.toFixed(2)),
+                  liftedAt: new Date(nowMs).toISOString(),
+                };
+              } catch (e: any) {
+                debug.reasons.push(`ratchet_lift_failed_${sym}:${e?.message || "unknown"}`);
+              }
+            } else {
+              debug.ratchet = {
+                symbol: sym,
+                entry: rs.entry,
+                high: rs.high,
+                rungIndex,
+                curSL: curMemo,
+                targetSL,
+                cooldownOK,
+                improvedBy: Number(improvedBy.toFixed(2)),
+              };
+            }
+          }
+          // -------- end staircase ratchet --------
         }
       } else if (lastRec?.ticker) {
         const q = await fmpQuoteCached(lastRec.ticker);
