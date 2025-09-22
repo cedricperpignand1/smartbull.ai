@@ -24,7 +24,7 @@ import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
 /* -------------------------- sizing tiers -------------------------- */
 const SIZE_FULL = 1.0;   // default
-const SIZE_HALF = 0.65;   // for clearly weak-but-not-awful
+const SIZE_HALF = 0.75;   // for clearly weak-but-not-awful
 const SIZE_MICRO = 0.50; // for obvious garbage only
 
 /* -------------------------- throttle & config -------------------------- */
