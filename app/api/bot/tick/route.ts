@@ -725,7 +725,7 @@ async function handle(req: Request) {
       const marketOpen = isMarketHoursET();
 
       // Pre-scan 09:14–09:29
-      if (!openPos && marketOpen && inPreScanWindow()) {
+      if (!openPos && inPreScanWindow()) {
         const snapshot = await getSnapshot(base);
         const top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
         const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
