@@ -23,9 +23,9 @@ import {
 import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
 /* -------------------------- sizing tiers -------------------------- */
-const SIZE_FULL = 1.0;   // default
-const SIZE_HALF = 0.75;   // for clearly weak-but-not-awful
-const SIZE_MICRO = 0.50; // for obvious garbage only
+const SIZE_FULL = 1.0;  // default
+const SIZE_HALF = 0.75; // your requested mid tier
+const SIZE_MICRO = 0.50; // smaller tier
 
 /* -------------------------- throttle & config -------------------------- */
 let lastTickAt = 0;
@@ -595,8 +595,6 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     });
   } catch (e: any) {
     const msg = e?.message || "unknown";
-    the: {
-    }
     const body = e?.body ? JSON.stringify(e.body).slice(0, 300) : "";
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
@@ -1203,7 +1201,11 @@ async function handle(req: Request) {
   } catch (e: any) {
     const msg = e?.message || "unknown";
     const stack = typeof e?.stack === "string" ? e.stack.split("\n").slice(0, 6).join("\n") : undefined;
-    return NextResponse.json({ error: true, message: msg, stack }, { status: 500 });
+    // FIX: NextResponse.json older types expect 1 arg; use the base constructor with status.
+    return new NextResponse(
+      JSON.stringify({ error: true, message: msg, stack }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
   }
 }
 
