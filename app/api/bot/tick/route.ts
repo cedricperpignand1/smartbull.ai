@@ -309,6 +309,62 @@ function dipArmedNow(params: { candles: Candle[]; todayYMD: string; vwap: number
   return { armed, meta: { open930, minLow, pullbackPct, withinDipBand, brokePrevHigh, reclaimedVWAP, lastGreen } };
 }
 
+/* -------------------------- higher-low detection (9:30–9:44) -------------------------- */
+function inWindow9344ET(dateIso: string): boolean {
+  const d = toET(dateIso);
+  const mins = d.getHours() * 60 + d.getMinutes();
+  return mins >= 9 * 60 + 30 && mins <= 9 * 60 + 44;
+}
+
+/** Find a higher-low after the first dip from the 9:30 open. */
+function computeHigherLowAfterOpen(candles: Candle[], todayYMD: string) {
+  const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
+  if (day.length < 5) return { ok: false };
+
+  const open930 = sessionOpenAt930(candles, todayYMD);
+  if (open930 == null) return { ok: false };
+
+  const win = day.filter((c) => inWindow9344ET(c.date));
+  if (win.length < 3) return { ok: false };
+
+  // Step 1: first local low after 9:30 (initial dip)
+  let firstLowIdx = 0;
+  let firstLow = Infinity;
+  for (let i = 0; i < Math.min(win.length, 8); i++) {
+    if (win[i].low < firstLow) {
+      firstLow = win[i].low;
+      firstLowIdx = i;
+    }
+  }
+  if (!Number.isFinite(firstLow)) return { ok: false };
+
+  // Step 2: find higher-low after that dip
+  let higherLow = Infinity;
+  let higherLowIdx = -1;
+  for (let i = firstLowIdx + 1; i < win.length; i++) {
+    const bar = win[i];
+    if (bar.low < higherLow && bar.low > firstLow) {
+      higherLow = bar.low;
+      higherLowIdx = i;
+    }
+  }
+  if (!Number.isFinite(higherLow) || higherLowIdx < 0) return { ok: false };
+
+  // Step 3: confirmation — close above prior bar high
+  let confirmClose: number | null = null;
+  for (let i = higherLowIdx + 1; i < win.length; i++) {
+    const bar = win[i];
+    const prev = win[i - 1];
+    if (bar.close > prev.high) {
+      confirmClose = bar.close;
+      break;
+    }
+  }
+  if (confirmClose == null) return { ok: false };
+
+  return { ok: true, firstLow, higherLow, confirmBarClose: confirmClose };
+}
+
 /* -------------------------- balanced decay & spread -------------------------- */
 function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
@@ -454,6 +510,7 @@ async function evaluateEntrySignals(
   armed: boolean;
   armedMomentum: boolean;
   armedDip: boolean;
+  armedHigherLow: boolean;
   refPrice: number | null;
   meta: any;
   debug: any;
@@ -462,20 +519,24 @@ async function evaluateEntrySignals(
   const candles = await fetchCandles1m(ticker, 240, baseUrl);
   const day = candles.filter((c) => isSameETDay(toET(c.date), today));
   if (!day.length) {
-    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: null, meta: { reason: "no_day_candles" }, debug: dbg };
+    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, armedHigherLow: false, refPrice: null, meta: { reason: "no_day_candles" }, debug: dbg };
   }
   const last = day[day.length - 1];
 
+  // price band
   if (last.close < PRICE_MIN || last.close > PRICE_MAX) {
-    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "price_band" }, debug: dbg };
+    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, armedHigherLow: false, refPrice: last.close, meta: { reason: "price_band" }, debug: dbg };
   }
+
+  // spread guard (scan phase)
   const spreadLimit = dynamicSpreadLimitPct(nowET(), last?.close ?? null, "scan");
   const spreadOK = await memoSpreadGuardOK(ticker, spreadLimit);
   dbg.spread = { limitPct: spreadLimit, spreadOK };
   if (!spreadOK) {
-    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "spread_guard" }, debug: dbg };
+    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, armedHigherLow: false, refPrice: last.close, meta: { reason: "spread_guard" }, debug: dbg };
   }
 
+  // float/liquidity
   const floatShares = await fetchFloatShares(
     ticker,
     Number.isFinite(Number(last.close)) ? Number(last.close) : null,
@@ -506,31 +567,55 @@ async function evaluateEntrySignals(
     ok: liq.ok
   };
   if (!liq.ok) {
-    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, refPrice: last.close, meta: { reason: "liquidity" }, debug: dbg };
+    return { eligible: false, armed: false, armedMomentum: false, armedDip: false, armedHigherLow: false, refPrice: last.close, meta: { reason: "liquidity" }, debug: dbg };
   }
 
   const orRange = computeOpeningRange(candles, today);
-
+  const open930 = sessionOpenAt930(candles, today);
   const aboveVWAP = vwap != null && last ? last.close >= vwap : false;
-  const breakORH = !!(orRange && last && last.close > orRange.high);
+
+  // near-OR/H reclaim + VWAP band
   const NEAR_OR_PCT = lerp(NEAR_OR_START, NEAR_OR_END, t);
   const VWAP_RECLAIM_BAND = lerp(VWAP_BAND_START, VWAP_BAND_END, t);
+  const breakORH = !!(orRange && last && last.close > orRange.high);
   const nearOR = !!(orRange && last && last.close >= orRange.high * (1 - NEAR_OR_PCT));
   const vwapRecl = !!(vwap != null && last && last.close >= vwap && last.low >= vwap * (1 - VWAP_RECLAIM_BAND));
   const volOK = (volPulse?.mult ?? 0) >= VOL_MULT_MIN;
 
-  const signals: Record<string, boolean> = { volPulseOK: volOK, breakORH, nearOR, vwapReclaim: vwapRecl };
-  const signalCount = Object.values(signals).filter(Boolean).length;
-  const armedMomentum = !!(aboveVWAP && signalCount >= 2);
+  // NEW: Higher-low pattern (9:30–9:44 only)
+  const hl = computeHigherLowAfterOpen(candles, today);
+  const armedHigherLow = !!hl.ok;
 
+  // NEW: Not overextended relative to 9:30 open (don’t chase +12%+ during scan)
+  let notOverextended = true;
+  if (open930 != null && Number.isFinite(open930) && open930 > 0) {
+    const ext = (last.close - open930) / open930;
+    notOverextended = ext <= 0.12; // 12% cap during scan window
+    dbg.overextension = { fromOpenPct: Number((ext * 100).toFixed(2)), notOverextended };
+  }
+
+  // Combine into momentum/dip/higher-low “armed” flags
+  const signals: Record<string, boolean> = { volPulseOK: volOK, breakORH, nearOR, vwapReclaim: vwapRecl, higherLow: armedHigherLow, aboveVWAP };
+  const signalCount = Object.values(signals).filter(Boolean).length;
+  const armedMomentum = !!(aboveVWAP && vwapRecl && volOK && notOverextended && (breakORH || nearOR));
   const dip = dipArmedNow({ candles, todayYMD: today, vwap: vwap ?? null });
-  dbg.signals = { aboveVWAP, volPulse: volPulse?.mult ?? null, VOL_MULT_MIN, breakORH, nearOR, NEAR_OR_PCT, vwapReclaim: vwapRecl, VWAP_RECLAIM_BAND, signalCount, mSince930: m, armedMomentum, armedDip: dip.armed };
+
+  dbg.signals = { ...signals, VOL_MULT_MIN, NEAR_OR_PCT, VWAP_RECLAIM_BAND, signalCount, mSince930: m, armedMomentum, armedDip: dip.armed, armedHigherLow };
   dbg.dipMeta = dip.meta;
 
   const eligible = true;
-  const armed = armedMomentum || dip.armed;
+  const armed = armedMomentum || dip.armed || armedHigherLow;
 
-  return { eligible, armed, armedMomentum, armedDip: dip.armed, refPrice: last.close ?? null, meta: { dipMeta: dip.meta, vwap, orRange }, debug: dbg };
+  return {
+    eligible,
+    armed,
+    armedMomentum,
+    armedDip: dip.armed,
+    armedHigherLow,
+    refPrice: last.close ?? null,
+    meta: { dipMeta: dip.meta, vwap, orRange, higherLow: hl },
+    debug: dbg
+  };
 }
 
 /* -------------------------- setup scoring (no time-of-day bonus) -------------------------- */
@@ -566,6 +651,38 @@ function sizeForScoreOptionA(score: number): { sizeMult: number; label: "full"|"
   if (score >= 2) return { sizeMult: SIZE_FULL, label: "full" };
   if (score === 1) return { sizeMult: SIZE_HALF, label: "half" };
   return { sizeMult: SIZE_MICRO, label: "micro" }; // score = 0
+}
+
+/* -------------------------- entry quality scoring for scan (9:30–9:44) -------------------------- */
+function entryQualityScore(e: Awaited<ReturnType<typeof evaluateEntrySignals>>) {
+  let score = 0;
+  if (e.armedHigherLow) score += 3;   // best “nice entry” pattern
+  if (e.armedDip)        score += 2;   // strong pullback confirm
+  if (e.armedMomentum)   score += 1;   // balanced momentum
+
+  // Volume factor (0..2)
+  const volMult = Number(e?.debug?.volPulse ?? 0);
+  const volMin  = Number(e?.debug?.VOL_MULT_MIN ?? 1);
+  const volBoost = Math.max(0, Math.min(2, volMult / (volMin || 1)));
+  score += volBoost;
+
+  // Overextension guard: reward being less extended from 9:30 open (0..4)
+  const extPct = Number(e?.debug?.overextension?.fromOpenPct ?? 0) / 100;
+  const notOverextended = e?.debug?.overextension?.notOverextended ?? true;
+  const extBoost = notOverextended ? Math.max(0, Math.min(4, 4 * (0.12 - Math.max(0, extPct)))) : 0;
+  score += (isNaN(extBoost) ? 2 : extBoost);
+
+  return {
+    score,
+    features: {
+      armedHigherLow: e.armedHigherLow,
+      armedDip: e.armedDip,
+      armedMomentum: e.armedMomentum,
+      volMult,
+      volMin,
+      extPct: Number((extPct*100).toFixed(2)),
+    }
+  };
 }
 
 /* -------------------------- order helper (ACCEPTS sizeMult + tpPct) -------------------------- */
@@ -753,7 +870,7 @@ async function handle(req: Request) {
         } catch (e: any) { debug.reasons.push(`presc_exception:${e?.message || "unknown"}`); }
       }
 
-      // Scan 09:30–09:44 — Option A sizing + TP override (weak=5%)
+      // Scan 09:30–09:44 — head-to-head best entry between primary & secondary
       if (!openPos && marketOpen && inScanWindow() && state!.lastRunDay !== today) {
         let snapshot = await getSnapshot(base);
         let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
@@ -780,25 +897,29 @@ async function handle(req: Request) {
           debug.scan_evals = evals;
 
           let chosen: string | null = null;
-          const dipArmed = picks
-            .filter(s => evals[s]?.eligible && evals[s]?.armedDip)
-            .sort((a, b) => {
-              const pa = Number(evals[a]?.meta?.dipMeta?.pullbackPct ?? 0);
-              const pb = Number(evals[b]?.meta?.dipMeta?.pullbackPct ?? 0);
-              return pb - pa;
-            });
 
-          if (dipArmed.length) {
-            chosen = dipArmed[0];
-            debug.scan_choice_reason = `dip_armed_priority (${chosen})`;
+          // Consider BOTH primary & secondary; pick best entry by quality score
+          const eligiblePicks = picks.filter(s => {
+            const ev = evals[s];
+            return ev?.eligible && (ev.armedHigherLow || ev.armedDip || ev.armedMomentum);
+          });
+
+          if (eligiblePicks.length) {
+            const ranked = eligiblePicks
+              .map(sym => {
+                const eq = entryQualityScore(evals[sym]!);
+                return { sym, eq, vol: Number(evals[sym]?.debug?.volPulse ?? 0) };
+              })
+              .sort((a, b) => {
+                if (b.eq.score !== a.eq.score) return b.eq.score - a.eq.score; // higher total wins
+                return (b.vol || 0) - (a.vol || 0);                            // tie-break: more volume
+              });
+
+            chosen = ranked[0].sym;
+            debug.scan_choice_reason = `best_entry_quality (${chosen})`;
+            debug.scan_quality_rank = ranked.map(r => ({ ticker: r.sym, score: Number(r.eq.score.toFixed(2)), feats: r.eq.features }));
           } else {
-            const prim = picks[0];
-            const sec = picks[1];
-            if (prim && evals[prim]?.eligible && evals[prim]?.armedMomentum) {
-              chosen = prim; debug.scan_choice_reason = `primary_momentum (${chosen})`;
-            } else if (sec && evals[sec]?.eligible && evals[sec]?.armedMomentum) {
-              chosen = sec; debug.scan_choice_reason = `secondary_momentum (${chosen})`;
-            }
+            debug.reasons.push("scan_no_armed_signal_after_eval");
           }
 
           if (chosen) {
@@ -832,7 +953,7 @@ async function handle(req: Request) {
 
                   const placed = await placeEntryNow(chosen, Number(ref), state, sizeMult, tpPct);
                   if (placed.ok) {
-                    debug.lastMessage = `BUY (${chosenEval.armedDip ? "Buy-the-Dip" : "Balanced"}) ${chosen} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
+                    debug.lastMessage = `BUY (${chosenEval.armedHigherLow ? "Higher-Low" : (chosenEval.armedDip ? "Buy-the-Dip" : "Balanced")}) ${chosen} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
                     openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
                   } else {
                     debug.reasons.push(`scan_place_entry_failed_${chosen}:${placed.reason}`);
@@ -844,8 +965,6 @@ async function handle(req: Request) {
                 }
               }
             }
-          } else {
-            debug.reasons.push("scan_no_armed_signal_after_eval");
           }
         }
       }
