@@ -850,7 +850,7 @@ async function handle(req: Request) {
         }
       }
 
-      // Force window 09:45–09:46 — Option A sizing + TP override
+      // Force window 09:45–09:46 — PRIMARY-ONLY + Option A sizing + TP override
       if (!openPos && marketOpen && inForceWindow() && state!.lastRunDay !== today) {
         if (await hasAnyBuyTodayDB()) {
           debug.reasons.push("force_skipped_buy_exists_today");
@@ -874,14 +874,15 @@ async function handle(req: Request) {
             const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
             if (lastRecRow?.ticker) lastRec = lastRecRow;
 
-            const picks = [primary, secondary].filter(Boolean) as string[];
+            // ⬇️ PRIMARY ONLY during FORCE
+            const picks = primary ? [primary] : [];
             if (!picks.length) {
-              debug.reasons.push(`force_no_ai_pick_iter_${i}`);
+              debug.reasons.push(`force_no_primary_iter_${i}`);
               await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
               continue;
             }
 
-            debug[`force_iter_${i}_picks`] = picks;
+            debug[`force_iter_${i}_primary`] = picks[0];
 
             let entered = false;
             for (const sym of picks) {
@@ -926,7 +927,7 @@ async function handle(req: Request) {
 
                 const placed = await placeEntryNow(sym!, Number(ref), state!, sizeMult, tpPct);
                 if (placed.ok) {
-                  debug.lastMessage = `09:45 FORCE BUY ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
+                  debug.lastMessage = `09:45 FORCE BUY (PRIMARY) ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
                   openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
                   entered = true;
                   break;
@@ -956,7 +957,7 @@ async function handle(req: Request) {
         }
       }
 
-      /* --------------------- SECOND ATTEMPT 10:00–10:01 (Option A + TP override) --------------------- */
+      /* --------------------- SECOND ATTEMPT 10:00–10:01 (PRIMARY-ONLY + Option A + TP override) --------------------- */
       if (!openPos && marketOpen && inSecondForceWindow() && state!.lastRunDay !== today) {
         if (await hasAnyBuyTodayDB()) {
           debug.reasons.push("second_force_skipped_buy_exists_today");
@@ -980,14 +981,15 @@ async function handle(req: Request) {
             const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
             if (lastRecRow?.ticker) lastRec = lastRecRow;
 
-            const picks = [primary, secondary].filter(Boolean) as string[];
+            // ⬇️ PRIMARY ONLY during SECOND FORCE
+            const picks = primary ? [primary] : [];
             if (!picks.length) {
-              debug.reasons.push(`second_force_no_ai_pick_iter_${i}`);
+              debug.reasons.push(`second_force_no_primary_iter_${i}`);
               await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
               continue;
             }
 
-            debug[`second_force_iter_${i}_picks`] = picks;
+            debug[`second_force_iter_${i}_primary`] = picks[0];
 
             let entered = false;
             for (const sym of picks) {
@@ -1031,7 +1033,7 @@ async function handle(req: Request) {
 
                 const placed = await placeEntryNow(sym!, Number(ref), state!, sizeMult, tpPct);
                 if (placed.ok) {
-                  debug.lastMessage = `10:00 SECOND FORCE BUY ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
+                  debug.lastMessage = `10:00 SECOND FORCE BUY (PRIMARY) ${sym} @ ~${Number(ref).toFixed(2)} (shares=${placed.shares}, size=${label}, score=${score}, tp=${(tpPct*100).toFixed(0)}%)`;
                   openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
                   entered = true;
                   break;
