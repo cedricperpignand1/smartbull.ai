@@ -24,7 +24,7 @@ import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
 /* -------------------------- sizing tiers -------------------------- */
 const SIZE_FULL = 1.0;  // default
-const SIZE_HALF = 0.75; // your requested mid tier
+const SIZE_HALF = 0.75; // requested mid tier
 const SIZE_MICRO = 0.50; // smaller tier
 
 /* -------------------------- throttle & config -------------------------- */
@@ -116,6 +116,15 @@ async function memoGetAccount() {
   const v = await getAccount();
   _acctMemo = { t: now, v };
   return v;
+}
+
+/* -------------------------- AI fallback controls (NEW) -------------------------- */
+const AI_FALLBACK_ENABLED = true;
+// Allow fallback only late in scan window to give AI a chance first
+const AI_FALLBACK_MINUTE_FROM_OPEN = 8; // 9:38 ET (8 minutes after 9:30)
+function allowAIFallbackNow() {
+  const m = minutesSince930ET();
+  return m >= AI_FALLBACK_MINUTE_FROM_OPEN && m <= 14; // 9:38–9:44
 }
 
 /* -------------------------- helpers -------------------------- */
@@ -600,6 +609,10 @@ async function evaluateEntrySignals(
   const armedMomentum = !!(aboveVWAP && vwapRecl && volOK && notOverextended && (breakORH || nearOR));
   const dip = dipArmedNow({ candles, todayYMD: today, vwap: vwap ?? null });
 
+  // ✅ expose fields used by scoreSetup()
+  dbg.volPulse = volPulse?.mult ?? null;
+  dbg.VOL_MULT_MIN = VOL_MULT_MIN;
+
   dbg.signals = { ...signals, VOL_MULT_MIN, NEAR_OR_PCT, VWAP_RECLAIM_BAND, signalCount, mSince930: m, armedMomentum, armedDip: dip.armed, armedHigherLow };
   dbg.dipMeta = dip.meta;
 
@@ -627,7 +640,7 @@ function scoreSetup(e: Awaited<ReturnType<typeof evaluateEntrySignals>>): SetupS
 
   // 1) Volume against dynamic minimum
   const volMult = Number(e?.debug?.volPulse ?? 0);
-  const volMin  = Number(e?.debug?.VOL_MULT_MIN ?? 999);
+  const volMin  = Number(e?.debug?.V0L_MULT_MIN ?? e?.debug?.VOL_MULT_MIN ?? 999); // tolerate typo just in case
   if (Number.isFinite(volMult) && Number.isFinite(volMin) && volMult >= volMin) {
     score++; r.push(`volOK(${volMult.toFixed(2)}≥${volMin.toFixed(2)})`);
   } else {
@@ -870,7 +883,7 @@ async function handle(req: Request) {
         } catch (e: any) { debug.reasons.push(`presc_exception:${e?.message || "unknown"}`); }
       }
 
-      // Scan 09:30–09:44 — head-to-head best entry between primary & secondary
+      // Scan 09:30–09:44 — head-to-head best entry between primary & secondary (+ fallback)
       if (!openPos && marketOpen && inScanWindow() && state!.lastRunDay !== today) {
         let snapshot = await getSnapshot(base);
         let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
@@ -885,11 +898,23 @@ async function handle(req: Request) {
         debug.scan_affordable_count = affordableTop.length;
 
         const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates);
-        if (!primary && REQUIRE_AI_PICK) {
-          debug.reasons.push("scan_no_ai_pick_yet");
+
+        let picks: string[] = [];
+        let aiMissing = !primary;
+        if (!primary && REQUIRE_AI_PICK && AI_FALLBACK_ENABLED && allowAIFallbackNow()) {
+          const fb = await pickFallbackPrimary(snapshot, candidates, today, base);
+          if (fb.sym) {
+            picks = [fb.sym]; // single fallback primary
+            debug.scan_fallback = { picked: fb.sym, reason: fb.reason };
+            aiMissing = false; // we have a fallback "primary"
+          }
+        }
+
+        if (aiMissing && REQUIRE_AI_PICK) {
+          debug.reasons.push("scan_no_ai_pick_and_no_fallback");
         } else {
           if (lastRecRow?.ticker) lastRec = lastRecRow;
-          const picks = [primary, secondary].filter(Boolean) as string[];
+          if (!picks.length) picks = [primary, secondary].filter(Boolean) as string[];
           debug.scan_considered_order = picks;
 
           const evals: Record<string, Awaited<ReturnType<typeof evaluateEntrySignals>>> = {};
@@ -969,7 +994,7 @@ async function handle(req: Request) {
         }
       }
 
-      // Force window 09:45–09:46 — PRIMARY-ONLY + Option A sizing + TP override
+      // Force window 09:45–09:46 — PRIMARY-ONLY (+ fallback) + Option A sizing + TP override
       if (!openPos && marketOpen && inForceWindow() && state!.lastRunDay !== today) {
         if (await hasAnyBuyTodayDB()) {
           debug.reasons.push("force_skipped_buy_exists_today");
@@ -993,10 +1018,17 @@ async function handle(req: Request) {
             const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
             if (lastRecRow?.ticker) lastRec = lastRecRow;
 
-            // ⬇️ PRIMARY ONLY during FORCE
-            const picks = primary ? [primary] : [];
+            // ⬇️ PRIMARY ONLY during FORCE; fallback if missing
+            let picks = primary ? [primary] : [];
+            if (!picks.length && AI_FALLBACK_ENABLED) {
+              const fb = await pickFallbackPrimary(snapshot, candidates, yyyyMmDdET(), base);
+              if (fb.sym) {
+                picks = [fb.sym];
+                debug[`force_iter_${i}_fallback`] = { picked: fb.sym, reason: fb.reason };
+              }
+            }
             if (!picks.length) {
-              debug.reasons.push(`force_no_primary_iter_${i}`);
+              debug.reasons.push(`force_no_primary_and_no_fallback_iter_${i}`);
               await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
               continue;
             }
@@ -1076,7 +1108,7 @@ async function handle(req: Request) {
         }
       }
 
-      /* --------------------- SECOND ATTEMPT 10:00–10:01 (PRIMARY-ONLY + Option A + TP override) --------------------- */
+      /* --------------------- SECOND ATTEMPT 10:00–10:01 (PRIMARY-ONLY + fallback) --------------------- */
       if (!openPos && marketOpen && inSecondForceWindow() && state!.lastRunDay !== today) {
         if (await hasAnyBuyTodayDB()) {
           debug.reasons.push("second_force_skipped_buy_exists_today");
@@ -1100,10 +1132,17 @@ async function handle(req: Request) {
             const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
             if (lastRecRow?.ticker) lastRec = lastRecRow;
 
-            // ⬇️ PRIMARY ONLY during SECOND FORCE
-            const picks = primary ? [primary] : [];
+            // ⬇️ PRIMARY ONLY during SECOND FORCE; fallback if missing
+            let picks = primary ? [primary] : [];
+            if (!picks.length && AI_FALLBACK_ENABLED) {
+              const fb = await pickFallbackPrimary(snapshot, candidates, yyyyMmDdET(), base);
+              if (fb.sym) {
+                picks = [fb.sym];
+                debug[`second_force_iter_${i}_fallback`] = { picked: fb.sym, reason: fb.reason };
+              }
+            }
             if (!picks.length) {
-              debug.reasons.push(`second_force_no_primary_iter_${i}`);
+              debug.reasons.push(`second_force_no_primary_and_no_fallback_iter_${i}`);
               await new Promise((r) => setTimeout(r, BURST_DELAY_MS));
               continue;
             }
@@ -1322,7 +1361,6 @@ async function handle(req: Request) {
   } catch (e: any) {
     const msg = e?.message || "unknown";
     const stack = typeof e?.stack === "string" ? e.stack.split("\n").slice(0, 6).join("\n") : undefined;
-    // FIX: NextResponse.json older types expect 1 arg; use the base constructor with status.
     return new NextResponse(
       JSON.stringify({ error: true, message: msg, stack }),
       { status: 500, headers: { "content-type": "application/json" } }
@@ -1454,4 +1492,24 @@ async function ensureRollingRecommendationTwo(
   }
 
   return { primary: primary ?? null, secondary: secondary ?? null, lastRecRow: lastRec || null };
+}
+
+/* -------------------------- Fallback picker (NEW) -------------------------- */
+async function pickFallbackPrimary(
+  snapshot: { stocks: SnapStock[] } | null,
+  candidates: SnapStock[],
+  today: string,
+  base: string
+): Promise<{ sym: string | null; reason: string; eval?: Awaited<ReturnType<typeof evaluateEntrySignals>> }> {
+  const evals: Array<{sym:string; ev: Awaited<ReturnType<typeof evaluateEntrySignals>>; eq:number}> = [];
+  for (const s of candidates.slice(0, TOP_CANDIDATES)) {
+    const ev = await evaluateEntrySignals(s.ticker, snapshot, today, base);
+    if (ev?.eligible && (ev.armedHigherLow || ev.armedDip || ev.armedMomentum)) {
+      const eq = entryQualityScore(ev).score;
+      evals.push({ sym: s.ticker, ev, eq });
+    }
+  }
+  if (!evals.length) return { sym: null, reason: "fallback_no_armed_candidates" };
+  evals.sort((a,b)=> b.eq - a.eq);
+  return { sym: evals[0].sym, reason: "fallback_best_entry_quality", eval: evals[0].ev };
 }
