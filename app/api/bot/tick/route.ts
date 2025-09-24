@@ -25,7 +25,7 @@ import { fmpQuoteCached } from "../../../../lib/fmpCached";
 /* -------------------------- sizing tiers -------------------------- */
 const SIZE_FULL = 1.0;
 const SIZE_HALF = 0.75;
-const SIZE_MICRO = 0.50;
+const SIZE_MICRO = 0.65;
 
 /* -------------------------- throttle & config -------------------------- */
 let lastTickAt = 0;
