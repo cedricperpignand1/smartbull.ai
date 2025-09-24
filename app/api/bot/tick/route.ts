@@ -480,29 +480,46 @@ function passesRelaxedLiquidity(
 }
 /* =================================================================================== */
 
-/* >>>>>>>>>>>>>>> dynamic spread function <<<<<<<<<<<<<<< */
-function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
+// >>>>>>>>>>>>>>> dynamic spread function (slightly relaxed) <<<<<<<<<<<<<<<
+function dynamicSpreadLimitPct(
+  now: Date,
+  price?: number | null,
+  phase: "scan" | "force" = "scan"
+): number {
+  // Early volatility (9:30–9:45): was 1.2%, now 1.3%
   if (inWindow930to945ET()) {
-    return 0.015; // 1%
+    return 0.013; // 1.3%
   }
-  const toPct = (v: number) => Math.max(0.001, Math.min(0.03, v));
+
+  // Global clamp: was 2.0%, now 2.2% max
+  const clamp = (v: number) => Math.max(0.001, Math.min(0.022, v));
+
+  // Base buckets (each +0.1% from the safer preset)
   let base =
     phase === "force"
-      ? 0.012
+      ? 0.011  // was 0.010 → 1.1% in force window
       : (function () {
           const mins = now.getHours() * 60 + now.getMinutes();
-          if (mins <= 9 * 60 + 34) return 0.010;
-          if (mins <= 9 * 60 + 39) return 0.008;
-          return 0.007;
+          if (mins <= 9 * 60 + 34) return 0.011; // was 0.010
+          if (mins <= 9 * 60 + 39) return 0.009; // was 0.008
+          return 0.008;                           // was 0.007
         })();
 
   const p = Number(price);
   if (Number.isFinite(p)) {
-    if (p < 2) base = Math.min(base, 0.018);
+    // Keep the "safer cap" behavior for cheap names, but relax slightly:
+    // (<$2: cap 1.5% ; $2–$5: cap 1.2%)
+    if (p < 2) base = Math.min(base, 0.015);
     else if (p < 5) base = Math.min(base, 0.012);
+
+    // If instead you want to *allow* wider spreads on cheap names, swap to Math.max:
+    // if (p < 2) base = Math.max(base, 0.015);
+    // else if (p < 5) base = Math.max(base, 0.012);
   }
-  return toPct(base);
+
+  return clamp(base);
 }
+
 
 /* -------------------------- premarket memo -------------------------- */
 type PreMemo = { pmHigh: number; pmLow: number; pmVol: number; fetchedAt: number };
