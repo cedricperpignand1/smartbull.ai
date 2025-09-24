@@ -483,23 +483,23 @@ function passesRelaxedLiquidity(
 /* >>>>>>>>>>>>>>> dynamic spread function <<<<<<<<<<<<<<< */
 function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
   if (inWindow930to945ET()) {
-    return 0.01; // 1%
+    return 0.015; // 1%
   }
-  const toPct = (v: number) => Math.max(0.001, Math.min(0.02, v));
+  const toPct = (v: number) => Math.max(0.001, Math.min(0.03, v));
   let base =
     phase === "force"
-      ? 0.007
+      ? 0.012
       : (function () {
           const mins = now.getHours() * 60 + now.getMinutes();
-          if (mins <= 9 * 60 + 34) return 0.008;
-          if (mins <= 9 * 60 + 39) return 0.006;
-          return 0.005;
+          if (mins <= 9 * 60 + 34) return 0.010;
+          if (mins <= 9 * 60 + 39) return 0.008;
+          return 0.007;
         })();
 
   const p = Number(price);
   if (Number.isFinite(p)) {
-    if (p < 2) base = Math.min(base, 0.012);
-    else if (p < 5) base = Math.min(base, 0.008);
+    if (p < 2) base = Math.min(base, 0.018);
+    else if (p < 5) base = Math.min(base, 0.012);
   }
   return toPct(base);
 }
