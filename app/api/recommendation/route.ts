@@ -1,6 +1,7 @@
 // app/api/recommendation/route.ts
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { Prisma } from "@prisma/client";
 
 // ⬇️ use the cached FMP helpers (relative import avoids alias issues)
 import {
@@ -35,7 +36,7 @@ const makeUrl = (p: string) => (BASE_URL ? `${BASE_URL}${p}` : p);
 const MAX_INPUT = 20;                 // read at most 20 incoming rows
 const PREMARKET_LIMIT = 8;            // analyze premarket for top 8 (single Alpaca call)
 const FMP_ENRICH_LIMIT = Math.max(8, PREMARKET_LIMIT); // ensure we enrich at least 8
-const DEFAULT_TOP_N = 2;              // default to TWO
+const DEFAULT_TOP_N = 2;              // default to TWO picks
 
 // Premarket+open window you want the model to consider
 const PM_START_H = 9, PM_START_M = 0;
@@ -347,10 +348,16 @@ function buildExplanationForPick(
     country?: string | null;
   } | undefined,
   reasons: string[] | undefined,
-  risk: string | undefined
+  risk: string | undefined,
+  winnerIndustry: string | null
 ): string {
   const bullets: string[] = [];
   if (reasons?.length) bullets.push(...reasons);
+  if (winnerIndustry && (c?.industry || c?.sector)) {
+    const label = (c?.industry || c?.sector || "").trim();
+    if (label && label === winnerIndustry) bullets.push(`Industry tilt: ${winnerIndustry}`);
+  }
+  if (c?.country) bullets.push(`Geo: ${c.country}`);
   if (c?.relVol != null) bullets.push(`RelVol ~ ${c.relVol.toFixed(2)}x`);
   if (c?.dollarVolume != null) bullets.push(`DollarVol ~$${Math.round(c.dollarVolume).toLocaleString()}`);
   if (c?.sharesOutstanding != null) bullets.push(`Float ~ ${c.sharesOutstanding.toLocaleString()}`);
@@ -364,14 +371,13 @@ function buildExplanationForPick(
   if (c?.pmVolume != null) bullets.push(`09:00–09:45 vol ${Math.round(c.pmVolume).toLocaleString()}`);
   if (c?.pmVWAP != null) bullets.push(`09:00–09:45 VWAP ~$${c.pmVWAP.toFixed(2)}`);
   if (c?.pmUpMinutePct != null) bullets.push(`Up-minutes ${(c.pmUpMinutePct*100).toFixed(0)}%`);
-  if (c?.country) bullets.push(`Country ${c.country}`);
   if (risk?.trim()) bullets.push(`Risk: ${risk.trim()}`);
   const clean = bullets.map(b => b.replace(/\s+/g, " ").trim()).filter(Boolean);
   return clean.length ? clean.join(" • ") : `${t.toUpperCase()} selected for momentum, liquidity & morning tone.`;
 }
 
 /* ──────────────────────────────────────────────────────────
-   Soft preference helpers
+   Soft preference helpers (Float ↓ strongest, Employees ↑, AvgVolume ↑)
    ────────────────────────────────────────────────────────── */
 function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; employees?: number|null; avgVolume?: number|null }>) {
   const floats = rows.map(r => r.sharesOutstanding ?? null).filter((v): v is number => v != null && Number.isFinite(v));
@@ -418,15 +424,9 @@ function buildSoftPrefScorer(rows: Array<{ sharesOutstanding?: number|null; empl
 
 /* ──────────────────────────────────────────────────────────
    NEW: Preference rules & comparator (hard guidance)
-   + Industry tilt + Geography soft bias
    ────────────────────────────────────────────────────────── */
 const LOW_FLOAT_MAX = 50_000_000;      // treat as "low float" if <= 50M shares
 const SMALL_CAP_MAX = 1_000_000_000;   // treat as "small cap" if <= $1B
-
-// soft nudges (0..1 scale)
-const INDUSTRY_TILT_BONUS = 0.10;  // add to softPref if matches daily winner
-const US_BONUS            = 0.02;  // small nudge for US names
-const CHINA_PENALTY       = 0.07;  // small penalty for China/HK names
 
 function isLowFloat(x?: number | null) {
   return x != null && x > 0 && x <= LOW_FLOAT_MAX;
@@ -434,34 +434,52 @@ function isLowFloat(x?: number | null) {
 function isSmallCap(x?: number | null) {
   return x != null && x > 0 && x <= SMALL_CAP_MAX;
 }
-function isChinaish(country?: string | null): boolean {
-  if (!country) return false;
-  const c = country.toLowerCase();
-  return c.includes("china") || c === "cn" || c.includes("hong kong") || c === "hk";
-}
-function isUS(country?: string | null): boolean {
-  if (!country) return false;
-  const c = country.toLowerCase();
-  return c.includes("united states") || c === "us" || c === "usa" || c === "u.s.";
-}
 
-type Tilt = { label: string; count: number; members: string[] } | null;
-function computeIndustryWinner(rows: Array<{ industry?: string|null; sector?: string|null; ticker: string }>): Tilt {
-  if (!rows.length) return null;
-  const map = new Map<string, string[]>();
+// Winner industry finder (by frequency, then dollar vol, then median %)
+function toPct(x: number | null | undefined) {
+  if (x == null || !Number.isFinite(Number(x))) return null;
+  const n = Number(x);
+  return Math.abs(n) <= 1.2 ? n * 100 : n; // 0.085 -> 8.5
+}
+function median(nums: number[]): number {
+  if (!nums.length) return 0;
+  const a = [...nums].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+function pickWinnerIndustry(rows: Array<{ industry?: string|null; sector?: string|null; dollarVolume?: number|null; changesPercentage?: number|null }>): { label: string|null; count: number; dv: number; med: number } {
+  const map = new Map<string, { count: number; dv: number; pcts: number[] }>();
   for (const r of rows) {
-    const k = (r.industry || r.sector || "Unknown").trim() || "Unknown";
-    const arr = map.get(k) || [];
-    arr.push(r.ticker.toUpperCase());
-    map.set(k, arr);
+    const key = (r.industry || r.sector || "Unknown").trim();
+    const g = map.get(key) || { count: 0, dv: 0, pcts: [] };
+    g.count += 1;
+    g.dv += Number(r.dollarVolume ?? 0);
+    const pct = toPct(r.changesPercentage);
+    if (pct != null) g.pcts.push(pct);
+    map.set(key, g);
   }
   const hasLabeled = Array.from(map.keys()).some(k => k !== "Unknown");
-  if (hasLabeled && map.has("Unknown")) map.delete("Unknown");
+  if (hasLabeled) map.delete("Unknown");
 
-  const groups = Array.from(map.entries()).map(([label, members]) => ({ label, count: members.length, members: members.sort() }));
-  if (!groups.length) return null;
-  groups.sort((a, b) => (b.count - a.count) || a.label.localeCompare(b.label));
-  return groups[0];
+  const items = Array.from(map.entries()).map(([label, g]) => ({
+    label, count: g.count, dv: g.dv, med: median(g.pcts),
+  }));
+  if (!items.length) return { label: null, count: 0, dv: 0, med: 0 };
+
+  items.sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    if (b.dv !== a.dv) return b.dv - a.dv;
+    return b.med - a.med;
+  });
+  return items[0];
+}
+
+function geoBias(country?: string | null): number {
+  const c = (country || "").toUpperCase();
+  if (!c) return 0;
+  if (c === "US" || c === "USA" || c.includes("UNITED STATES")) return +0.2;
+  if (c === "CN" || c.includes("CHINA") || c === "HK" || c.includes("HONG KONG")) return -0.4;
+  return 0;
 }
 
 /**
@@ -470,11 +488,11 @@ function computeIndustryWinner(rows: Array<{ industry?: string|null; sector?: st
  *  2) Prefer small-cap (<= $1B)
  *  3) Among low-float vs low-float, prefer higher employees
  *  4) Lower absolute float wins (if both low-float and employees tie)
- *  5) NEW: Prefer names in the day's winner industry (soft tiebreak)
- *  6) NEW: Prefer non-China/HK vs China/HK (soft tiebreak)
- *  7) Fall back to pmScore, then dollarVolume, then softPrefAdj
+ *  5) Winner industry tilt (if provided)
+ *  6) Soft geo bias (US slightly up, CN/HK slightly down)
+ *  7) Fall back to pmScore, then dollarVolume, then softPref
  */
-function compareByPreferenceFactory(winnerLabel?: string | null) {
+function makePreferenceComparator(winnerIndustry: string | null) {
   return function compareByPreference(a: any, b: any) {
     const aLow = isLowFloat(a.sharesOutstanding);
     const bLow = isLowFloat(b.sharesOutstanding);
@@ -493,24 +511,25 @@ function compareByPreferenceFactory(winnerLabel?: string | null) {
       if (af !== bf) return af - bf;
     }
 
-    // 5) industry tilt (soft)
-    if (winnerLabel) {
-      const aWin = (a.industry || a.sector) === winnerLabel;
-      const bWin = (b.industry || b.sector) === winnerLabel;
-      if (aWin !== bWin) return aWin ? -1 : 1;
+    // Winner industry tilt
+    if (winnerIndustry) {
+      const ai = (a.industry || a.sector || "").trim();
+      const bi = (b.industry || b.sector || "").trim();
+      const aIn = ai === winnerIndustry;
+      const bIn = bi === winnerIndustry;
+      if (aIn !== bIn) return aIn ? -1 : 1;
     }
 
-    // 6) geo soft bias
-    const aChina = isChinaish(a.country);
-    const bChina = isChinaish(b.country);
-    if (aChina !== bChina) return aChina ? 1 : -1; // prefer non-China
+    // Geo bias
+    const g = geoBias(a.country) - geoBias(b.country);
+    if (Math.abs(g) > 1e-12) return g > 0 ? -1 : 1;
 
     const pm = (b.pmScore ?? -1) - (a.pmScore ?? -1);
     if (Math.abs(pm) > 1e-12) return pm;
     const dv = (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0);
     if (dv !== 0) return dv;
 
-    return ((b.softPrefAdj ?? b.softPref ?? 0) - (a.softPrefAdj ?? a.softPref ?? 0));
+    return ((b.softPref ?? 0) - (a.softPref ?? 0));
   };
 }
 
@@ -600,16 +619,13 @@ export async function POST(req: Request) {
         const price = row.price ?? num(quote?.price);
         const { pos, neg } = quickHeadlineScore(news);
 
-        // NEW: capture geography
-        const country = (profile?.countryISO || profile?.country || null) as string | null;
-
         return {
           ...row,
           price, marketCap, employees, profitMarginTTM, avgVolume, relVol,
           isEtf, isOTC,
           sector: profile?.sector || null,
           industry: profile?.industry || null,
-          country,
+          country: profile?.country || profile?.countryIso || null,
           headlines: (news || []).map((n: any) => n?.title).filter(Boolean).slice(0, 5),
           headlinePos: pos, headlineNeg: neg,
         };
@@ -620,17 +636,6 @@ export async function POST(req: Request) {
     const scoreSoft = buildSoftPrefScorer(enriched);
     for (const r of enriched) {
       (r as any).softPref = scoreSoft(r as any); // 0..1
-    }
-
-    /* ── NEW: compute winner industry and add geo/tilt bias to softPref ── */
-    const winner = computeIndustryWinner(enriched.map(e => ({ ticker: e.ticker, industry: e.industry, sector: e.sector })));
-    for (const r of enriched) {
-      let bias = 0;
-      const label = r.industry || r.sector || null;
-      if (winner && label === winner.label) bias += INDUSTRY_TILT_BONUS;
-      if (isUS(r.country)) bias += US_BONUS;
-      if (isChinaish(r.country)) bias -= CHINA_PENALTY;
-      (r as any).softPrefAdj = Math.max(0, Math.min(1, (r as any).softPref + bias));
     }
 
     /* Hard filters (PRICE BAND: $1–$70 + enforce MIN_FLOAT) */
@@ -655,14 +660,14 @@ export async function POST(req: Request) {
     // Last-chance fallback that still respects float
     const lastChance = enriched.filter((s) => (s.sharesOutstanding ?? 0) >= MIN_FLOAT);
 
-    // Sort helper: prioritize AM tone if available, then DollarVol, then SoftPrefAdj
+    // Sort helper: prioritize AM tone if available, then DollarVol, then SoftPref
     const byComposite = (arr: any[]) =>
       arr.slice().sort((a, b) => {
         const pmDiff = (b.pmScore ?? -1) - (a.pmScore ?? -1);
         if (Math.abs(pmDiff) > 1e-9) return pmDiff;
         const dv = (b.dollarVolume ?? 0) - (a.dollarVolume ?? 0);
         if (Math.abs(dv) > 0) return dv;
-        return ((b as any).softPrefAdj ?? (b as any).softPref ?? 0) - ((a as any).softPrefAdj ?? (a as any).softPref ?? 0);
+        return ((b as any).softPref ?? 0) - ((a as any).softPref ?? 0);
       });
 
     const prePool =
@@ -672,6 +677,10 @@ export async function POST(req: Request) {
 
     // First pass: momentum/liquidity order
     const candidatesBase = byComposite(prePool).slice(0, PREMARKET_LIMIT);
+
+    // Winner industry (from candidate pool)
+    const win = pickWinnerIndustry(candidatesBase);
+    const winnerIndustry = win.label;
 
     /* ── Get or fetch the 09:00–09:45 snapshot (cached) ── */
     const symbols = candidatesBase.map((c: any) => String(c.ticker).toUpperCase());
@@ -693,11 +702,10 @@ export async function POST(req: Request) {
       };
     });
 
-    // Second pass: apply explicit preference rules + tilt/geo soft tiebreaks
-    const compareByPreference = compareByPreferenceFactory(winner?.label);
-    const prefSorted = candidates.slice().sort(compareByPreference);
+    // Second pass: apply explicit preference rules + winner industry + geo
+    const prefSorted = candidates.slice().sort(makePreferenceComparator(winnerIndustry));
 
-    /* ── Prompt (JSON mode) ── */
+    /* Prompt (JSON mode), augmented with 09:00–09:45 signals + soft pref) */
     const lines = prefSorted.map((s: any) => {
       const pct =
         s.changesPercentage == null
@@ -718,7 +726,6 @@ export async function POST(req: Request) {
         `DollarVol:${s.dollarVolume != null ? Math.round(s.dollarVolume).toLocaleString() : "n/a"}`,
         `Employees:${s.employees ?? "n/a"}`,
         `SoftPref:${((s as any).softPref ?? 0).toFixed(2)}`,
-        `SoftPrefAdj:${((s as any).softPrefAdj ?? (s as any).softPref ?? 0).toFixed(2)}`,
         `ProfitMarginTTM:${s.profitMarginTTM != null ? (Math.abs(s.profitMarginTTM) <= 1 ? (s.profitMarginTTM*100).toFixed(2) : s.profitMarginTTM.toFixed(2)) + "%" : "n/a"}`,
         `Sector:${s.sector ?? "n/a"}`,
         `Industry:${s.industry ?? "n/a"}`,
@@ -757,19 +764,15 @@ Use ONLY the provided data (no outside facts).
 - Quality: prefer positive netProfitMarginTTM.
 - Catalysts: positive headlines; penalize clusters of negatives.
 
+## Day Tilt (soft)
+- Winner industry today: **${winnerIndustry ?? "Unknown"}**. Prefer candidates that match this label when close.
+- Geo bias (soft): prefer **U.S.** over **China/HK** if other signals are similar. Do not overrule strong momentum.
+
 ## Cedric Preference Policy (must obey for tie-breaks and close calls)
 1) Prefer **low-float** (≤ 50M) over higher float.
 2) Prefer **small-cap** (≤ $1B) over larger cap when other signals are similar.
 3) If the top two are both low-float, **prefer the one with higher employees**.
 4) If choosing between a high-cap and a low-cap/low-float name in the top two, **prefer the low-float/small-cap**.
-
-## Daily Tilt
-- Winner industry (from the provided candidates): **${winner?.label ?? "n/a"}** (count ${winner?.count ?? 0}).
-- When signals are close, **prefer** names in this industry. Do not override much stronger momentum/liquidity.
-
-## Geography (soft rule)
-- When signals are close, **prefer U.S. names** over China/Hong Kong ADRs or China/HK-domiciled names.
-- This is a **small penalty only**; do not overrule a clearly superior momentum/liquidity setup.
 
 ## Output (strict JSON)
 {
@@ -786,8 +789,6 @@ ${lines.join("\n")}
 
 Recent headlines (titles only):
 ${headlinesBlock}
-
-Industry Tilt: ${winner?.label ?? "n/a"} (members: ${(winner?.members ?? []).join(", ") || "—"})
 
 Select up to **${topN}** best long candidates (ranked). Output JSON as specified.
 `.trim();
@@ -887,7 +888,11 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
     const reasonsMap: Record<string, string[]> = modelObj?.reasons || {};
     const risk: string | undefined = typeof modelObj?.risk === "string" ? modelObj.risk : undefined;
 
-    /* L2 tiebreaker (optional) */
+    /* ──────────────────────────────────────────────────────
+       ---- L2 tiebreaker (place after finalPicks is set) ----
+       Uses your Level-2 pressure endpoint to possibly swap the top two.
+       Fails safe if endpoint is unavailable.
+       ────────────────────────────────────────────────────── */
     try {
       const toRank = (finalPicks as string[]).slice(0, 2);
       if (toRank.length === 2) {
@@ -903,52 +908,45 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           const b = toRank[1].toUpperCase();
           const sa = map[a]; const sb = map[b];
           if (sa != null && sb != null && sb > sa) {
-            // swap
+            // swap: pick the one with higher buy pressure as primary
             finalPicks[0] = b;
             finalPicks[1] = a;
           }
         }
       }
-    } catch { /* ignore */ }
+    } catch { /* ignore L2 errors and keep original order */ }
+    /* ---- /L2 tiebreaker ---- */
 
-    /* Save picks with explanation (includes tilt / geo bullets) */
-    const saved: any[] = [];
-    for (const sym of finalPicks) {
-      const t = sym.toUpperCase();
-      const c = (prefSorted as any[]).find((x: any) => String(x.ticker).toUpperCase() === t);
+   /* Save picks with explanation (includes AM bullets if present) */
+const saved: any[] = [];
+for (const sym of finalPicks) {
+  const t = sym.toUpperCase();
+  const c = (prefSorted as any[]).find((x: any) => String(x.ticker).toUpperCase() === t);
 
-      const priceNum = (c?.price != null && Number.isFinite(Number(c.price)))
-        ? Number(c.price)
-        : null;
+  // Try to use the best price we have; fall back to 0 to satisfy Prisma's required field
+  const priceNum =
+    c?.price != null && Number.isFinite(Number(c.price)) ? Number(c.price) : 0;
 
-      // augment reasons with tilt/geo notes
-      const baseReasons = Array.isArray(reasonsMap[t]) ? [...reasonsMap[t]] : [];
-      if (winner && (c?.industry || c?.sector) === winner.label) {
-        baseReasons.unshift(`Industry tilt: ${winner.label}`);
-      }
-      if (isChinaish(c?.country)) {
-        baseReasons.push("Geo: China/HK (soft penalty applied)");
-      } else if (isUS(c?.country)) {
-        baseReasons.push("Geo: U.S. (small preference)");
-      }
+  const expl = buildExplanationForPick(t, c as any, reasonsMap[t], risk, winnerIndustry ?? null);
 
-      const expl = buildExplanationForPick(t, c as any, baseReasons, risk);
+  try {
+    const data: Prisma.RecommendationCreateInput = {
+      ticker: t,
+      explanation: expl,
+      // If your schema uses Decimal, Prisma accepts number OR you can wrap:
+      // price: new Prisma.Decimal(priceNum),
+      price: priceNum,
+    };
 
-      try {
-        const row = await prisma.recommendation.create({
-          data: {
-            ticker: t,
-            ...(priceNum != null ? { price: priceNum } : {}), // omit if null
-            explanation: expl,
-          },
-        });
-        saved.push(row);
-      } catch (e) {
-        console.error("Failed to save recommendation for", t, e);
-      }
-    }
+    const row = await prisma.recommendation.create({ data });
+    saved.push(row);
+  } catch (e) {
+    console.error("Failed to save recommendation for", t, e);
+  }
+}
 
-    // 🔔 Tell the L2 streaming layer which 1–2 symbols to track now
+
+    // 🔔 Tell the L2 streaming layer which 1–2 symbols to track now (uses swapped order if any)
     try {
       const toTrack = finalPicks.slice(0, 2);
       if (toTrack.length) {
@@ -970,7 +968,7 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
       saved,
       raw: typeof content === "string" ? content : JSON.stringify(content),
       context: {
-        industryWinner: winner,
+        winnerIndustry,
         tickers: (prefSorted as any[]).map((x: any) => ({
           ticker: x.ticker,
           price: x.price,
@@ -987,7 +985,6 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           headlinePos: x.headlinePos,
           headlineNeg: x.headlineNeg,
           softPref: (x as any).softPref ?? 0,
-          softPrefAdj: (x as any).softPrefAdj ?? (x as any).softPref ?? 0,
           amHigh: x.pmHigh ?? null,
           amLow: x.pmLow ?? null,
           amRangePct: x.pmRangePct ?? null,
@@ -995,11 +992,11 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           amVWAP: x.pmVWAP ?? null,
           amUpMinutePct: x.pmUpMinutePct ?? null,
           amScore: x.pmScore ?? null,
+          sector: x.sector ?? null,
+          industry: x.industry ?? null,
+          country: x.country ?? null,
           isLowFloat: isLowFloat(x.sharesOutstanding),
           isSmallCap: isSmallCap(x.marketCap),
-          sector: x.sector,
-          industry: x.industry,
-          country: x.country ?? null,
         })),
         pmCache: {
           date: pmCacheDate,
@@ -1014,9 +1011,6 @@ Select up to **${topN}** best long candidates (ranked). Output JSON as specified
           lowFloatMax: LOW_FLOAT_MAX,
           smallCapMax: SMALL_CAP_MAX,
           minFloat: MIN_FLOAT,
-          industryTiltBonus: INDUSTRY_TILT_BONUS,
-          geoUSBonus: US_BONUS,
-          geoChinaPenalty: CHINA_PENALTY,
         },
         nowET: nowET().toISOString(),
       },
