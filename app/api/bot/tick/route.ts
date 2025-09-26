@@ -16,10 +16,7 @@ import {
   computePremarketLevelsFromBars,
   spreadGuardOK,
   getAccount,
-  sellMarket,
 } from "@/lib/alpaca";
-
-// Cached FMP helpers
 import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
 /* -------------------------- sizing tiers -------------------------- */
@@ -36,20 +33,12 @@ const MIN_TICK_MS = 200;
 const START_CASH = 6250;
 const INVEST_BUDGET = 6250;
 
-const TARGET_PCT = 0.10;   // TP default (+10%)
-const STOP_PCT = -0.05;    // SL -5%
-const TOP_CANDIDATES = 8;
+/* -------------------------- exit / target rules -------------------------- */
+const STOP_PCT = -0.05;              // SL -5% (all trades at entry)
+const TARGET_PCT_WEAK = 0.05;        // weak setups: fixed TP +5%
+const TARGET_PCT_STRONG_DUMMY = 0.50; // strong setups: dummy high TP (+50%) then runner manages
 
-/** Ratchet */
-const RATCHET_ENABLED = true;
-const RATCHET_STEP_PCT = 0.05; // 5% steps
-const RATCHET_LIFT_BROKER_CHILDREN = true;
-const RATCHET_VIRTUAL_EXITS = false;
-const LIFT_COOLDOWN_MS = 12000;
-const MAX_TIGHTNESS_BEHIND_HIGH = 0.05;
-const MIN_SL_IMPROVE_CENTS = 0.02;
-
-/* -------------------------- dynamic thresholds -------------------------- */
+/* -------------------------- time-decay tuning -------------------------- */
 const DECAY_START_MIN = 0;
 const DECAY_END_MIN = 14;
 
@@ -103,8 +92,8 @@ async function memoGetAccount() {
   return v;
 }
 
-/* -------------------------- AI fallback controls -------------------------- */
-const AI_FALLBACK_ENABLED = true; // only for early scan window
+/* -------------------------- AI fallback controls (scan only) -------------------------- */
+const AI_FALLBACK_ENABLED = true; // only during 9:30–9:44 if no AI pick
 const AI_FALLBACK_MINUTE_FROM_OPEN = 8; // 9:38 ET
 function allowAIFallbackNow() {
   const m = minutesSince930ET();
@@ -123,6 +112,7 @@ type SnapStock = {
 };
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
 
+/* -------------------------- small utils -------------------------- */
 function priceFromFmp(q: any): number | null {
   const n = Number(q?.price ?? q?.c ?? q?.close ?? q?.previousClose);
   return Number.isFinite(n) ? n : null;
@@ -136,11 +126,10 @@ function getBaseUrl(req: Request) {
   const host = (req.headers.get("x-forwarded-host") || req.headers.get("host") || "").split(",")[0].trim();
   return `${proto}://${host}`;
 }
-
 function yyyyMmDdLocal(d: Date) {
   const dt = new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const mo = String(dt.getMonth() + 1).padStart(2, "0");
-  const da = String(dt.getDate()).padStart(2, "0");
+  const da = String(dt.getDate() + 0).padStart(2, "0");
   return `${dt.getFullYear()}-${mo}-${da}`;
 }
 function yyyyMmDd(date: Date) {
@@ -179,22 +168,18 @@ function inForceWindow1015() {
   const d = nowET();
   return d.getHours() === 10 && (d.getMinutes() === 15 || d.getMinutes() === 16);
 }
-
-/** Mandatory exit from 15:50 ET onward */
 function isMandatoryExitET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
   return mins >= (15 * 60 + 50);
 }
-
-/* 9:30–9:45 for spread limiter */
 function inWindow930to945ET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
   return mins >= 9 * 60 + 30 && mins <= 9 * 60 + 45;
 }
 
-/* ---------- DB helpers ---------- */
+/* -------------------------- DB helpers -------------------------- */
 async function hasBuyAfter946TodayDB(): Promise<boolean> {
   const now = nowET();
   const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
@@ -206,7 +191,6 @@ async function hasBuyAfter946TodayDB(): Promise<boolean> {
   });
   return !!buy;
 }
-// ADDED: hasAnyBuyTodayDB (fixes your error)
 async function hasAnyBuyTodayDB(): Promise<boolean> {
   const etNow = new Date(nowET().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const dayStartET = new Date(etNow); dayStartET.setHours(0, 0, 0, 0);
@@ -216,8 +200,7 @@ async function hasAnyBuyTodayDB(): Promise<boolean> {
   });
   return !!buy;
 }
-
-/* -------------------------- HARD DAY-LOCK helpers -------------------------- */
+/* day-lock helpers */
 async function hasDayLock(): Promise<boolean> {
   const s = await prisma.botState.findUnique({ where: { id: 1 }, select: { lastRunDay: true } });
   return s?.lastRunDay === yyyyMmDdET();
@@ -225,14 +208,8 @@ async function hasDayLock(): Promise<boolean> {
 async function setDayLock(): Promise<void> {
   await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: yyyyMmDdET() } });
 }
-async function clearDayLockIfToday(): Promise<void> {
-  await prisma.botState.updateMany({
-    where: { id: 1, lastRunDay: yyyyMmDdET() },
-    data: { lastRunDay: null },
-  });
-}
 
-/* -------------------------- FMP session candles -------------------------- */
+/* -------------------------- FMP candles -------------------------- */
 function toET(dateIso: string) {
   return new Date(new Date(dateIso).toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
@@ -257,7 +234,7 @@ async function fetchCandles1m(symbol: string, limit: number, baseUrl: string): P
   }));
 }
 
-/* -------------------------- signals -------------------------- */
+/* -------------------------- signals & metrics -------------------------- */
 function computeOpeningRange(candles: Candle[], todayYMD: string) {
   const window = candles.filter((c) => {
     const d = toET(c.date);
@@ -324,7 +301,7 @@ function dipArmedNow(params: { candles: Candle[]; todayYMD: string; vwap: number
   return { armed, meta: { open930, minLow, pullbackPct, withinDipBand, brokePrevHigh, reclaimedVWAP, lastGreen } };
 }
 
-/* -------------------------- higher-low detection (9:30–9:44) -------------------------- */
+/* -------------------------- higher-low after open -------------------------- */
 function inWindow9344ET(dateIso: string): boolean {
   const d = toET(dateIso);
   const mins = d.getHours() * 60 + d.getMinutes();
@@ -592,7 +569,7 @@ async function evaluateEntrySignals(
   const volOK = (volPulse?.mult ?? 0) >= VOL_MULT_MIN;
 
   const hl = computeHigherLowAfterOpen(candles, today);
-  const armedHigherLow = !!(hl.ok);
+  const armedHigherLow = !!hl.ok;
 
   let notOverextended = true;
   if (open930 != null && Number.isFinite(open930) && open930 > 0) {
@@ -653,7 +630,7 @@ function sizeForScoreOptionA(score: number): { sizeMult: number; label: "full"|"
   return { sizeMult: SIZE_MICRO, label: "micro" };
 }
 
-/* -------------------------- entry quality scoring -------------------------- */
+/* -------------------------- entry quality scoring (for tie-breaks) -------------------------- */
 function entryQualityScore(e: Awaited<ReturnType<typeof evaluateEntrySignals>>) {
   let score = 0;
   if (e.armedHigherLow) score += 3;
@@ -683,17 +660,19 @@ function entryQualityScore(e: Awaited<ReturnType<typeof evaluateEntrySignals>>) 
   };
 }
 
-/* -------------------------- order helper -------------------------- */
-async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult = 1.0, tpPct = TARGET_PCT) {
-  const cashNum = Number(state!.cash);
+/* -------------------------- order helper (weak vs strong) -------------------------- */
+type EntryMode = "weak" | "strong";
 
+async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult = 1.0, mode: EntryMode) {
+  const cashNum = Number(state!.cash);
   const budget = Math.max(0, Math.min(cashNum, INVEST_BUDGET) * Math.max(0.1, Math.min(sizeMult, 1.0)));
 
   let shares = Math.floor(budget / ref);
   if (shares <= 0 && budget >= ref) shares = 1;
   if (shares <= 0) return { ok: false, reason: `insufficient_cash_for_one_share_ref_${ticker}_${ref.toFixed(2)}` };
 
-  const tmpTp = ref * (1 + tpPct);
+  // strong: dummy high TP (+50%); weak: +5% TP
+  const tmpTp = ref * (1 + (mode === "strong" ? TARGET_PCT_STRONG_DUMMY : TARGET_PCT_WEAK));
   const tmpSl = ref * (1 + STOP_PCT);
 
   let order;
@@ -712,8 +691,8 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
 
-  // Poll for REAL average fill
-  let entry = Number.NaN;
+  // Poll for fill avg price
+  let entry = Number.isFinite(ref) ? ref : NaN;
   for (let i = 0; i < 24; i++) {
     try {
       const pos = await getPosition(ticker);
@@ -724,14 +703,14 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
   }
   if (!Number.isFinite(entry)) entry = ref;
 
-  // recenter TP/SL
-  const newTp = round2(entry * (1 + tpPct));
+  // recenter TP/SL to entry-based values
+  const newTp = round2(entry * (1 + (mode === "strong" ? TARGET_PCT_STRONG_DUMMY : TARGET_PCT_WEAK)));
   const newSl = round2(entry * (1 + STOP_PCT));
   try {
     await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true });
   } catch {}
 
-  // Persist & lock
+  // Persist the position and lock day
   await prisma.position.create({ data: { ticker, entryPrice: entry, shares, open: true, brokerOrderId: order.id } });
   await prisma.trade.create({ data: { side: "BUY", ticker, price: entry, shares, brokerOrderId: order.id } });
   await setDayLock();
@@ -741,15 +720,29 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     data: { cash: cashNum - shares * entry, equity: cashNum - shares * entry + shares * entry },
   });
 
+  // init ratchet state for runner
+  ratchetState[ticker] = {
+    entry,
+    high: entry,
+    lastRung: 0,
+    lastLiftAt: 0,
+    runner: (mode === "strong"),
+    lastSL: newSl,
+    lastTP: newTp,
+  };
+
+  // also init daily SL memo (used by classic ratchet path)
+  lastDynSLMemo[ticker] = { day: yyyyMmDdET(), sl: newSl };
+
   return { ok: true, shares };
 }
 
 /* -------------------------- memos (ratchet + SL tracking) -------------------------- */
 const lastDynSLMemo: Record<string, { day: string; sl: number }> = {};
-type RatchetState = { entry: number; high: number; lastRung: number; lastLiftAt: number };
+type RatchetState = { entry: number; high: number; lastRung: number; lastLiftAt: number; runner: boolean; lastSL: number; lastTP: number };
 const ratchetState: Record<string, RatchetState> = {};
 
-/* -------------------------- force-window obvious-weakness checker (gentle) -------------------------- */
+/* -------------------------- gentle gate for force windows -------------------------- */
 async function assessObviousWeakAtForce(opts: {
   symbol: string;
   today: string;
@@ -908,10 +901,6 @@ async function handle(req: Request) {
             scan_1001_1014: inScanWindowLate(),
             force_1015: inForceWindow1015(),
             requireAiPick: REQUIRE_AI_PICK,
-            targetPct: TARGET_PCT,
-            stopPct: STOP_PCT,
-            aiFreshnessMs: FRESHNESS_MS,
-            liquidity: { minSharesAbs: MIN_SHARES_ABS, floatPctPerMin: FLOAT_MIN_PCT_PER_MIN, minDollarVol: MIN_DOLLAR_VOL },
           },
           debug,
         };
@@ -921,7 +910,7 @@ async function handle(req: Request) {
       // Pre-scan 09:14–09:29
       if (!openPos && inPreScanWindow()) {
         const snapshot = await getSnapshot(base);
-        const top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
+        const top = (snapshot?.stocks || []).slice(0, 8);
         const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
         const candidates = affordableTop.length ? affordableTop : top;
         debug.presc_top = candidates.map((s) => s.ticker);
@@ -948,7 +937,7 @@ async function handle(req: Request) {
       }
 
       /* ============================== SCAN 09:30–09:44 (EARLY) ============================== */
-      if (!openPos && marketOpen && inScanWindowEarly() && state!.lastRunDay !== today && !(await hasDayLock())) {
+      if (!openPos && marketOpen && inScanWindowEarly() && !(await hasDayLock())) {
         await runScanWindow({
           req, base, today, stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
           lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug, windowName: "scan_early"
@@ -956,21 +945,21 @@ async function handle(req: Request) {
       }
 
       /* ============================== FORCE 09:45 (PRIMARY→SECONDARY) ============================== */
-      if (!openPos && marketOpen && inForceWindow0945() && state!.lastRunDay !== today && !(await hasDayLock())) {
+      if (!openPos && marketOpen && inForceWindow0945() && !(await hasDayLock())) {
         const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
-        if (boughtOrLocked) {
-          debug.reasons.push("force_0945_skipped_buy_or_lock");
-        } else {
+        if (!boughtOrLocked) {
           await runForceWindowPrimarySecondary({
             req, base, today, labelPrefix: "force_0945", banner: "09:45 FORCE BUY (PRIMARY→SECONDARY)",
             stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
             lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
           });
+        } else {
+          debug.reasons.push("force_0945_skipped_buy_or_lock");
         }
       }
 
       /* ============================== SCAN 09:46–09:59 (MID) ============================== */
-      if (!openPos && marketOpen && inScanWindowMid() && state!.lastRunDay !== today && !(await hasDayLock()) && !(await hasAnyBuyTodayDB())) {
+      if (!openPos && marketOpen && inScanWindowMid() && !(await hasDayLock()) && !(await hasAnyBuyTodayDB())) {
         await runScanWindow({
           req, base, today, stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
           lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug, windowName: "scan_mid"
@@ -978,21 +967,21 @@ async function handle(req: Request) {
       }
 
       /* ============================== FORCE 10:00 (PRIMARY→SECONDARY) ============================== */
-      if (!openPos && marketOpen && inForceWindow1000() && state!.lastRunDay !== today && !(await hasDayLock())) {
+      if (!openPos && marketOpen && inForceWindow1000() && !(await hasDayLock())) {
         const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
-        if (boughtOrLocked) {
-          debug.reasons.push("force_1000_skipped_buy_or_lock");
-        } else {
+        if (!boughtOrLocked) {
           await runForceWindowPrimarySecondary({
             req, base, today, labelPrefix: "force_1000", banner: "10:00 SECOND FORCE BUY (PRIMARY→SECONDARY)",
             stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
             lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
           });
+        } else {
+          debug.reasons.push("force_1000_skipped_buy_or_lock");
         }
       }
 
       /* ============================== SCAN 10:01–10:14 (LATE) ============================== */
-      if (!openPos && marketOpen && inScanWindowLate() && state!.lastRunDay !== today && !(await hasDayLock()) && !(await hasAnyBuyTodayDB())) {
+      if (!openPos && marketOpen && inScanWindowLate() && !(await hasDayLock()) && !(await hasAnyBuyTodayDB())) {
         await runScanWindow({
           req, base, today, stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
           lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug, windowName: "scan_late"
@@ -1000,20 +989,20 @@ async function handle(req: Request) {
       }
 
       /* ============================== FORCE 10:15 (PRIMARY→SECONDARY) ============================== */
-      if (!openPos && marketOpen && inForceWindow1015() && state!.lastRunDay !== today && !(await hasDayLock())) {
+      if (!openPos && marketOpen && inForceWindow1015() && !(await hasDayLock())) {
         const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
-        if (boughtOrLocked) {
-          debug.reasons.push("force_1015_skipped_buy_or_lock");
-        } else {
+        if (!boughtOrLocked) {
           await runForceWindowPrimarySecondary({
             req, base, today, labelPrefix: "force_1015", banner: "10:15 THIRD FORCE BUY (PRIMARY→SECONDARY)",
             stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
             lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
           });
+        } else {
+          debug.reasons.push("force_1015_skipped_buy_or_lock");
         }
       }
 
-      /* ------------------------------ Holding loop (ratchet) ------------------------------ */
+      /* ------------------------------ Holding loop (ratchet + runner) ------------------------------ */
       if (openPos) {
         const q = await fmpQuoteCached(openPos.ticker);
         const pParsed = priceFromFmp(q);
@@ -1021,60 +1010,82 @@ async function handle(req: Request) {
           const p = pParsed;
           livePrice = p;
 
+          // equity mark
           const equityNow = Number(state!.cash) + Number(openPos.shares) * p;
           if (Number(state!.equity) !== equityNow) {
             state = await prisma.botState.update({ where: { id: 1 }, data: { equity: equityNow } });
           }
 
-          if (RATCHET_ENABLED && RATCHET_LIFT_BROKER_CHILDREN) {
-            const sym = openPos.ticker;
-            const entry = Number(openPos.entryPrice);
-            if (!ratchetState[sym]) {
-              ratchetState[sym] = { entry, high: Math.max(entry, p), lastRung: 0, lastLiftAt: 0 };
-            }
-            const rs = ratchetState[sym];
-            rs.high = Math.max(rs.high, p);
+          // Classic ratchet that lifts SL behind highs (works for all)
+          const sym = openPos.ticker;
+          const entry = Number(openPos.entryPrice);
+          if (!ratchetState[sym]) {
+            ratchetState[sym] = { entry, high: Math.max(entry, p), lastRung: 0, lastLiftAt: 0, runner: false, lastSL: round2(entry * (1 + STOP_PCT)), lastTP: round2(entry * (1 + TARGET_PCT_WEAK)) };
+          }
 
-            const gainPct = (rs.high - rs.entry) / rs.entry;
-            const rungIndex = Math.floor(gainPct / RATCHET_STEP_PCT);
+          const rs = ratchetState[sym];
+          rs.high = Math.max(rs.high, p);
 
-            const candidatePctFromEntry = Math.max(0, (rungIndex - 1) * RATCHET_STEP_PCT);
-            const candidateSL = round2(rs.entry * (1 + candidatePctFromEntry));
+          // rung computation for classic SL lift
+          const gainPct = (rs.high - rs.entry) / rs.entry;
+          const rungIndex = Math.floor(gainPct / 0.05); // 5% steps
+          const candidatePctFromEntry = Math.max(0, (rungIndex - 1) * 0.05);
+          const candidateSL = round2(rs.entry * (1 + candidatePctFromEntry));
+          const maxTightStop = round2(rs.high * (1 - 0.05));
+          const targetSL = Math.min(candidateSL, maxTightStop);
+          const curMemo = lastDynSLMemo[sym]?.sl ?? round2(rs.entry * (1 + STOP_PCT));
+          const improvedBy = targetSL - curMemo;
+          const nowMs = Date.now();
+          const cooldownOK = nowMs - (rs.lastLiftAt || 0) >= 12000;
 
-            const maxTightStop = round2(rs.high * (1 - MAX_TIGHTNESS_BEHIND_HIGH));
-            const targetSL = Math.min(candidateSL, maxTightStop);
+          if (rungIndex > rs.lastRung && improvedBy >= 0.02 && cooldownOK) {
+            try {
+              await (replaceTpSlIfBetter as any)({
+                symbol: sym,
+                newSl: targetSL,
+                force: false,
+              });
+              lastDynSLMemo[sym] = { day: yyyyMmDdET(), sl: targetSL };
+              rs.lastRung = rungIndex;
+              rs.lastLiftAt = nowMs;
+              rs.lastSL = targetSL;
+            } catch {}
+          }
 
-            const curMemo = lastDynSLMemo[sym]?.sl ?? round2(rs.entry * (1 + STOP_PCT));
+          // Runner mode for strong setups: lift TP too (no hard 10% cap)
+          if (rs.runner) {
+            // checkpoints and mapping: at +5%, lock >= breakeven; TP ~ +15%;
+            // +10% → lock >= +5%; TP ~ +20%; etc.
+            const steps = [0.05, 0.10, 0.15, 0.20, 0.30];
+            for (const step of steps) {
+              if (gainPct >= step && nowMs - rs.lastLiftAt >= 6000) {
+                // SL target: 5% below checkpoint, but never below breakeven
+                let targetRunnerSL = round2(rs.entry * (1 + step - 0.05));
+                if (targetRunnerSL < rs.entry) targetRunnerSL = rs.entry;
 
-            const improvedBy = targetSL - curMemo;
-            const nowMs = Date.now();
-            const cooldownOK = nowMs - (rs.lastLiftAt || 0) >= LIFT_COOLDOWN_MS;
+                // TP target: 10% above checkpoint
+                const targetRunnerTP = round2(rs.entry * (1 + step + 0.10));
 
-            if (rungIndex > rs.lastRung && improvedBy >= MIN_SL_IMPROVE_CENTS && cooldownOK) {
-              try {
-                await (replaceTpSlIfBetter as any)({
-                  symbol: sym,
-                  newSl: targetSL,
-                  force: false,
-                });
-                lastDynSLMemo[sym] = { day: yyyyMmDdET(), sl: targetSL };
-                rs.lastRung = rungIndex;
-                rs.lastLiftAt = nowMs;
+                const needSL = targetRunnerSL > (rs.lastSL + 0.01);
+                const needTP = targetRunnerTP > (rs.lastTP + 0.01);
 
-                debug.ratchet = {
-                  symbol: sym, entry: rs.entry, high: rs.high, rungIndex,
-                  candidatePctFromEntry: Number((candidatePctFromEntry * 100).toFixed(1)) + "%",
-                  targetSL, maxTightStop, improvedBy: Number(improvedBy.toFixed(2)),
-                  liftedAt: new Date(nowMs).toISOString(),
-                };
-              } catch (e: any) {
-                debug.reasons.push(`ratchet_lift_failed_${sym}:${e?.message || "unknown"}`);
+                if (needSL || needTP) {
+                  try {
+                    await (replaceTpSlIfBetter as any)({
+                      symbol: sym,
+                      newSl: needSL ? targetRunnerSL : undefined,
+                      newTp: needTP ? targetRunnerTP : undefined,
+                      force: true,
+                    });
+                    if (needSL) {
+                      lastDynSLMemo[sym] = { day: yyyyMmDdET(), sl: targetRunnerSL };
+                      rs.lastSL = targetRunnerSL;
+                    }
+                    if (needTP) rs.lastTP = targetRunnerTP;
+                    rs.lastLiftAt = Date.now();
+                  } catch {}
+                }
               }
-            } else {
-              debug.ratchet = {
-                symbol: sym, entry: rs.entry, high: rs.high, rungIndex,
-                curSL: curMemo, targetSL, cooldownOK, improvedBy: Number(improvedBy.toFixed(2)),
-              };
             }
           }
         }
@@ -1084,7 +1095,7 @@ async function handle(req: Request) {
         if (p != null) livePrice = p;
       }
 
-      /* ---------------------- VIEW SYMBOL UNTIL 23:59 ET ---------------------- */
+      /* ---------------------- return ---------------------- */
       const etNow = new Date(nowET().toLocaleString("en-US", { timeZone: "America/New_York" }));
       const endOfDayET = new Date(etNow); endOfDayET.setHours(23, 59, 0, 0);
 
@@ -1100,20 +1111,6 @@ async function handle(req: Request) {
         serverTimeET: nowET().toISOString(),
         account: alpacaAccount,
         budget: { investPerTrade: INVEST_BUDGET },
-        info: {
-          prescan_0914_0929: inPreScanWindow(),
-          scan_0930_0944: inScanWindowEarly(),
-          force_0945: inForceWindow0945(),
-          scan_0946_0959: inScanWindowMid(),
-          force_1000: inForceWindow1000(),
-          scan_1001_1014: inScanWindowLate(),
-          force_1015: inForceWindow1015(),
-          requireAiPick: REQUIRE_AI_PICK,
-          targetPct: TARGET_PCT,
-          stopPct: STOP_PCT,
-          aiFreshnessMs: FRESHNESS_MS,
-          liquidity: { minSharesAbs: MIN_SHARES_ABS, floatPctPerMin: FLOAT_MIN_PCT_PER_MIN, minDollarVol: MIN_DOLLAR_VOL },
-        },
         debug,
       };
     })();
@@ -1163,7 +1160,7 @@ async function getSnapshot(baseUrl: string): Promise<{ stocks: SnapStock[]; upda
   }
 }
 
-/* -------------------------- AI pick parsing & rolling recs -------------------------- */
+/* -------------------------- AI picks parsing & rolling recs -------------------------- */
 function tokenizeTickers(txt: string): string[] {
   if (!txt) return [];
   return Array.from(new Set((txt.toUpperCase().match(/\b[A-Z]{1,5}\b/g) || [])));
@@ -1282,9 +1279,9 @@ async function runScanWindow(opts: {
   let lastRec = lastRecRef();
 
   let snapshot = await getSnapshot(base);
-  let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
+  let top = (snapshot?.stocks || []).slice(0, 8);
   if (!top.length && lastGoodSnapshot && lastGoodSnapshotDay === today) {
-    top = lastGoodSnapshot.stocks.slice(0, TOP_CANDIDATES);
+    top = lastGoodSnapshot.stocks.slice(0, 8);
     debug[`used_last_good_snapshot_${windowName}`] = true;
   }
   const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
@@ -1302,7 +1299,7 @@ async function runScanWindow(opts: {
   const allowFallback = windowName === "scan_early" && AI_FALLBACK_ENABLED && allowAIFallbackNow();
   if (!primary && REQUIRE_AI_PICK && allowFallback) {
     const evals: Array<{sym:string; ev: Awaited<ReturnType<typeof evaluateEntrySignals>>; eq:number}> = [];
-    for (const s of candidates.slice(0, TOP_CANDIDATES)) {
+    for (const s of candidates.slice(0, 8)) {
       const ev = await evaluateEntrySignals(s.ticker, snapshot, today, base);
       if (ev?.eligible && (ev.armedHigherLow || ev.armedDip || ev.armedMomentum)) {
         const eq = entryQualityScore(ev).score;
@@ -1383,10 +1380,9 @@ async function runScanWindow(opts: {
   const chosenEval = evals[chosen]!;
   const { score, reasons } = scoreSetup(chosenEval);
   const { sizeMult, label } = sizeForScoreOptionA(score);
-  const tpPct = score >= 2 ? 0.10 : 0.05;
-  debug[`${windowName}_choice_scoring`] = { chosen, score, sizeLabel: label, tpPct, reasons, ref };
+  const mode: EntryMode = score >= 2 ? "strong" : "weak";
 
-  const placed = await placeEntryNow(chosen, Number(ref), stateRef(), sizeMult, tpPct);
+  const placed = await placeEntryNow(chosen, Number(ref), stateRef(), sizeMult, mode);
   if (placed.ok) {
     const newOpen = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
     setOpenPos(newOpen);
@@ -1409,16 +1405,16 @@ async function runForceWindowPrimarySecondary(opts: {
   setLastRec: (r: any) => void;
   debug: any;
 }) {
-  const { req, base, today, labelPrefix, banner, stateRef, openPosRef, setOpenPos, lastRecRef, setLastRec, debug } = opts;
+  const { req, base, today, labelPrefix, stateRef, openPosRef, setOpenPos, lastRecRef, setLastRec, debug } = opts;
 
   let state = stateRef();
   let openPos = openPosRef();
   let lastRec = lastRecRef();
 
   let snapshot = await getSnapshot(base);
-  let top = (snapshot?.stocks || []).slice(0, TOP_CANDIDATES);
+  let top = (snapshot?.stocks || []).slice(0, 8);
   if (!top.length && lastGoodSnapshot && lastGoodSnapshotDay === today) {
-    top = lastGoodSnapshot.stocks.slice(0, TOP_CANDIDATES);
+    top = lastGoodSnapshot.stocks.slice(0, 8);
     debug[`used_last_good_snapshot_${labelPrefix}`] = true;
   }
   const affordableTop = top.filter(s => Number.isFinite(Number(s.price)) && Number(s.price) <= INVEST_BUDGET);
@@ -1438,14 +1434,8 @@ async function runForceWindowPrimarySecondary(opts: {
     const assess = await assessObviousWeakAtForce({ symbol: sym, today, base, snapshot });
     debug[`${labelPrefix}_check_${sym}`] = assess;
 
-    if (assess.instantVeto) {
-      debug.reasons.push(`${labelPrefix}_instant_veto_${sym}:${assess.veto}`);
-      continue;
-    }
-    if (!assess.proceed) {
-      debug.reasons.push(`${labelPrefix}_skipped_weak_${sym}_flags=${assess.flagsCount}`);
-      continue;
-    }
+    if (assess.instantVeto) continue;
+    if (!assess.proceed) continue;
 
     // Entry price
     let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
@@ -1454,52 +1444,32 @@ async function runForceWindowPrimarySecondary(opts: {
       const p = priceFromFmp(q);
       if (p != null) ref = p;
     }
-    if (ref == null || !Number.isFinite(Number(ref))) {
-      debug.reasons.push(`${labelPrefix}_no_price_for_entry_${sym}`);
-      continue;
-    }
-    if (ref < PRICE_MIN || ref > PRICE_MAX) {
-      debug.reasons.push(`${labelPrefix}_price_band_fail_${sym}_${Number(ref).toFixed(2)}`);
-      continue;
-    }
+    if (ref == null || !Number.isFinite(Number(ref))) continue;
+    if (ref < PRICE_MIN || ref > PRICE_MAX) continue;
 
     // Force spread
     const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
     const spreadOK = await memoSpreadGuardOK(sym, spreadLimit);
-    if (!spreadOK) {
-      debug.reasons.push(`${labelPrefix}_spread_guard_fail_${sym}_limit=${(spreadLimit * 100).toFixed(2)}%`);
-      continue;
-    }
+    if (!spreadOK) continue;
 
     // Final safety: ensure no concurrent open & no day lock yet
     const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-    if (already || await hasDayLock()) {
-      debug.reasons.push(`${labelPrefix}_aborted_due_to_existing_pos_or_lock_${sym}`);
-      break;
-    }
+    if (already || await hasDayLock()) break;
 
     try {
       const evalRes = assess.ev ?? await evaluateEntrySignals(sym, snapshot, yyyyMmDdET(), base);
-      const { score, reasons } = scoreSetup(evalRes);
-      const { sizeMult, label } = sizeForScoreOptionA(score);
-      const tpPct = score >= 2 ? 0.10 : 0.05;
-      debug[`${labelPrefix}_score_${sym}`] = { score, sizeLabel: label, reasons, ref, tpPct };
+      const { score } = scoreSetup(evalRes);
+      const { sizeMult } = sizeForScoreOptionA(score);
+      const mode: EntryMode = score >= 2 ? "strong" : "weak";
 
-      const placed = await placeEntryNow(sym, Number(ref), stateRef(), sizeMult, tpPct);
+      const placed = await placeEntryNow(sym, Number(ref), stateRef(), sizeMult, mode);
       if (placed.ok) {
         placedSymbol = sym;
         const newOpen = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
         setOpenPos(newOpen);
-        debug[`${labelPrefix}_placed`] = { symbol: sym, shares: placed.shares };
         break;
-      } else {
-        debug.reasons.push(`${labelPrefix}_place_entry_failed_${sym}:${placed.reason}`);
-        // no lock was set; continue to next candidate
       }
-    } catch (e:any) {
-      debug.reasons.push(`${labelPrefix}_eval_or_place_exception_${sym}:${e?.message||"unknown"}`);
-      // no lock set; try next
-    }
+    } catch {}
   }
 
   debug[`${labelPrefix}_final`] = { placedSymbol: placedSymbol ?? null };
