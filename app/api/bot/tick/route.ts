@@ -16,6 +16,7 @@ import {
   computePremarketLevelsFromBars,
   spreadGuardOK,
   getAccount,
+  sellMarket,
 } from "@/lib/alpaca";
 import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
@@ -663,9 +664,24 @@ function entryQualityScore(e: Awaited<ReturnType<typeof evaluateEntrySignals>>) 
 /* -------------------------- order helper (weak vs strong) -------------------------- */
 type EntryMode = "weak" | "strong";
 
+// CHANGED: size off Alpaca buying_power/cash instead of DB; keep tiers and $6,250 cap
 async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult = 1.0, mode: EntryMode) {
-  const cashNum = Number(state!.cash);
-  const budget = Math.max(0, Math.min(cashNum, INVEST_BUDGET) * Math.max(0.1, Math.min(sizeMult, 1.0)));
+  // NEW: read live cash/buying power from Alpaca
+  let cashNum = 0;
+  try {
+    const acct = await memoGetAccount();
+    const raw = Number(acct?.buying_power ?? acct?.cash ?? 0);
+    cashNum = Number.isFinite(raw) ? raw : 0;
+  } catch {
+    // fallback to DB state only if Alpaca temporarily fails
+    const raw = Number(state?.cash ?? 0);
+    cashNum = Number.isFinite(raw) ? raw : 0;
+  }
+
+  // hard per-trade cap stays 6,250 and we keep your size tiers
+  const cap = INVEST_BUDGET;
+  const clampedMult = Math.max(0.1, Math.min(sizeMult, 1.0));
+  const budget = Math.max(0, Math.min(cashNum, cap) * clampedMult);
 
   let shares = Math.floor(budget / ref);
   if (shares <= 0 && budget >= ref) shares = 1;
@@ -715,9 +731,11 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
   await prisma.trade.create({ data: { side: "BUY", ticker, price: entry, shares, brokerOrderId: order.id } });
   await setDayLock();
 
+  // DB cash/equity update is UI-only; handle() also syncs from Alpaca each tick
+  const newCash = Math.max(0, Number(state?.cash ?? 0) - shares * entry);
   await prisma.botState.update({
     where: { id: 1 },
-    data: { cash: cashNum - shares * entry, equity: cashNum - shares * entry + shares * entry },
+    data: { cash: newCash, equity: newCash + shares * entry },
   });
 
   // init ratchet state for runner
@@ -846,19 +864,37 @@ async function handle(req: Request) {
       const debug: any = { reasons: [] as string[] };
       const base = getBaseUrl(req);
 
-      // Ensure state exists
+      // Optional: real Alpaca balances (memoized)
+      let alpacaAccount: any = null;
+      try { alpacaAccount = await memoGetAccount(); } catch {}
+
+      // CHANGED: Ensure state exists and keep it loosely synced with Alpaca (UI only)
       let state = await prisma.botState.findUnique({ where: { id: 1 } });
       if (!state) {
-        state = await prisma.botState.create({ data: { id: 1, cash: START_CASH, pnl: 0, equity: START_CASH } });
+        const startCash = Number(alpacaAccount?.buying_power ?? alpacaAccount?.cash ?? START_CASH);
+        const startEquity = Number(alpacaAccount?.portfolio_value ?? startCash);
+        state = await prisma.botState.create({
+          data: { id: 1, cash: startCash, pnl: 0, equity: startEquity }
+        });
+      } else {
+        const acCash = Number(alpacaAccount?.buying_power ?? alpacaAccount?.cash);
+        const acEquity = Number(alpacaAccount?.portfolio_value);
+        const needsCash = Number.isFinite(acCash) && acCash !== Number(state.cash);
+        const needsEq   = Number.isFinite(acEquity) && acEquity !== Number(state.equity);
+        if (needsCash || needsEq) {
+          state = await prisma.botState.update({
+            where: { id: 1 },
+            data: {
+              cash: needsCash ? acCash : state.cash,
+              equity: needsEq ? acEquity : state.equity
+            }
+          });
+        }
       }
 
       let openPos = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
       let lastRec = await prisma.recommendation.findFirst({ orderBy: { id: "desc" } });
       let livePrice: number | null = null;
-
-      // Optional: real Alpaca balances (memoized)
-      let alpacaAccount: any = null;
-      try { alpacaAccount = await memoGetAccount(); } catch {}
 
       const today = yyyyMmDdET();
 
