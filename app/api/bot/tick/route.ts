@@ -206,8 +206,18 @@ async function hasDayLock(): Promise<boolean> {
   const s = await prisma.botState.findUnique({ where: { id: 1 }, select: { lastRunDay: true } });
   return s?.lastRunDay === yyyyMmDdET();
 }
-async function setDayLock(): Promise<void> {
-  await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: yyyyMmDdET() } });
+// NEW: atomic claim helpers
+async function acquireDayLock(today: string): Promise<boolean> {
+  const res = await prisma.botState.updateMany({
+    where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
+    data: { lastRunDay: today },
+  });
+  return res.count === 1;
+}
+async function releaseDayLock(): Promise<void> {
+  try {
+    await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+  } catch { /* ignore */ }
 }
 
 /* -------------------------- FMP candles -------------------------- */
@@ -664,21 +674,19 @@ function entryQualityScore(e: Awaited<ReturnType<typeof evaluateEntrySignals>>) 
 /* -------------------------- order helper (weak vs strong) -------------------------- */
 type EntryMode = "weak" | "strong";
 
-// CHANGED: size off Alpaca buying_power/cash instead of DB; keep tiers and $6,250 cap
+// NOTE: lock is now handled by caller; do NOT set the day-lock here.
 async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult = 1.0, mode: EntryMode) {
-  // NEW: read live cash/buying power from Alpaca
+  // live cash/buying power from Alpaca
   let cashNum = 0;
   try {
     const acct = await memoGetAccount();
     const raw = Number(acct?.buying_power ?? acct?.cash ?? 0);
     cashNum = Number.isFinite(raw) ? raw : 0;
   } catch {
-    // fallback to DB state only if Alpaca temporarily fails
     const raw = Number(state?.cash ?? 0);
     cashNum = Number.isFinite(raw) ? raw : 0;
   }
 
-  // hard per-trade cap stays 6,250 and we keep your size tiers
   const cap = INVEST_BUDGET;
   const clampedMult = Math.max(0.1, Math.min(sizeMult, 1.0));
   const budget = Math.max(0, Math.min(cashNum, cap) * clampedMult);
@@ -726,12 +734,11 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true });
   } catch {}
 
-  // Persist the position and lock day
+  // Persist the position & trade
   await prisma.position.create({ data: { ticker, entryPrice: entry, shares, open: true, brokerOrderId: order.id } });
   await prisma.trade.create({ data: { side: "BUY", ticker, price: entry, shares, brokerOrderId: order.id } });
-  await setDayLock();
 
-  // DB cash/equity update is UI-only; handle() also syncs from Alpaca each tick
+  // UI-only equity/cash update (server sync happens per tick)
   const newCash = Math.max(0, Number(state?.cash ?? 0) - shares * entry);
   await prisma.botState.update({
     where: { id: 1 },
@@ -803,7 +810,6 @@ async function assessObviousWeakAtForce(opts: {
     : 0;
   const mildBleed = bleedFromOpen <= -0.06;
 
-  // overrides
   const dipArmed = !!ev.armedDip;
 
   // micro-bounce detection
@@ -868,7 +874,7 @@ async function handle(req: Request) {
       let alpacaAccount: any = null;
       try { alpacaAccount = await memoGetAccount(); } catch {}
 
-      // CHANGED: Ensure state exists and keep it loosely synced with Alpaca (UI only)
+      // Ensure bot state exists and loosely sync with Alpaca (UI only)
       let state = await prisma.botState.findUnique({ where: { id: 1 } });
       if (!state) {
         const startCash = Number(alpacaAccount?.buying_power ?? alpacaAccount?.cash ?? START_CASH);
@@ -1090,16 +1096,11 @@ async function handle(req: Request) {
 
           // Runner mode for strong setups: lift TP too (no hard 10% cap)
           if (rs.runner) {
-            // checkpoints and mapping: at +5%, lock >= breakeven; TP ~ +15%;
-            // +10% → lock >= +5%; TP ~ +20%; etc.
             const steps = [0.05, 0.10, 0.15, 0.20, 0.30];
             for (const step of steps) {
               if (gainPct >= step && nowMs - rs.lastLiftAt >= 6000) {
-                // SL target: 5% below checkpoint, but never below breakeven
                 let targetRunnerSL = round2(rs.entry * (1 + step - 0.05));
                 if (targetRunnerSL < rs.entry) targetRunnerSL = rs.entry;
-
-                // TP target: 10% above checkpoint
                 const targetRunnerTP = round2(rs.entry * (1 + step + 0.10));
 
                 const needSL = targetRunnerSL > (rs.lastSL + 0.01);
@@ -1389,41 +1390,39 @@ async function runScanWindow(opts: {
 
   if (!chosen) return;
 
-  const claim = await prisma.botState.updateMany({
-    where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
-    data: { lastRunDay: today },
-  });
-  const claimed = claim.count === 1;
+  // Atomic claim (existing logic)
+  const claimed = await acquireDayLock(today);
   if (!claimed) return;
 
-  const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-  if (already) return;
+  try {
+    const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+    if (already) return;
 
-  let ref = evals[chosen]?.refPrice ?? null;
-  if (ref == null || !Number.isFinite(Number(ref))) {
-    ref = Number(snapshot?.stocks?.find((s) => s.ticker === chosen)?.price ?? NaN);
-  }
-  if (ref == null || !Number.isFinite(Number(ref))) {
-    const q = await fmpQuoteCached(chosen);
-    const p = priceFromFmp(q);
-    if (p != null) ref = p;
-  }
-  if (ref == null || !Number.isFinite(Number(ref))) {
-    await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-    return;
-  }
+    let ref = evals[chosen]?.refPrice ?? null;
+    if (ref == null || !Number.isFinite(Number(ref))) {
+      ref = Number(snapshot?.stocks?.find((s) => s.ticker === chosen)?.price ?? NaN);
+    }
+    if (ref == null || !Number.isFinite(Number(ref))) {
+      const q = await fmpQuoteCached(chosen);
+      const p = priceFromFmp(q);
+      if (p != null) ref = p;
+    }
+    if (ref == null || !Number.isFinite(Number(ref))) return;
 
-  const chosenEval = evals[chosen]!;
-  const { score, reasons } = scoreSetup(chosenEval);
-  const { sizeMult, label } = sizeForScoreOptionA(score);
-  const mode: EntryMode = score >= 2 ? "strong" : "weak";
+    const chosenEval = evals[chosen]!;
+    const { score } = scoreSetup(chosenEval);
+    const { sizeMult } = sizeForScoreOptionA(score);
+    const mode: EntryMode = score >= 2 ? "strong" : "weak";
 
-  const placed = await placeEntryNow(chosen, Number(ref), stateRef(), sizeMult, mode);
-  if (placed.ok) {
-    const newOpen = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-    setOpenPos(newOpen);
-  } else {
-    await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
+    const placed = await placeEntryNow(chosen, Number(ref), stateRef(), sizeMult, mode);
+    if (placed.ok) {
+      const newOpen = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+      setOpenPos(newOpen);
+    } else {
+      await releaseDayLock();
+    }
+  } catch {
+    await releaseDayLock();
   }
 }
 
@@ -1465,47 +1464,59 @@ async function runForceWindowPrimarySecondary(opts: {
   const trySymbols = [primary, secondary].filter(Boolean) as string[];
   let placedSymbol: string | null = null;
 
-  for (let idx = 0; idx < trySymbols.length && !placedSymbol && !openPosRef(); idx++) {
-    const sym = trySymbols[idx]!;
-    const assess = await assessObviousWeakAtForce({ symbol: sym, today, base, snapshot });
-    debug[`${labelPrefix}_check_${sym}`] = assess;
+  // NEW: atomic claim for force window
+  const claimed = await acquireDayLock(today);
+  if (!claimed) {
+    debug[`${labelPrefix}_final`] = { placedSymbol: null, reason: "lock_not_acquired" };
+    return;
+  }
 
-    if (assess.instantVeto) continue;
-    if (!assess.proceed) continue;
+  try {
+    for (let idx = 0; idx < trySymbols.length && !placedSymbol && !openPosRef(); idx++) {
+      const sym = trySymbols[idx]!;
+      const assess = await assessObviousWeakAtForce({ symbol: sym, today, base, snapshot });
+      debug[`${labelPrefix}_check_${sym}`] = assess;
 
-    // Entry price
-    let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
-    if (!Number.isFinite(Number(ref))) {
-      const q = await fmpQuoteCached(sym);
-      const p = priceFromFmp(q);
-      if (p != null) ref = p;
-    }
-    if (ref == null || !Number.isFinite(Number(ref))) continue;
-    if (ref < PRICE_MIN || ref > PRICE_MAX) continue;
+      if (assess.instantVeto) continue;
+      if (!assess.proceed) continue;
 
-    // Force spread
-    const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
-    const spreadOK = await memoSpreadGuardOK(sym, spreadLimit);
-    if (!spreadOK) continue;
-
-    // Final safety: ensure no concurrent open & no day lock yet
-    const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-    if (already || await hasDayLock()) break;
-
-    try {
-      const evalRes = assess.ev ?? await evaluateEntrySignals(sym, snapshot, yyyyMmDdET(), base);
-      const { score } = scoreSetup(evalRes);
-      const { sizeMult } = sizeForScoreOptionA(score);
-      const mode: EntryMode = score >= 2 ? "strong" : "weak";
-
-      const placed = await placeEntryNow(sym, Number(ref), stateRef(), sizeMult, mode);
-      if (placed.ok) {
-        placedSymbol = sym;
-        const newOpen = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
-        setOpenPos(newOpen);
-        break;
+      // Entry price
+      let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
+      if (!Number.isFinite(Number(ref))) {
+        const q = await fmpQuoteCached(sym);
+        const p = priceFromFmp(q);
+        if (p != null) ref = p;
       }
-    } catch {}
+      if (ref == null || !Number.isFinite(Number(ref))) continue;
+      if (ref < PRICE_MIN || ref > PRICE_MAX) continue;
+
+      // Force spread
+      const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
+      const spreadOK = await memoSpreadGuardOK(sym, spreadLimit);
+      if (!spreadOK) continue;
+
+      // Final safety: ensure no concurrent open (race-safe due to lock)
+      const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+      if (already) break;
+
+      try {
+        const evalRes = assess.ev ?? await evaluateEntrySignals(sym, snapshot, yyyyMmDdET(), base);
+        const { score } = scoreSetup(evalRes);
+        const { sizeMult } = sizeForScoreOptionA(score);
+        const mode: EntryMode = score >= 2 ? "strong" : "weak";
+
+        const placed = await placeEntryNow(sym, Number(ref), stateRef(), sizeMult, mode);
+        if (placed.ok) {
+          placedSymbol = sym;
+          const newOpen = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
+          setOpenPos(newOpen);
+          break;
+        }
+      } catch {}
+    }
+  } finally {
+    // If nothing placed, release the lock so later windows can try again
+    if (!placedSymbol) await releaseDayLock();
   }
 
   debug[`${labelPrefix}_final`] = { placedSymbol: placedSymbol ?? null };
