@@ -17,6 +17,7 @@ import {
   spreadGuardOK,
   getAccount,
   sellMarket,
+  getOrder, // <-- NEW: wrapper around Alpaca GET /v2/orders/{order_id}
 } from "@/lib/alpaca";
 import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
@@ -35,8 +36,8 @@ const START_CASH = 6250;
 const INVEST_BUDGET = 6250;
 
 /* -------------------------- exit / target rules -------------------------- */
-const STOP_PCT = -0.05;              // SL -5% (all trades at entry)
-const TARGET_PCT_WEAK = 0.05;        // weak setups: fixed TP +5%
+const STOP_PCT = -0.05;               // SL -5% (all trades at entry)
+const TARGET_PCT_WEAK = 0.05;         // weak setups: fixed TP +5%
 const TARGET_PCT_STRONG_DUMMY = 0.50; // strong setups: dummy high TP (+50%) then runner manages
 
 /* -------------------------- time-decay tuning -------------------------- */
@@ -137,6 +138,26 @@ function yyyyMmDd(date: Date) {
   const mo = String(date.getMonth() + 1).padStart(2, "0");
   const da = String(date.getDate()).padStart(2, "0");
   return `${date.getFullYear()}-${mo}-${da}`;
+}
+
+/* -------------------------- wait for broker fill -------------------------- */
+// NEW: poll the order to capture the actual filled_avg_price
+async function waitForFillAvgPrice(orderId: string, timeoutMs = 20_000, pollMs = 300): Promise<{ price: number | null; filledAt?: string }> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const o = await getOrder(orderId);
+      const px = Number(o?.filled_avg_price);
+      if (o?.status === "filled" && Number.isFinite(px) && px > 0) {
+        return { price: px, filledAt: o.filled_at || o.filledAt };
+      }
+      if ((o?.status === "partially_filled" || o?.status === "done_for_day") && Number.isFinite(px) && px > 0) {
+        return { price: px, filledAt: o.filled_at || o.filledAt };
+      }
+    } catch { /* ignore and keep polling */ }
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  return { price: null };
 }
 
 /* -------------------------- time windows -------------------------- */
@@ -620,7 +641,7 @@ function scoreSetup(e: Awaited<ReturnType<typeof evaluateEntrySignals>>): SetupS
   let score = 0;
 
   const volMult = Number(e?.debug?.volPulse ?? 0);
-  const volMin  = Number(e?.debug?.V0L_MULT_MIN ?? e?.debug?.VOL_MULT_MIN ?? 999);
+  const volMin  = Number(e?.debug?.VOL_MULT_MIN ?? e?.debug?.VOL_MULT_MIN ?? 999);
   if (Number.isFinite(volMult) && Number.isFinite(volMin) && volMult >= volMin) {
     score++; r.push(`volOK(${volMult.toFixed(2)}≥${volMin.toFixed(2)})`);
   } else {
@@ -715,15 +736,21 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
 
-  // Poll for fill avg price
+  // --- NEW: Poll the actual order for the true fill price
   let entry = Number.isFinite(ref) ? ref : NaN;
-  for (let i = 0; i < 24; i++) {
+  try {
+    const { price } = await waitForFillAvgPrice(order.id);
+    if (Number.isFinite(Number(price)) && Number(price) > 0) {
+      entry = Number(price);
+    }
+  } catch { /* fallback below */ }
+  if (!Number.isFinite(entry)) {
+    // fallback to position if needed
     try {
       const pos = await getPosition(ticker);
       const px = Number(pos?.avg_entry_price);
-      if (Number.isFinite(px) && px > 0) { entry = px; break; }
+      if (Number.isFinite(px) && px > 0) entry = px;
     } catch {}
-    await new Promise(r => setTimeout(r, 250));
   }
   if (!Number.isFinite(entry)) entry = ref;
 
@@ -904,27 +931,45 @@ async function handle(req: Request) {
 
       const today = yyyyMmDdET();
 
-      // Mandatory exit after 15:50 ET
-      if (openPos && isMandatoryExitET()) {
-        const exitTicker = openPos.ticker;
-        try {
-          await closePositionMarket(exitTicker);
-          const q = await fmpQuoteCached(exitTicker);
-          const parsed = priceFromFmp(q);
-          const p = parsed != null ? parsed : Number(openPos.entryPrice);
-          const shares = Number(openPos.shares);
-          const entry = Number(openPos.entryPrice);
-          const exitVal = shares * p;
-          const realized = exitVal - shares * entry;
+     // Mandatory exit after 15:50 ET — record ACTUAL broker fill
+if (openPos && isMandatoryExitET()) {
+  const exitTicker = openPos.ticker;
+  const shares = Number(openPos.shares);
+  const entry = Number(openPos.entryPrice);
+  try {
+    // Close position with symbol + qty
+    const sellOrder = await sellMarket({ symbol: exitTicker, qty: shares, tif: "day" });
 
-          await prisma.trade.create({ data: { side: "SELL", ticker: exitTicker, price: p, shares } });
-          await prisma.position.update({ where: { id: openPos.id }, data: { open: false, exitPrice: p, exitAt: nowET() } });
-          state = await prisma.botState.update({ where: { id: 1 }, data: { cash: Number(state!.cash) + exitVal, pnl: Number(state!.pnl) + realized, equity: Number(state!.cash) + exitVal } });
+    // Poll for actual broker fill price
+    let filledExit: number | null = null;
+    if (sellOrder?.id) {
+      const r = await waitForFillAvgPrice(sellOrder.id);
+      if (Number.isFinite(Number(r.price))) filledExit = Number(r.price);
+    }
 
-          openPos = null;
-          debug.lastMessage = `Mandatory 15:50+ exit ${exitTicker}`;
-        } catch { debug.reasons.push("mandatory_exit_exception"); }
-      }
+    const p = Number.isFinite(Number(filledExit)) ? Number(filledExit) : entry;
+    const exitVal = shares * p;
+    const realized = exitVal - shares * entry;
+
+    await prisma.trade.create({
+      data: { side: "SELL", ticker: exitTicker, price: p, shares, brokerOrderId: sellOrder?.id ?? null }
+    });
+    await prisma.position.update({
+      where: { id: openPos.id },
+      data: { open: false, exitPrice: p, exitAt: nowET() }
+    });
+    state = await prisma.botState.update({
+      where: { id: 1 },
+      data: { cash: Number(state!.cash) + exitVal, pnl: Number(state!.pnl) + realized, equity: Number(state!.cash) + exitVal }
+    });
+
+    openPos = null;
+    debug.lastMessage = `Mandatory 15:50+ exit ${exitTicker} filled @ ${p}`;
+  } catch {
+    debug.reasons.push("mandatory_exit_exception");
+  }
+}
+
 
       // Weekday/market guard
       if (!isWeekdayET()) {
