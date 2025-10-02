@@ -23,8 +23,8 @@ import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
 /* -------------------------- sizing tiers -------------------------- */
 const SIZE_FULL = 1.0;
-const SIZE_HALF = 0.75;
-const SIZE_MICRO = 0.65;
+const SIZE_HALF = 0.9;
+const SIZE_MICRO = 0.8;
 
 /* -------------------------- throttle & config -------------------------- */
 let lastTickAt = 0;
@@ -32,8 +32,8 @@ let lastTickResponse: any = null;
 let pendingTick: Promise<any> | null = null;
 const MIN_TICK_MS = 200;
 
-const START_CASH = 6250;
-const INVEST_BUDGET = 6250;
+const START_CASH = 5000;
+const INVEST_BUDGET = 5000;
 
 /* -------------------------- exit / target rules -------------------------- */
 const STOP_PCT = -0.05;               // SL -5% (all trades at entry)
