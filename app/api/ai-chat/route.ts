@@ -82,27 +82,76 @@ function endOfETDayUTC(utcInstant: Date): Date {
   const start = startOfETDayUTC(utcInstant);
   return new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
 }
+/* ───────────────── Week config ───────────────── */
+// Choose how to interpret "week":
+//  - "trading": Monday→Friday ET (common for P&L)
+//  - "calendar": Monday→Sunday ET
+const WEEK_MODE: "trading" | "calendar" = "trading";
 
 /* ───────────────── Week helpers (ET) ───────────────── */
-// weekStart: 1 = Monday (trading-style week), 0 = Sunday (US calendar)
-function startOfETWeekUTC(utcInstant: Date, weekStart: 0 | 1 = 1): Date {
-  const startDay = startOfETDayUTC(utcInstant);
-  const isDST = isDST_US_Eastern(utcInstant);
-  const offsetMin = isDST ? -240 : -300;
-  const shifted = new Date(utcInstant.getTime() + offsetMin * 60_000);
-  const dow = shifted.getUTCDay(); // 0=Sun .. 6=Sat (in ET)
-  const daysFromWeekStart = (dow - weekStart + 7) % 7;
-  return new Date(startDay.getTime() - daysFromWeekStart * 24 * 60 * 60 * 1000);
+function etOffsetMin(utc: Date) {
+  return isDST_US_Eastern(utc) ? -240 : -300; // minutes to add to UTC to get ET clock
 }
-function endOfETWeekUTCFromStart(startUTC: Date): Date {
-  return new Date(startUTC.getTime() + 7 * 24 * 60 * 60 * 1000 - 1);
+function etDate(utc: Date) {
+  return new Date(utc.getTime() + etOffsetMin(utc) * 60_000);
+}
+function etDayOfWeek(utc: Date) {
+  // 0=Sun..6=Sat in ET
+  return etDate(utc).getUTCDay();
 }
 
-/** Parse ET date range from message. */
+// Start of ET day (you already have startOfETDayUTC / endOfETDayUTC)
+
+/** Monday 00:00:00 ET for the week containing utcInstant. */
+function startOfETWeekUTC(utcInstant: Date): Date {
+  const startDay = startOfETDayUTC(utcInstant);
+  const dow = etDayOfWeek(utcInstant); // 0..6
+  const daysFromMonday = (dow + 6) % 7; // Sun->6, Mon->0, Tue->1, ...
+  return new Date(startDay.getTime() - daysFromMonday * 24 * 60 * 60 * 1000);
+}
+
+/** End of week depending on mode. */
+function endOfETWeekUTCFromStart(weekStartUTC: Date): Date {
+  if (WEEK_MODE === "trading") {
+    // Friday 23:59:59.999 ET
+    const friStartUTC = new Date(weekStartUTC.getTime() + 4 * 24 * 60 * 60 * 1000);
+    return endOfETDayUTC(friStartUTC);
+  }
+  // calendar: Sunday 23:59:59.999 ET
+  return new Date(weekStartUTC.getTime() + 7 * 24 * 60 * 60 * 1000 - 1);
+}
+
+/**
+ * For weekend-aware WTD:
+ *  - If Sat/Sun and WEEK_MODE === 'trading', return the Mon→Fri that just ended.
+ *  - Otherwise Mon→today (end of day).
+ */
+function weekToDateRange(nowUTC: Date) {
+  const weekStart = startOfETWeekUTC(nowUTC);
+  const dow = etDayOfWeek(nowUTC); // 0=Sun, 6=Sat
+
+  if (WEEK_MODE === "trading") {
+    if (dow === 6 || dow === 0) {
+      // Sat/Sun → show the finished trading week (Mon→Fri)
+      const end = endOfETWeekUTCFromStart(weekStart);
+      return { startUTC: weekStart, endUTC: end, label: "this week (Mon–Fri)" };
+    }
+    // Mon–Fri → WTD is Mon→today
+    return { startUTC: weekStart, endUTC: endOfETDayUTC(nowUTC), label: "week to date" };
+  }
+
+  // calendar mode: Mon→today (or Mon→Sun if Sunday)
+  if (dow === 0) {
+    return { startUTC: weekStart, endUTC: endOfETDayUTC(nowUTC), label: "this week" };
+  }
+  return { startUTC: weekStart, endUTC: endOfETDayUTC(nowUTC), label: "week to date" };
+}
+
+/* ───────────────── Parse ET date range from message (REPLACE) ───────────────── */
 function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Date; endUTC: Date; label: string } {
   const lower = msg.toLowerCase();
 
-  // explicit YYYY-MM-DD (on ...)
+  // explicit YYYY-MM-DD
   const on = lower.match(/\b(on\s+)?(\d{4})[-/](\d{2})[-/](\d{2})\b/);
   if (on) {
     const Y = Number(on[2]), M = Number(on[3]), D = Number(on[4]);
@@ -110,7 +159,7 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: startOfETDayUTC(anchor), endUTC: endOfETDayUTC(anchor), label: `${Y}-${String(M).padStart(2,"0")}-${String(D).padStart(2,"0")}` };
   }
 
-  // between YYYY-MM-DD and/to YYYY-MM-DD
+  // between YYYY-MM-DD and YYYY-MM-DD
   const between = lower.match(/\bbetween\s+(\d{4})[-/](\d{2})[-/](\d{2})\s+(and|to)\s+(\d{4})[-/](\d{2})[-/](\d{2})\b/);
   if (between) {
     const Y1 = Number(between[1]), M1 = Number(between[2]), D1 = Number(between[3]);
@@ -120,22 +169,21 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: startOfETDayUTC(a), endUTC: endOfETDayUTC(b), label: `${Y1}-${String(M1).padStart(2,"0")}-${String(D1).padStart(2,"0")} → ${Y2}-${String(M2).padStart(2,"0")}-${String(D2).padStart(2,"0")}` };
   }
 
-  // week-to-date phrases
+  // Week-specific phrases first (before rolling windows)
   if (/\b(this week|for the week|week to date|wtd)\b/.test(lower)) {
-    const start = startOfETWeekUTC(nowUTC, 1); // Monday start for trading
-    const end = endOfETDayUTC(nowUTC);
-    return { startUTC: start, endUTC: end, label: "week to date" };
+    return weekToDateRange(nowUTC);
   }
 
-  // previous full week (Mon→Sun ET)
   if (/\blast week\b/.test(lower)) {
-    const thisWeekStart = startOfETWeekUTC(nowUTC, 1);
+    // previous full week
+    const thisWeekStart = startOfETWeekUTC(nowUTC);
     const lastWeekStart = new Date(thisWeekStart.getTime() - 7 * 24 * 60 * 60 * 1000);
     const lastWeekEnd = endOfETWeekUTCFromStart(lastWeekStart);
-    return { startUTC: lastWeekStart, endUTC: lastWeekEnd, label: "last week" };
+    const label = WEEK_MODE === "trading" ? "last week (Mon–Fri)" : "last week";
+    return { startUTC: lastWeekStart, endUTC: lastWeekEnd, label };
   }
 
-  // this month (full calendar month in ET)
+  // month helpers unchanged
   if (/\bthis month\b/.test(lower)) {
     const parts = toETParts(nowUTC);
     const [Y, M] = parts.ymd.split("-").map(Number);
@@ -151,20 +199,30 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: new Date(todayStart.getTime() - 24 * 60 * 60 * 1000), endUTC: new Date(todayStart.getTime() - 1), label: "yesterday" };
   }
 
-  // rolling windows: last N days/weeks
+  // Rolling windows: last N days/weeks
   const lastX = lower.match(/\blast\s+(\d{1,2})\s*(day|days|week|weeks)\b/);
   if (lastX) {
     const n = Number(lastX[1]);
-    const unit = lastX[2].startsWith("week") ? "week" : "day";
-    const days = unit === "week" ? n * 7 : n;
-    const end = endOfETDayUTC(nowUTC);
-    const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000 + 1);
-    return { startUTC: start, endUTC: end, label: `last ${n} ${unit}${n>1?"s":""}` };
+    const isWeek = lastX[2].startsWith("week");
+    if (isWeek && WEEK_MODE === "trading") {
+      // N trading weeks back-to-back (Mon→Fri, then previous Mon→Fri, etc.)
+      const thisStart = startOfETWeekUTC(nowUTC);
+      const end = endOfETWeekUTCFromStart(thisStart);
+      const start = new Date(thisStart.getTime() - n * 7 * 24 * 60 * 60 * 1000);
+      return { startUTC: start, endUTC: end, label: `last ${n} trading week${n>1?"s":""}` };
+    } else {
+      // simple rolling days/weeks
+      const days = isWeek ? n * 7 : n;
+      const end = endOfETDayUTC(nowUTC);
+      const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000 + 1);
+      return { startUTC: start, endUTC: end, label: `last ${n} ${isWeek ? "week" : "day"}${n>1?"s":""}` };
+    }
   }
 
-  // default: today (ET)
+  // Default: today
   return { startUTC: startOfETDayUTC(nowUTC), endUTC: endOfETDayUTC(nowUTC), label: "today" };
 }
+
 
 /* ───────────────── Types ───────────────── */
 type DbTrade = {
