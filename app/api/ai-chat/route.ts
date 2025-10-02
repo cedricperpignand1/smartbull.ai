@@ -83,10 +83,26 @@ function endOfETDayUTC(utcInstant: Date): Date {
   return new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
 }
 
+/* ───────────────── Week helpers (ET) ───────────────── */
+// weekStart: 1 = Monday (trading-style week), 0 = Sunday (US calendar)
+function startOfETWeekUTC(utcInstant: Date, weekStart: 0 | 1 = 1): Date {
+  const startDay = startOfETDayUTC(utcInstant);
+  const isDST = isDST_US_Eastern(utcInstant);
+  const offsetMin = isDST ? -240 : -300;
+  const shifted = new Date(utcInstant.getTime() + offsetMin * 60_000);
+  const dow = shifted.getUTCDay(); // 0=Sun .. 6=Sat (in ET)
+  const daysFromWeekStart = (dow - weekStart + 7) % 7;
+  return new Date(startDay.getTime() - daysFromWeekStart * 24 * 60 * 60 * 1000);
+}
+function endOfETWeekUTCFromStart(startUTC: Date): Date {
+  return new Date(startUTC.getTime() + 7 * 24 * 60 * 60 * 1000 - 1);
+}
+
 /** Parse ET date range from message. */
 function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Date; endUTC: Date; label: string } {
   const lower = msg.toLowerCase();
 
+  // explicit YYYY-MM-DD (on ...)
   const on = lower.match(/\b(on\s+)?(\d{4})[-/](\d{2})[-/](\d{2})\b/);
   if (on) {
     const Y = Number(on[2]), M = Number(on[3]), D = Number(on[4]);
@@ -94,6 +110,7 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: startOfETDayUTC(anchor), endUTC: endOfETDayUTC(anchor), label: `${Y}-${String(M).padStart(2,"0")}-${String(D).padStart(2,"0")}` };
   }
 
+  // between YYYY-MM-DD and/to YYYY-MM-DD
   const between = lower.match(/\bbetween\s+(\d{4})[-/](\d{2})[-/](\d{2})\s+(and|to)\s+(\d{4})[-/](\d{2})[-/](\d{2})\b/);
   if (between) {
     const Y1 = Number(between[1]), M1 = Number(between[2]), D1 = Number(between[3]);
@@ -103,6 +120,38 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: startOfETDayUTC(a), endUTC: endOfETDayUTC(b), label: `${Y1}-${String(M1).padStart(2,"0")}-${String(D1).padStart(2,"0")} → ${Y2}-${String(M2).padStart(2,"0")}-${String(D2).padStart(2,"0")}` };
   }
 
+  // week-to-date phrases
+  if (/\b(this week|for the week|week to date|wtd)\b/.test(lower)) {
+    const start = startOfETWeekUTC(nowUTC, 1); // Monday start for trading
+    const end = endOfETDayUTC(nowUTC);
+    return { startUTC: start, endUTC: end, label: "week to date" };
+  }
+
+  // previous full week (Mon→Sun ET)
+  if (/\blast week\b/.test(lower)) {
+    const thisWeekStart = startOfETWeekUTC(nowUTC, 1);
+    const lastWeekStart = new Date(thisWeekStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const lastWeekEnd = endOfETWeekUTCFromStart(lastWeekStart);
+    return { startUTC: lastWeekStart, endUTC: lastWeekEnd, label: "last week" };
+  }
+
+  // this month (full calendar month in ET)
+  if (/\bthis month\b/.test(lower)) {
+    const parts = toETParts(nowUTC);
+    const [Y, M] = parts.ymd.split("-").map(Number);
+    const start = startOfETDayUTC(new Date(Date.UTC(Y, M - 1, 1, 12)));
+    const firstNext = new Date(Date.UTC(Y, M, 1, 12));
+    const lastDay = new Date(firstNext.getTime() - 24 * 60 * 60 * 1000);
+    return { startUTC: start, endUTC: endOfETDayUTC(lastDay), label: "this month" };
+  }
+
+  // yesterday
+  if (/\byesterday\b/.test(lower)) {
+    const todayStart = startOfETDayUTC(nowUTC);
+    return { startUTC: new Date(todayStart.getTime() - 24 * 60 * 60 * 1000), endUTC: new Date(todayStart.getTime() - 1), label: "yesterday" };
+  }
+
+  // rolling windows: last N days/weeks
   const lastX = lower.match(/\blast\s+(\d{1,2})\s*(day|days|week|weeks)\b/);
   if (lastX) {
     const n = Number(lastX[1]);
@@ -113,30 +162,7 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: start, endUTC: end, label: `last ${n} ${unit}${n>1?"s":""}` };
   }
 
-  if (/\bthis week\b/.test(lower)) {
-    const todayStart = startOfETDayUTC(nowUTC);
-    const etAnchor = new Date(todayStart.getTime() + 12 * 60 * 60 * 1000);
-    const dow = new Date(etAnchor).getUTCDay();
-    const daysFromMon = (dow + 6) % 7;
-    const start = new Date(todayStart.getTime() - daysFromMon * 24 * 60 * 60 * 1000);
-    const end = endOfETDayUTC(nowUTC);
-    return { startUTC: start, endUTC: end, label: "this week" };
-  }
-
-  if (/\bthis month\b/.test(lower)) {
-    const parts = toETParts(nowUTC);
-    const [Y, M] = parts.ymd.split("-").map(Number);
-    const start = startOfETDayUTC(new Date(Date.UTC(Y, M - 1, 1, 12)));
-    const firstNext = new Date(Date.UTC(Y, M, 1, 12));
-    const lastDay = new Date(firstNext.getTime() - 24 * 60 * 60 * 1000);
-    return { startUTC: start, endUTC: endOfETDayUTC(lastDay), label: "this month" };
-  }
-
-  if (/\byesterday\b/.test(lower)) {
-    const todayStart = startOfETDayUTC(nowUTC);
-    return { startUTC: new Date(todayStart.getTime() - 24 * 60 * 60 * 1000), endUTC: new Date(todayStart.getTime() - 1), label: "yesterday" };
-  }
-
+  // default: today (ET)
   return { startUTC: startOfETDayUTC(nowUTC), endUTC: endOfETDayUTC(nowUTC), label: "today" };
 }
 
@@ -515,7 +541,6 @@ async function buildWhyPickNarrative(base: string, symbol: string) {
   const name = profile.companyName ? `${profile.companyName} (${symbol})` : symbol;
   const scoreStr = Number.isFinite(Number(ev?.score)) ? ` with the highest internal score (${Number(ev.score).toFixed(2)})` : "";
 
-  // Core paragraph
   lines.push(
     `We ranked ${name}${scoreStr} because it matched more of our preferred conditions at the time: ` +
     `${floatTag ? `${floatTag}` : "adequate float"}, ` +
@@ -590,7 +615,6 @@ function renderWhyTradeReport(params: {
     recExplanation
   } = params;
 
-  // Produce a flowing paragraph (no bullets), using simple sentences.
   const bits: string[] = [];
   bits.push(`We entered ${symbol} around $${entryPrice.toFixed(2)} at ${entryET.replace("T", " ").replace(".000Z","")} ET.`);
 
@@ -1024,7 +1048,6 @@ export async function POST(req: Request) {
         });
       }
 
-      // Always return the paragraph
       return NextResponse.json({ reply: narrative });
     }
 
@@ -1054,8 +1077,8 @@ export async function POST(req: Request) {
     const pieces: string[] = [];
     pieces.push(openPos?.open ? tone.holding(openPos) : tone.flat());
     if (traded === "No trades in that range.") {
-      const base = getBaseUrl(req);
-      const why = await explainNoTradeToday(base).catch(() => null);
+      const base2 = getBaseUrl(req);
+      const why = await explainNoTradeToday(base2).catch(() => null);
       pieces.push(`No trades ${label}.`);
       if (why) pieces.push(why);
     } else {
