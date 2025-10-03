@@ -183,7 +183,7 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: lastWeekStart, endUTC: lastWeekEnd, label };
   }
 
-  // month helpers unchanged
+  // month helpers
   if (/\bthis month\b/.test(lower)) {
     const parts = toETParts(nowUTC);
     const [Y, M] = parts.ymd.split("-").map(Number);
@@ -299,6 +299,58 @@ function realizedFIFO(tradesAsc: DbTrade[]): number {
 function realizedForTicker(tradesAsc: DbTrade[], ticker: string) {
   const rows = tradesAsc.filter(t => t.ticker.toUpperCase() === ticker.toUpperCase());
   return realizedFIFO(rows);
+}
+
+/* ── WEEKLY REALIZED BY DAY (FIFO across time, attribute P&L to SELL day) ── */
+function ymdETFromUTC(utc: Date): string {
+  return toETParts(utc).ymd;
+}
+
+/**
+ * Walk FIFO across the (ascending) trades and attribute realized P&L
+ * to the ET date of each SELL fill/at.
+ *
+ * This correctly handles buys from prior days that are sold today,
+ * attributing the realized P&L to *today*.
+ */
+function realizedByDayFIFO(tradesAsc: DbTrade[]): Map<string, number> {
+  const lots: Lot[] = [];
+  const byDay = new Map<string, number>();
+
+  for (const t of tradesAsc) {
+    const price = asNumber(t.filledPrice != null ? t.filledPrice : t.price);
+    const side = String(t.side).toUpperCase();
+
+    if (side === "BUY") {
+      lots.push({ qty: t.shares, cost: price });
+      continue;
+    }
+
+    if (side === "SELL") {
+      let remain = t.shares;
+      let dayPnl = 0;
+
+      while (remain > 0 && lots.length) {
+        const lot = lots[0];
+        const take = Math.min(lot.qty, remain);
+        dayPnl += (price - lot.cost) * take;
+        lot.qty -= take;
+        remain -= take;
+        if (lot.qty === 0) lots.shift();
+      }
+
+      const when = new Date(t.filledAt || t.at);
+      const ymd = ymdETFromUTC(when);
+      byDay.set(ymd, (byDay.get(ymd) || 0) + dayPnl);
+    }
+  }
+  return byDay;
+}
+
+/** Pretty money with +/- sign (reuses your money() but without the emoji tone). */
+function moneyFlat(n: number) {
+  if (!Number.isFinite(n)) return "n/a";
+  return (n >= 0 ? `+$${n.toFixed(2)}` : `-$${Math.abs(n).toFixed(2)}`);
 }
 
 /* ───────────────── Tone helpers ───────────────── */
@@ -954,7 +1006,40 @@ export async function POST(req: Request) {
       return NextResponse.json({ reply: await maybePolishReply(draft) });
     }
 
+    /* ─────────────── P&L (updated weekly breakdown) ─────────────── */
     if (intent === "pnl") {
+      const weeklyQuery =
+        /\b(this week|for the week|week to date|wtd|last week|week)\b/i.test(msg) ||
+        /week/i.test(label);
+
+      if (weeklyQuery) {
+        // Break down realized by ET day for the selected week range
+        const byDay = realizedByDayFIFO(tradesInRange);
+        const days = Array.from(byDay.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+        const total = days.reduce((s, [, v]) => s + v, 0);
+        const greenSum = days.filter(([, v]) => v > 0).reduce((s, [, v]) => s + v, 0);
+        const redSum = days.filter(([, v]) => v < 0).reduce((s, [, v]) => s + v, 0);
+
+        if (!days.length) {
+          const draft = tone.fun(`no realized trades ${label}, so realized P&L is $0.00.`);
+          return NextResponse.json({ reply: await maybePolishReply(draft, { realized: 0, label }) });
+        }
+
+        const lines: string[] = [];
+        lines.push(tone.fun(`realized P&L ${label}: ${money(total)}.`));
+        lines.push(`Green days sum: ${moneyFlat(greenSum)} • Red days sum: ${moneyFlat(redSum)}`);
+
+        for (const [ymd, val] of days) {
+          lines.push(`• ${ymd}: ${moneyFlat(val)}`);
+        }
+
+        return NextResponse.json({
+          reply: await maybePolishReply(lines.join("\n"), { total, greenSum, redSum, days, label }, { maxLen: 1200 })
+        });
+      }
+
+      // Fallback: non-week queries (today, yesterday, this month, last N days, etc.)
       const realized = realizedFIFO(tradesInRange);
       const draft = !tradesInRange.length
         ? tone.fun(`no trades ${label}, so realized P&L is $0.00.`)
