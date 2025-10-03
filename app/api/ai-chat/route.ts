@@ -100,8 +100,6 @@ function etDayOfWeek(utc: Date) {
   return etDate(utc).getUTCDay();
 }
 
-// Start of ET day (you already have startOfETDayUTC / endOfETDayUTC)
-
 /** Monday 00:00:00 ET for the week containing utcInstant. */
 function startOfETWeekUTC(utcInstant: Date): Date {
   const startDay = startOfETDayUTC(utcInstant);
@@ -147,7 +145,7 @@ function weekToDateRange(nowUTC: Date) {
   return { startUTC: weekStart, endUTC: endOfETDayUTC(nowUTC), label: "week to date" };
 }
 
-/* ───────────────── Parse ET date range from message (REPLACE) ───────────────── */
+/* ───────────────── Parse ET date range from message ───────────────── */
 function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Date; endUTC: Date; label: string } {
   const lower = msg.toLowerCase();
 
@@ -183,7 +181,7 @@ function parseDateRangeETFromMessage(msg: string, nowUTC: Date): { startUTC: Dat
     return { startUTC: lastWeekStart, endUTC: lastWeekEnd, label };
   }
 
-  // month helpers
+  // month helpers unchanged
   if (/\bthis month\b/.test(lower)) {
     const parts = toETParts(nowUTC);
     const [Y, M] = parts.ymd.split("-").map(Number);
@@ -275,14 +273,24 @@ function money(n: number) {
   if (!Number.isFinite(n)) return "n/a";
   return n >= 0 ? `+$${n.toFixed(2)}` : `-$${Math.abs(n).toFixed(2)}`;
 }
+function priceOfTrade(t: DbTrade) {
+  const p = t.filledPrice != null ? asNumber(t.filledPrice) : asNumber(t.price);
+  return Number.isFinite(p) ? p : asNumber(t.price);
+}
+
+/** REALIZED total across all tickers using per-ticker FIFO queues. */
 function realizedFIFO(tradesAsc: DbTrade[]): number {
-  const lots: Lot[] = [];
+  const lotsByTicker = new Map<string, Lot[]>();
   let realized = 0;
   for (const t of tradesAsc) {
-    const p = asNumber(t.price);
+    const sym = t.ticker.toUpperCase();
+    const p = priceOfTrade(t);
     const side = String(t.side).toUpperCase();
-    if (side === "BUY") lots.push({ qty: t.shares, cost: p });
-    else if (side === "SELL") {
+    const lots = lotsByTicker.get(sym) || [];
+    if (side === "BUY") {
+      lots.push({ qty: t.shares, cost: p });
+      lotsByTicker.set(sym, lots);
+    } else if (side === "SELL") {
       let remain = t.shares;
       while (remain > 0 && lots.length) {
         const lot = lots[0];
@@ -292,6 +300,7 @@ function realizedFIFO(tradesAsc: DbTrade[]): number {
         remain -= take;
         if (lot.qty === 0) lots.shift();
       }
+      lotsByTicker.set(sym, lots);
     }
   }
   return realized;
@@ -301,43 +310,73 @@ function realizedForTicker(tradesAsc: DbTrade[], ticker: string) {
   return realizedFIFO(rows);
 }
 
-/* ── WEEKLY REALIZED BY DAY (FIFO across time, attribute P&L to SELL day) ── */
+/* ── carry-in lots from trades before the start of the range ── */
+function buildSeedLotsBefore(priorTradesAsc: DbTrade[]): Map<string, Lot[]> {
+  const lotsByTicker = new Map<string, Lot[]>();
+  for (const t of priorTradesAsc) {
+    const sym = t.ticker.toUpperCase();
+    const p = priceOfTrade(t);
+    const side = String(t.side).toUpperCase();
+    const lots = lotsByTicker.get(sym) || [];
+    if (side === "BUY") {
+      lots.push({ qty: t.shares, cost: p });
+    } else if (side === "SELL") {
+      let remain = t.shares;
+      while (remain > 0 && lots.length) {
+        const lot = lots[0];
+        const take = Math.min(lot.qty, remain);
+        lot.qty -= take;               // consume prior lots
+        remain -= take;
+        if (lot.qty === 0) lots.shift();
+      }
+    }
+    lotsByTicker.set(sym, lots);
+  }
+  return lotsByTicker;
+}
+
+/* ── realized per ET day, attributing P&L to SELL day; per-ticker FIFO with optional seeds ── */
 function ymdETFromUTC(utc: Date): string {
   return toETParts(utc).ymd;
 }
-
-/**
- * Walk FIFO across the (ascending) trades and attribute realized P&L
- * to the ET date of each SELL fill/at.
- *
- * This correctly handles buys from prior days that are sold today,
- * attributing the realized P&L to *today*.
- */
-function realizedByDayFIFO(tradesAsc: DbTrade[]): Map<string, number> {
-  const lots: Lot[] = [];
+function realizedByDayFIFO(
+  tradesAsc: DbTrade[],
+  seedLotsByTicker?: Map<string, Lot[]>
+): Map<string, number> {
   const byDay = new Map<string, number>();
+  const lotsByTicker = new Map<string, Lot[]>();
+
+  // copy seeds
+  if (seedLotsByTicker) {
+    for (const [sym, lots] of seedLotsByTicker.entries()) {
+      lotsByTicker.set(sym, lots.map(l => ({ qty: l.qty, cost: l.cost })));
+    }
+  }
 
   for (const t of tradesAsc) {
-    const price = asNumber(t.filledPrice != null ? t.filledPrice : t.price);
+    const sym = t.ticker.toUpperCase();
+    const p = priceOfTrade(t);
     const side = String(t.side).toUpperCase();
+    const lots = lotsByTicker.get(sym) || [];
 
     if (side === "BUY") {
-      lots.push({ qty: t.shares, cost: price });
+      lots.push({ qty: t.shares, cost: p });
+      lotsByTicker.set(sym, lots);
       continue;
     }
 
     if (side === "SELL") {
       let remain = t.shares;
       let dayPnl = 0;
-
       while (remain > 0 && lots.length) {
         const lot = lots[0];
         const take = Math.min(lot.qty, remain);
-        dayPnl += (price - lot.cost) * take;
+        dayPnl += (p - lot.cost) * take;
         lot.qty -= take;
         remain -= take;
         if (lot.qty === 0) lots.shift();
       }
+      lotsByTicker.set(sym, lots);
 
       const when = new Date(t.filledAt || t.at);
       const ymd = ymdETFromUTC(when);
@@ -347,7 +386,7 @@ function realizedByDayFIFO(tradesAsc: DbTrade[]): Map<string, number> {
   return byDay;
 }
 
-/** Pretty money with +/- sign (reuses your money() but without the emoji tone). */
+/** Pretty money with +/- sign (no extra tone). */
 function moneyFlat(n: number) {
   if (!Number.isFinite(n)) return "n/a";
   return (n >= 0 ? `+$${n.toFixed(2)}` : `-$${Math.abs(n).toFixed(2)}`);
@@ -614,7 +653,6 @@ async function buildWhyPickNarrative(base: string, symbol: string) {
   const evals = tick?.debug?.scan_evals || {};
   const ev = evals?.[symbol] || {};
   const spreadOK = ev?.debug?.spread?.spreadOK;
-  const spreadLimit = ev?.debug?.spread?.limitPct;
   const liqOK = ev?.debug?.liquidity?.ok;
   const dvol = ev?.debug?.liquidity?.dollarVol;
   const minDollarVol = tick?.info?.liquidity?.minDollarVol;
@@ -662,9 +700,7 @@ async function buildWhyPickNarrative(base: string, symbol: string) {
     `${Number.isFinite(minDollarVol) ? `we require roughly $${Math.round(minDollarVol).toLocaleString()} per minute.` : ""}`
   );
 
-  if (savedReason) {
-    lines.push(` The picker’s stored note for ${symbol} was: “${savedReason}”.`);
-  }
+  if (savedReason) lines.push(` The picker’s stored note for ${symbol} was: “${savedReason}”.`);
 
   if (rival?.symbol) {
     const rivalName = rivalProfile.companyName ? `${rivalProfile.companyName} (${rival.symbol})` : rival.symbol;
@@ -682,15 +718,11 @@ async function buildWhyPickNarrative(base: string, symbol: string) {
     const hypeA = hypeTags(profile.sector, profile.industry).join("/");
     const hypeB = hypeTags(rivalProfile.sector, rivalProfile.industry).join("/");
     if (hypeA && !hypeB) youVsRival.push("it aligns with a current market-hype theme");
-    if (youVsRival.length) {
-      lines.push(` We preferred it over ${rivalName} because ${youVsRival.join(", ")}.`);
-    } else {
-      lines.push(` It was slightly preferred over ${rivalName} given our checks at that moment.`);
-    }
+    if (youVsRival.length) lines.push(` We preferred it over ${rivalName} because ${youVsRival.join(", ")}.`);
+    else lines.push(` It was slightly preferred over ${rivalName} given our checks at that moment.`);
   }
 
   lines.push(` In short, the picker liked ${symbol} because it fit our playbook—structure, liquidity, and market theme—better than the other candidate at that moment.`);
-
   return lines.join("");
 }
 
@@ -969,10 +1001,19 @@ export async function POST(req: Request) {
     const intent = parseIntent(msg);
     const { startUTC, endUTC, label } = parseDateRangeETFromMessage(msg, nowUTC);
 
+    // in-range trades
     const tradesInRange = await prisma.trade.findMany({
       where: { at: { gte: startUTC, lte: endUTC } },
       orderBy: { id: "asc" },
     }) as unknown as DbTrade[];
+
+    // seed with prior trades (carry-in lots per ticker)
+    const priorTrades = await prisma.trade.findMany({
+      where: { at: { lt: startUTC } },
+      orderBy: { id: "asc" },
+    }) as unknown as DbTrade[];
+    const seedLots = buildSeedLotsBefore(priorTrades);
+
     const openPos = await prisma.position.findFirst({
       where: { open: true },
       orderBy: { id: "desc" },
@@ -1006,15 +1047,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ reply: await maybePolishReply(draft) });
     }
 
-    /* ─────────────── P&L (updated weekly breakdown) ─────────────── */
+    /* ─────────────── P&L (weekly breakdown with seeds & per-ticker FIFO) ─────────────── */
     if (intent === "pnl") {
       const weeklyQuery =
         /\b(this week|for the week|week to date|wtd|last week|week)\b/i.test(msg) ||
         /week/i.test(label);
 
       if (weeklyQuery) {
-        // Break down realized by ET day for the selected week range
-        const byDay = realizedByDayFIFO(tradesInRange);
+        const byDay = realizedByDayFIFO(tradesInRange, seedLots);
         const days = Array.from(byDay.entries()).sort((a, b) => a[0].localeCompare(b[0]));
 
         const total = days.reduce((s, [, v]) => s + v, 0);
@@ -1029,10 +1069,7 @@ export async function POST(req: Request) {
         const lines: string[] = [];
         lines.push(tone.fun(`realized P&L ${label}: ${money(total)}.`));
         lines.push(`Green days sum: ${moneyFlat(greenSum)} • Red days sum: ${moneyFlat(redSum)}`);
-
-        for (const [ymd, val] of days) {
-          lines.push(`• ${ymd}: ${moneyFlat(val)}`);
-        }
+        for (const [ymd, val] of days) lines.push(`• ${ymd}: ${moneyFlat(val)}`);
 
         return NextResponse.json({
           reply: await maybePolishReply(lines.join("\n"), { total, greenSum, redSum, days, label }, { maxLen: 1200 })
@@ -1217,6 +1254,7 @@ export async function POST(req: Request) {
     // Default status
     const realized = realizedFIFO(tradesInRange);
     const traded = summarizeTrades(tradesInRange);
+
     const pieces: string[] = [];
     pieces.push(openPos?.open ? tone.holding(openPos) : tone.flat());
     if (traded === "No trades in that range.") {
