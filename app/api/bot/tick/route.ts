@@ -1,4 +1,4 @@
-// app/api/bot/tick/route.ts
+// app/api/bot/tick/route.ts 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -641,7 +641,7 @@ function scoreSetup(e: Awaited<ReturnType<typeof evaluateEntrySignals>>): SetupS
   let score = 0;
 
   const volMult = Number(e?.debug?.volPulse ?? 0);
-  const volMin  = Number(e?.debug?.VOL_MULT_MIN ?? e?.debug?.VOL_MULT_MIN ?? 999);
+  const volMin  = Number(e?.debug?.VOL_MULT_MIN ?? 999);
   if (Number.isFinite(volMult) && Number.isFinite(volMin) && volMult >= volMin) {
     score++; r.push(`volOK(${volMult.toFixed(2)}≥${volMin.toFixed(2)})`);
   } else {
@@ -652,11 +652,21 @@ function scoreSetup(e: Awaited<ReturnType<typeof evaluateEntrySignals>>): SetupS
   if (e?.debug?.signals?.breakORH || e?.debug?.signals?.nearOR) { score++; r.push("ORH/nearOR"); } else r.push("noORH");
   if (e?.debug?.aboveVWAP) { score++; r.push("aboveVWAP"); } else r.push("belowVWAP");
 
+  // ✅ NEW: reward strongest confirmations so FULL can actually trigger
+  if (e.armedDip)       { score++; r.push("armedDip"); }
+  if (e.armedHigherLow) { score++; r.push("higherLow"); }
+
   return { score, reasons: r };
 }
 
-/* -------- map score -> size (unchanged) -------- */
-function sizeForScoreOptionA(score: number): { sizeMult: number; label: "full"|"half"|"micro" } {
+/* -------- map score -> size (UPDATED) -------- */
+function sizeForScoreOptionA(
+  score: number,
+  e: Awaited<ReturnType<typeof evaluateEntrySignals>>
+): { sizeMult: number; label: "full"|"half"|"micro" } {
+  // If it’s a premium confirmation, allow FULL immediately.
+  if (e.armedHigherLow || e.armedDip) return { sizeMult: SIZE_FULL, label: "full" };
+
   if (score >= 2) return { sizeMult: SIZE_FULL, label: "full" };
   if (score === 1) return { sizeMult: SIZE_HALF, label: "half" };
   return { sizeMult: SIZE_MICRO, label: "micro" };
@@ -1456,7 +1466,8 @@ async function runScanWindow(opts: {
 
     const chosenEval = evals[chosen]!;
     const { score } = scoreSetup(chosenEval);
-    const { sizeMult } = sizeForScoreOptionA(score);
+    const { sizeMult } = sizeForScoreOptionA(score, chosenEval); // UPDATED: pass eval
+
     const mode: EntryMode = score >= 2 ? "strong" : "weak";
 
     const placed = await placeEntryNow(chosen, Number(ref), stateRef(), sizeMult, mode);
@@ -1509,7 +1520,7 @@ async function runForceWindowPrimarySecondary(opts: {
   const trySymbols = [primary, secondary].filter(Boolean) as string[];
   let placedSymbol: string | null = null;
 
-  // NEW: atomic claim for force window
+  // Atomic claim for the force window
   const claimed = await acquireDayLock(today);
   if (!claimed) {
     debug[`${labelPrefix}_final`] = { placedSymbol: null, reason: "lock_not_acquired" };
@@ -1547,7 +1558,7 @@ async function runForceWindowPrimarySecondary(opts: {
       try {
         const evalRes = assess.ev ?? await evaluateEntrySignals(sym, snapshot, yyyyMmDdET(), base);
         const { score } = scoreSetup(evalRes);
-        const { sizeMult } = sizeForScoreOptionA(score);
+        const { sizeMult } = sizeForScoreOptionA(score, evalRes); // <-- UPDATED: pass eval for premium confirmations
         const mode: EntryMode = score >= 2 ? "strong" : "weak";
 
         const placed = await placeEntryNow(sym, Number(ref), stateRef(), sizeMult, mode);
@@ -1557,7 +1568,9 @@ async function runForceWindowPrimarySecondary(opts: {
           setOpenPos(newOpen);
           break;
         }
-      } catch {}
+      } catch {
+        // swallow and try next symbol
+      }
     }
   } finally {
     // If nothing placed, release the lock so later windows can try again
@@ -1566,3 +1579,4 @@ async function runForceWindowPrimarySecondary(opts: {
 
   debug[`${labelPrefix}_final`] = { placedSymbol: placedSymbol ?? null };
 }
+
