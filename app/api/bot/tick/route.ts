@@ -383,7 +383,6 @@ function computeHigherLowAfterOpen(candles: Candle[], todayYMD: string) {
 
   return { ok: true, firstLow, higherLow, confirmBarClose: confirmClose };
 }
-
 /* -------------------------- helpers -------------------------- */
 function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
@@ -633,7 +632,6 @@ async function evaluateEntrySignals(
     debug: dbg
   };
 }
-
 /* -------------------------- setup scoring -------------------------- */
 type SetupScore = { score: number; reasons: string[] };
 function scoreSetup(e: Awaited<ReturnType<typeof evaluateEntrySignals>>): SetupScore {
@@ -652,27 +650,24 @@ function scoreSetup(e: Awaited<ReturnType<typeof evaluateEntrySignals>>): SetupS
   if (e?.debug?.signals?.breakORH || e?.debug?.signals?.nearOR) { score++; r.push("ORH/nearOR"); } else r.push("noORH");
   if (e?.debug?.aboveVWAP) { score++; r.push("aboveVWAP"); } else r.push("belowVWAP");
 
-  // ✅ NEW: reward strongest confirmations so FULL can actually trigger
   if (e.armedDip)       { score++; r.push("armedDip"); }
   if (e.armedHigherLow) { score++; r.push("higherLow"); }
 
   return { score, reasons: r };
 }
 
-/* -------- map score -> size (UPDATED) -------- */
+/* -------- map score -> size -------- */
 function sizeForScoreOptionA(
   score: number,
   e: Awaited<ReturnType<typeof evaluateEntrySignals>>
 ): { sizeMult: number; label: "full"|"half"|"micro" } {
-  // If it’s a premium confirmation, allow FULL immediately.
   if (e.armedHigherLow || e.armedDip) return { sizeMult: SIZE_FULL, label: "full" };
-
   if (score >= 2) return { sizeMult: SIZE_FULL, label: "full" };
   if (score === 1) return { sizeMult: SIZE_HALF, label: "half" };
   return { sizeMult: SIZE_MICRO, label: "micro" };
 }
 
-/* -------------------------- entry quality scoring (for tie-breaks) -------------------------- */
+/* -------------------------- entry quality scoring -------------------------- */
 function entryQualityScore(e: Awaited<ReturnType<typeof evaluateEntrySignals>>) {
   let score = 0;
   if (e.armedHigherLow) score += 3;
@@ -702,12 +697,16 @@ function entryQualityScore(e: Awaited<ReturnType<typeof evaluateEntrySignals>>) 
   };
 }
 
-/* -------------------------- order helper (weak vs strong) -------------------------- */
+/* -------------------------- order helper -------------------------- */
 type EntryMode = "weak" | "strong";
 
-// NOTE: lock is now handled by caller; do NOT set the day-lock here.
-async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult = 1.0, mode: EntryMode) {
-  // live cash/buying power from Alpaca
+async function placeEntryNow(
+  ticker: string,
+  ref: number,
+  state: any,
+  sizeMult = 1.0,
+  mode: EntryMode
+) {
   let cashNum = 0;
   try {
     const acct = await memoGetAccount();
@@ -724,9 +723,8 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
 
   let shares = Math.floor(budget / ref);
   if (shares <= 0 && budget >= ref) shares = 1;
-  if (shares <= 0) return { ok: false, reason: `insufficient_cash_for_one_share_ref_${ticker}_${ref.toFixed(2)}` };
+  if (shares <= 0) return { ok: false, reason: `insufficient_cash_${ticker}_${ref.toFixed(2)}` };
 
-  // strong: dummy high TP (+50%); weak: +5% TP
   const tmpTp = ref * (1 + (mode === "strong" ? TARGET_PCT_STRONG_DUMMY : TARGET_PCT_WEAK));
   const tmpSl = ref * (1 + STOP_PCT);
 
@@ -746,16 +744,12 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     return { ok: false, reason: `alpaca_submit_failed_${ticker}:${msg}${body ? " body="+body : ""}` };
   }
 
-  // --- NEW: Poll the actual order for the true fill price
   let entry = Number.isFinite(ref) ? ref : NaN;
   try {
     const { price } = await waitForFillAvgPrice(order.id);
-    if (Number.isFinite(Number(price)) && Number(price) > 0) {
-      entry = Number(price);
-    }
-  } catch { /* fallback below */ }
+    if (Number.isFinite(Number(price)) && Number(price) > 0) entry = Number(price);
+  } catch {}
   if (!Number.isFinite(entry)) {
-    // fallback to position if needed
     try {
       const pos = await getPosition(ticker);
       const px = Number(pos?.avg_entry_price);
@@ -764,25 +758,21 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
   }
   if (!Number.isFinite(entry)) entry = ref;
 
-  // recenter TP/SL to entry-based values
   const newTp = round2(entry * (1 + (mode === "strong" ? TARGET_PCT_STRONG_DUMMY : TARGET_PCT_WEAK)));
   const newSl = round2(entry * (1 + STOP_PCT));
   try {
     await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true });
   } catch {}
 
-  // Persist the position & trade
   await prisma.position.create({ data: { ticker, entryPrice: entry, shares, open: true, brokerOrderId: order.id } });
   await prisma.trade.create({ data: { side: "BUY", ticker, price: entry, shares, brokerOrderId: order.id } });
 
-  // UI-only equity/cash update (server sync happens per tick)
   const newCash = Math.max(0, Number(state?.cash ?? 0) - shares * entry);
   await prisma.botState.update({
     where: { id: 1 },
     data: { cash: newCash, equity: newCash + shares * entry },
   });
 
-  // init ratchet state for runner
   ratchetState[ticker] = {
     entry,
     high: entry,
@@ -792,18 +782,15 @@ async function placeEntryNow(ticker: string, ref: number, state: any, sizeMult =
     lastSL: newSl,
     lastTP: newTp,
   };
-
-  // also init daily SL memo (used by classic ratchet path)
   lastDynSLMemo[ticker] = { day: yyyyMmDdET(), sl: newSl };
 
   return { ok: true, shares };
 }
 
-/* -------------------------- memos (ratchet + SL tracking) -------------------------- */
+/* -------------------------- ratchet tracking -------------------------- */
 const lastDynSLMemo: Record<string, { day: string; sl: number }> = {};
 type RatchetState = { entry: number; high: number; lastRung: number; lastLiftAt: number; runner: boolean; lastSL: number; lastTP: number };
 const ratchetState: Record<string, RatchetState> = {};
-
 /* -------------------------- gentle gate for force windows -------------------------- */
 async function assessObviousWeakAtForce(opts: {
   symbol: string;
@@ -941,45 +928,42 @@ async function handle(req: Request) {
 
       const today = yyyyMmDdET();
 
-     // Mandatory exit after 15:50 ET — record ACTUAL broker fill
-if (openPos && isMandatoryExitET()) {
-  const exitTicker = openPos.ticker;
-  const shares = Number(openPos.shares);
-  const entry = Number(openPos.entryPrice);
-  try {
-    // Close position with symbol + qty
-    const sellOrder = await sellMarket({ symbol: exitTicker, qty: shares, tif: "day" });
+      // Mandatory exit after 15:50 ET — record actual broker fill
+      if (openPos && isMandatoryExitET()) {
+        const exitTicker = openPos.ticker;
+        const shares = Number(openPos.shares);
+        const entry = Number(openPos.entryPrice);
+        try {
+          const sellOrder = await sellMarket({ symbol: exitTicker, qty: shares, tif: "day" });
 
-    // Poll for actual broker fill price
-    let filledExit: number | null = null;
-    if (sellOrder?.id) {
-      const r = await waitForFillAvgPrice(sellOrder.id);
-      if (Number.isFinite(Number(r.price))) filledExit = Number(r.price);
-    }
+          let filledExit: number | null = null;
+          if (sellOrder?.id) {
+            const r = await waitForFillAvgPrice(sellOrder.id);
+            if (Number.isFinite(Number(r.price))) filledExit = Number(r.price);
+          }
 
-    const p = Number.isFinite(Number(filledExit)) ? Number(filledExit) : entry;
-    const exitVal = shares * p;
-    const realized = exitVal - shares * entry;
+          const p = Number.isFinite(Number(filledExit)) ? Number(filledExit) : entry;
+          const exitVal = shares * p;
+          const realized = exitVal - shares * entry;
 
-    await prisma.trade.create({
-      data: { side: "SELL", ticker: exitTicker, price: p, shares, brokerOrderId: sellOrder?.id ?? null }
-    });
-    await prisma.position.update({
-      where: { id: openPos.id },
-      data: { open: false, exitPrice: p, exitAt: nowET() }
-    });
-    state = await prisma.botState.update({
-      where: { id: 1 },
-      data: { cash: Number(state!.cash) + exitVal, pnl: Number(state!.pnl) + realized, equity: Number(state!.cash) + exitVal }
-    });
+          await prisma.trade.create({
+            data: { side: "SELL", ticker: exitTicker, price: p, shares, brokerOrderId: sellOrder?.id ?? null }
+          });
+          await prisma.position.update({
+            where: { id: openPos.id },
+            data: { open: false, exitPrice: p, exitAt: nowET() }
+          });
+          state = await prisma.botState.update({
+            where: { id: 1 },
+            data: { cash: Number(state!.cash) + exitVal, pnl: Number(state!.pnl) + realized, equity: Number(state!.cash) + exitVal }
+          });
 
-    openPos = null;
-    debug.lastMessage = `Mandatory 15:50+ exit ${exitTicker} filled @ ${p}`;
-  } catch {
-    debug.reasons.push("mandatory_exit_exception");
-  }
-}
-
+          openPos = null;
+          debug.lastMessage = `Mandatory 15:50+ exit ${exitTicker} filled @ ${p}`;
+        } catch {
+          debug.reasons.push("mandatory_exit_exception");
+        }
+      }
 
       // Weekday/market guard
       if (!isWeekdayET()) {
@@ -1107,13 +1091,11 @@ if (openPos && isMandatoryExitET()) {
           const p = pParsed;
           livePrice = p;
 
-          // equity mark
           const equityNow = Number(state!.cash) + Number(openPos.shares) * p;
           if (Number(state!.equity) !== equityNow) {
             state = await prisma.botState.update({ where: { id: 1 }, data: { equity: equityNow } });
           }
 
-          // Classic ratchet that lifts SL behind highs (works for all)
           const sym = openPos.ticker;
           const entry = Number(openPos.entryPrice);
           if (!ratchetState[sym]) {
@@ -1123,7 +1105,6 @@ if (openPos && isMandatoryExitET()) {
           const rs = ratchetState[sym];
           rs.high = Math.max(rs.high, p);
 
-          // rung computation for classic SL lift
           const gainPct = (rs.high - rs.entry) / rs.entry;
           const rungIndex = Math.floor(gainPct / 0.05); // 5% steps
           const candidatePctFromEntry = Math.max(0, (rungIndex - 1) * 0.05);
@@ -1149,7 +1130,6 @@ if (openPos && isMandatoryExitET()) {
             } catch {}
           }
 
-          // Runner mode for strong setups: lift TP too (no hard 10% cap)
           if (rs.runner) {
             const steps = [0.05, 0.10, 0.15, 0.20, 0.30];
             for (const step of steps) {
@@ -1187,7 +1167,6 @@ if (openPos && isMandatoryExitET()) {
         if (p != null) livePrice = p;
       }
 
-      /* ---------------------- return ---------------------- */
       const etNow = new Date(nowET().toLocaleString("en-US", { timeZone: "America/New_York" }));
       const endOfDayET = new Date(etNow); endOfDayET.setHours(23, 59, 0, 0);
 
@@ -1445,7 +1424,6 @@ async function runScanWindow(opts: {
 
   if (!chosen) return;
 
-  // Atomic claim (existing logic)
   const claimed = await acquireDayLock(today);
   if (!claimed) return;
 
@@ -1466,8 +1444,7 @@ async function runScanWindow(opts: {
 
     const chosenEval = evals[chosen]!;
     const { score } = scoreSetup(chosenEval);
-    const { sizeMult } = sizeForScoreOptionA(score, chosenEval); // UPDATED: pass eval
-
+    const { sizeMult } = sizeForScoreOptionA(score, chosenEval);
     const mode: EntryMode = score >= 2 ? "strong" : "weak";
 
     const placed = await placeEntryNow(chosen, Number(ref), stateRef(), sizeMult, mode);
@@ -1520,7 +1497,6 @@ async function runForceWindowPrimarySecondary(opts: {
   const trySymbols = [primary, secondary].filter(Boolean) as string[];
   let placedSymbol: string | null = null;
 
-  // Atomic claim for the force window
   const claimed = await acquireDayLock(today);
   if (!claimed) {
     debug[`${labelPrefix}_final`] = { placedSymbol: null, reason: "lock_not_acquired" };
@@ -1536,7 +1512,6 @@ async function runForceWindowPrimarySecondary(opts: {
       if (assess.instantVeto) continue;
       if (!assess.proceed) continue;
 
-      // Entry price
       let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
       if (!Number.isFinite(Number(ref))) {
         const q = await fmpQuoteCached(sym);
@@ -1546,19 +1521,17 @@ async function runForceWindowPrimarySecondary(opts: {
       if (ref == null || !Number.isFinite(Number(ref))) continue;
       if (ref < PRICE_MIN || ref > PRICE_MAX) continue;
 
-      // Force spread
       const spreadLimit = dynamicSpreadLimitPct(nowET(), ref ?? null, "force");
       const spreadOK = await memoSpreadGuardOK(sym, spreadLimit);
       if (!spreadOK) continue;
 
-      // Final safety: ensure no concurrent open (race-safe due to lock)
       const already = await prisma.position.findFirst({ where: { open: true }, orderBy: { id: "desc" } });
       if (already) break;
 
       try {
         const evalRes = assess.ev ?? await evaluateEntrySignals(sym, snapshot, yyyyMmDdET(), base);
         const { score } = scoreSetup(evalRes);
-        const { sizeMult } = sizeForScoreOptionA(score, evalRes); // <-- UPDATED: pass eval for premium confirmations
+        const { sizeMult } = sizeForScoreOptionA(score, evalRes);
         const mode: EntryMode = score >= 2 ? "strong" : "weak";
 
         const placed = await placeEntryNow(sym, Number(ref), stateRef(), sizeMult, mode);
@@ -1569,14 +1542,12 @@ async function runForceWindowPrimarySecondary(opts: {
           break;
         }
       } catch {
-        // swallow and try next symbol
+        // try next symbol
       }
     }
   } finally {
-    // If nothing placed, release the lock so later windows can try again
     if (!placedSymbol) await releaseDayLock();
   }
 
   debug[`${labelPrefix}_final`] = { placedSymbol: placedSymbol ?? null };
 }
-
