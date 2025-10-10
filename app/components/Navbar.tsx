@@ -122,7 +122,7 @@ export default function Navbar() {
     () =>
       top13.filter((r) => {
         const v = r.volEstimate ?? r.volume ?? 0;
-        return v >= 9_000_000;
+        return v >= 7_000_000;
       }),
     [top13]
   );
