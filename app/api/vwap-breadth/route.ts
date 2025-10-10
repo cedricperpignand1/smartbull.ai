@@ -10,7 +10,7 @@ import { isMarketHoursET, nowET, yyyyMmDdET } from "@/lib/market";
 /* ───────────────────────── In-memory cache (60 s) ───────────────────────── */
 type CacheEntry = { ts: number; payload: any };
 const CACHE = new Map<string, CacheEntry>();
-const TTL_MS = 60 * 1000;
+const TTL_MS = 60_000;
 
 /* ─────────────────────────────── Types ─────────────────────────────── */
 type Bar1m = { t: string; o: number; h: number; l: number; c: number; v: number };
@@ -50,64 +50,107 @@ function getNowET(): Date {
   return d instanceof Date ? d : new Date(d);
 }
 
+/** Build ET window [9:30, 16:00] for a given date offset (0=today, -1=yesterday, etc.) */
+function sessionWindowISO(offsetDays: number, clampToNowIfOpen: boolean) {
+  const open = isMarketHoursET();
+  const base = getNowET();
+  const d = new Date(base);
+  d.setDate(d.getDate() + offsetDays);
+
+  const start = new Date(d);
+  start.setHours(9, 30, 0, 0);
+
+  const end = new Date(d);
+  end.setHours(16, 0, 0, 0);
+
+  // Only clamp today's end to "now" if the market is currently open
+  const endISO =
+    clampToNowIfOpen && offsetDays === 0 && open ? getNowET().toISOString() : end.toISOString();
+
+  return { startISO: start.toISOString(), endISO };
+}
+
 /* ───────────────────────────── Route ───────────────────────────── */
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const rawTickers: string[] = Array.isArray(body?.tickers) ? body.tickers : [];
     const tickers = rawTickers.map((s) => String(s || "")).filter(Boolean).slice(0, 13);
-    if (!tickers.length)
+    if (!tickers.length) {
       return NextResponse.json({ ok: false, error: "No tickers provided" }, { status: 400 });
+    }
 
     const key = sortAndKey(tickers);
     const nowMs = Date.now();
     const hit = CACHE.get(key);
-    if (hit && nowMs - hit.ts < TTL_MS)
+    if (hit && nowMs - hit.ts < TTL_MS) {
       return NextResponse.json(hit.payload, { headers: { "Cache-Control": "no-store" } });
+    }
 
-    // Build session window (today 9:30 → now if open, else 16:00)
-    const open = isMarketHoursET();
-    const now = getNowET();
-    const start = new Date(now);
-    start.setHours(9, 30, 0, 0);
-    const end = new Date(now);
-    if (!open) end.setHours(16, 0, 0, 0);
+    // Windows to try: today, -1d, -2d, -3d
+    const windows = [
+      sessionWindowISO(0, true),
+      sessionWindowISO(-1, false),
+      sessionWindowISO(-2, false),
+      sessionWindowISO(-3, false),
+    ];
+    const limit = 420; // enough 1m bars for a full session
 
-    const startISO = start.toISOString();
-    const endISO = end.toISOString();
-    const limit = 420; // enough to cover a full session if your helper caps by limit
+    const debug: any = {
+      dateET: yyyyMmDdET(),
+      marketOpen: isMarketHoursET(),
+      windows,
+      checks: [],
+    };
 
-    const debug: any = { dateET: yyyyMmDdET(), marketOpen: open, startISO, endISO, checks: [] };
+    // Fetch + compute
+    const VOL_THRESHOLD = 9_000_000; // cumulative session volume minimum
 
-    // Fetch and compute
     const results = await Promise.all(
       tickers.map(async (symbol) => {
         try {
-          const bars: Bar1m[] = await getBars1m(symbol, startISO, endISO, limit);
-          const count = Array.isArray(bars) ? bars.length : 0;
-          if (!count) {
-            debug.checks.push({ symbol, reason: "no-bars" });
+          let bars: Bar1m[] = [];
+          let usedWindowIdx = -1;
+
+          // Try each window until we get bars
+          for (let i = 0; i < windows.length; i++) {
+            const { startISO, endISO } = windows[i];
+            const candidate: Bar1m[] = await getBars1m(symbol, startISO, endISO, limit);
+            if (Array.isArray(candidate) && candidate.length > 0) {
+              bars = candidate;
+              usedWindowIdx = i;
+              break;
+            }
+          }
+
+          if (!Array.isArray(bars) || bars.length === 0) {
+            debug.checks.push({ symbol, reason: "no-bars-all-windows" });
             return { symbol, ok: false };
           }
 
-          // Filter by cumulative session volume >= 9,000,000
           const cumVol = cumulativeVolume(bars);
-          if (cumVol < 9_000_000) {
-            debug.checks.push({ symbol, reason: "low-cum-vol", cumVol });
+          if (cumVol < VOL_THRESHOLD) {
+            debug.checks.push({ symbol, reason: "low-cum-vol", cumVol, usedWindowIdx });
             return { symbol, ok: false };
           }
 
           const vwap = computeIntradayVWAP(bars);
           const last = bars[bars.length - 1]?.c ?? null;
           if (!vwap || !last) {
-            debug.checks.push({ symbol, reason: "no-vwap-or-last", cumVol, barCount: count });
+            debug.checks.push({ symbol, reason: "no-vwap-or-last", cumVol, usedWindowIdx, barCount: bars.length });
             return { symbol, ok: false };
           }
 
           const above = last >= vwap * 1.0001;
           const below = last <= vwap * 0.9999;
           const state = above ? "above" : below ? "below" : "flat";
-          debug.checks.push({ symbol, cumVol, barCount: count, state });
+          debug.checks.push({
+            symbol,
+            state,
+            cumVol,
+            barCount: bars.length,
+            usedWindowIdx,
+          });
 
           return { symbol, ok: true, state };
         } catch (e: any) {
@@ -133,11 +176,11 @@ export async function POST(req: Request) {
       above,
       below,
       flat,
-      skipped,               // low-volume or failed symbols
+      skipped,        // low-vol or failed symbols
       ratio,
-      marketOpen: open,
+      marketOpen: isMarketHoursET(),
       tickers,
-      debug,                 // keep for now—super helpful to verify filtering
+      debug,          // keep this—super helpful when total==0
     };
 
     CACHE.set(key, { ts: nowMs, payload });
