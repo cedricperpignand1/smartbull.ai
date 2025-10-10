@@ -7,7 +7,7 @@ import { NextResponse } from "next/server";
 import { getBars1m } from "@/lib/alpaca";
 import { isMarketHoursET, nowET, yyyyMmDdET } from "@/lib/market";
 
-/* ───────────────────────── In-memory cache (60s) ───────────────────────── */
+/* ───────────────────────── In-memory cache (60 s) ───────────────────────── */
 type CacheEntry = { ts: number; payload: any };
 const CACHE = new Map<string, CacheEntry>();
 const TTL_MS = 60 * 1000;
@@ -20,7 +20,7 @@ function sortAndKey(tickers: string[]) {
   return tickers
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean)
-    .slice(0, 8)
+    .slice(0, 13)
     .sort()
     .join(",");
 }
@@ -39,41 +39,10 @@ function computeIntradayVWAP(bars: Bar1m[]) {
   }
   return vv > 0 ? pv / vv : null;
 }
-
-/** Works whether `nowET` is a function or a value */
 function getNowET(): Date {
   const anyNow: any = nowET as any;
   const d = typeof anyNow === "function" ? anyNow() : anyNow;
   return d instanceof Date ? d : new Date(d);
-}
-
-/** Build a primary session window (today) and a fallback (past few days) */
-function buildWindows() {
-  const open = isMarketHoursET();       // boolean
-  const now = getNowET();               // Date in ET context
-  const todayET = yyyyMmDdET();         // string YYYY-MM-DD in ET
-
-  // Primary: today's 9:30 → now (if open) else 16:00
-  const start = new Date(now);
-  start.setHours(9, 30, 0, 0);
-  const end = new Date(now);
-  if (!open) end.setHours(16, 0, 0, 0);
-
-  // Fallback: go back up to 3 days (9:30→16:00) in case today has no bars (weekend/holiday)
-  const fbStart = new Date(now);
-  fbStart.setDate(fbStart.getDate() - 3);
-  fbStart.setHours(9, 30, 0, 0);
-  const fbEnd = new Date(now);
-  fbEnd.setHours(16, 0, 0, 0);
-
-  return {
-    marketOpen: open,
-    todayET,
-    startISO: start.toISOString(),
-    endISO: end.toISOString(),
-    fbStartISO: fbStart.toISOString(),
-    fbEndISO: fbEnd.toISOString(),
-  };
 }
 
 /* ───────────────────────────── Route ───────────────────────────── */
@@ -81,69 +50,55 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const rawTickers: string[] = Array.isArray(body?.tickers) ? body.tickers : [];
-    const tickers = rawTickers.map((s) => String(s || "")).filter(Boolean).slice(0, 8);
-
-    if (!tickers.length) {
+    const tickers = rawTickers.map((s) => String(s || "")).filter(Boolean).slice(0, 13);
+    if (!tickers.length)
       return NextResponse.json({ ok: false, error: "No tickers provided" }, { status: 400 });
-    }
 
     const key = sortAndKey(tickers);
     const nowMs = Date.now();
-
-    // Cache
     const hit = CACHE.get(key);
-    if (hit && nowMs - hit.ts < TTL_MS) {
+    if (hit && nowMs - hit.ts < TTL_MS)
       return NextResponse.json(hit.payload, { headers: { "Cache-Control": "no-store" } });
-    }
 
-    // Windows
-    const { marketOpen, todayET, startISO, endISO, fbStartISO, fbEndISO } = buildWindows();
-    const limit = 240; // minute bars cap
-    const debug: any = { marketOpen, todayET, startISO, endISO, fbStartISO, fbEndISO, attempts: [] };
+    // Build session window
+    const now = getNowET();
+    const start = new Date(now);
+    start.setHours(9, 30, 0, 0);
+    const startISO = start.toISOString();
+    const endISO = now.toISOString();
+    const limit = 240;
 
-    // Fetch bars with fallback window when needed
+    // Fetch and compute
     const results = await Promise.all(
       tickers.map(async (symbol) => {
         try {
-          let bars: Bar1m[] = await getBars1m(symbol, startISO, endISO, limit);
-          debug.attempts.push({ symbol, primaryCount: Array.isArray(bars) ? bars.length : 0 });
+          const bars: Bar1m[] = await getBars1m(symbol, startISO, endISO, limit);
+          if (!Array.isArray(bars) || !bars.length) return { symbol, ok: false, reason: "no-bars" };
 
-          // If no bars in primary, try fallback
-          if (!Array.isArray(bars) || bars.length === 0) {
-            const fbBars: Bar1m[] = await getBars1m(symbol, fbStartISO, fbEndISO, limit);
-            debug.attempts[debug.attempts.length - 1].fallbackCount = Array.isArray(fbBars) ? fbBars.length : 0;
-            bars = fbBars;
-          }
-
-          if (!Array.isArray(bars) || bars.length === 0) return { symbol, ok: false, reason: "no-bars" };
+          const last = bars[bars.length - 1];
+          const lastVol = last?.v ?? 0;
+          // 🚫 Filter out illiquid
+          if (lastVol < 9_000_000)
+            return { symbol, ok: false, reason: `low-vol ${lastVol}` };
 
           const vwap = computeIntradayVWAP(bars);
-          const last = bars[bars.length - 1]?.c ?? null;
-          if (!vwap || !last) return { symbol, ok: false, reason: "no-vwap-or-last" };
+          if (!vwap || !last?.c) return { symbol, ok: false, reason: "no-vwap-or-last" };
 
-          const above = last >= vwap * 1.0001;
-          const below = last <= vwap * 0.9999;
-
-          return {
-            symbol,
-            ok: true,
-            vwap,
-            last,
-            state: above ? "above" : below ? "below" : "flat",
-          };
+          const above = last.c >= vwap * 1.0001;
+          const below = last.c <= vwap * 0.9999;
+          return { symbol, ok: true, vwap, last: last.c, state: above ? "above" : below ? "below" : "flat" };
         } catch (e: any) {
-          debug.attempts.push({ symbol, error: String(e?.message || e) });
-          return { symbol, ok: false, reason: "exception" };
+          return { symbol, ok: false, reason: e?.message || "exception" };
         }
       })
     );
 
-    let above = 0, below = 0, flat = 0, failures = 0;
+    let above = 0, below = 0, flat = 0, skipped = 0;
     for (const r of results) {
-      if (!r?.ok) { failures += 1; continue; }
-      if (r.state === "above") above += 1;
-      else if (r.state === "below") below += 1;
-      else flat += 1;
+      if (!r?.ok) { skipped++; continue; }
+      if (r.state === "above") above++;
+      else if (r.state === "below") below++;
+      else flat++;
     }
     const total = above + below + flat;
     const ratio = total ? above / total : 0;
@@ -154,10 +109,11 @@ export async function POST(req: Request) {
       above,
       below,
       flat,
+      skipped,           // ← number of low-volume/failed symbols
       ratio,
-      marketOpen,
+      marketOpen: isMarketHoursET(),
       tickers,
-      debug, // ← keep this; helps verify windows & counts
+      dateET: yyyyMmDdET(),
     };
 
     CACHE.set(key, { ts: nowMs, payload });
