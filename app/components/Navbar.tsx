@@ -5,7 +5,12 @@ import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import { signOut } from "next-auth/react";
-import IndustryHypeSticker, { TickerRow } from "./IndustryHypeSticker";
+import IndustryHypeSticker, { TickerRow as BaseTickerRow } from "./IndustryHypeSticker";
+
+// Extend the row type locally (we won't touch IndustryHypeSticker's export)
+type TickerRow = BaseTickerRow & {
+  volume?: number | null; // intraday cumulative volume from your SSE feed
+};
 
 type VwapBreadth = {
   ok: boolean;
@@ -30,13 +35,7 @@ export default function Navbar() {
   /* Clock */
   useEffect(() => {
     const tick = () =>
-      setTime(
-        new Date().toLocaleTimeString("en-US", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        })
-      );
+      setTime(new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
@@ -51,14 +50,14 @@ export default function Navbar() {
         const list = Array.isArray(obj?.stocks) ? obj.stocks : [];
         const mapped: TickerRow[] = list.map((s: any) => ({
           ticker: String(s.ticker || s.symbol || ""),
-          changesPercentage:
-            typeof s.changesPercentage === "number" ? s.changesPercentage : null,
+          changesPercentage: typeof s.changesPercentage === "number" ? s.changesPercentage : null,
           dollarVolume:
             s?.dollarVolume != null
               ? Number(s.dollarVolume)
               : ((Number(s.price) || 0) * (Number(s.volume) || 0)) || null,
           sector: s?.sector ?? null,
           industry: s?.industry ?? null,
+          volume: s?.volume != null ? Number(s.volume) : null, // <-- add volume from your feed
         }));
         setRows(mapped);
       } catch (e) {
@@ -70,13 +69,18 @@ export default function Navbar() {
   }, []);
 
   // Top sets from your stream
-  const top13 = useMemo(
-    () => rows.slice(0, 13).map((r) => r.ticker).filter(Boolean),
-    [rows]
-  );
-  const top8 = useMemo(
-    () => top13.slice(0, 8).map((t) => t.toUpperCase()),
+  const top13 = useMemo(() => rows.slice(0, 13), [rows]);
+
+  // ✅ Filter out low-liquidity names (intraday cumulative volume < 9M)
+  const top13Eligible = useMemo(
+    () => top13.filter((r) => (r.volume ?? 0) >= 9_000_000),
     [top13]
+  );
+
+  // Tickernames for API
+  const eligibleTickers = useMemo(
+    () => top13Eligible.map((r) => r.ticker.toUpperCase()),
+    [top13Eligible]
   );
 
   /* Winner industry every 10 minutes (and once immediately) */
@@ -92,7 +96,7 @@ export default function Navbar() {
         const r = await fetch("/api/industry-winner", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tickers: top13 }),
+          body: JSON.stringify({ tickers: top13.map((r) => r.ticker) }),
           cache: "no-store",
           signal: ac.signal,
         });
@@ -102,9 +106,7 @@ export default function Navbar() {
           return;
         }
         const j = await r.json();
-        if (!stop && j?.ok && j?.winner?.label) {
-          setWinnerLabel(String(j.winner.label));
-        }
+        if (!stop && j?.ok && j?.winner?.label) setWinnerLabel(String(j.winner.label));
       } catch (e) {
         console.error("industry-winner fetch error:", e);
       }
@@ -117,11 +119,24 @@ export default function Navbar() {
       ac?.abort();
       clearInterval(id);
     };
-  }, [top13.join(",")]);
+  }, [top13.map(r => r.ticker).join(",")]);
 
-  /* VWAP breadth every 60s (and once immediately) */
+  /* VWAP breadth every 60s (and once immediately) — uses ONLY eligible tickers */
   useEffect(() => {
-    if (!top8.length) return;
+    if (!eligibleTickers.length) {
+      // Show neutral when nothing qualifies
+      setVwapBreadth({
+        ok: true,
+        total: 0,
+        above: 0,
+        below: 0,
+        flat: 0,
+        ratio: 0,
+        marketOpen: true,
+        tickers: [],
+      });
+      return;
+    }
 
     let stop = false;
     let ac: AbortController | null = null;
@@ -132,22 +147,18 @@ export default function Navbar() {
         const r = await fetch("/api/vwap-breadth", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tickers: top8 }),
+          body: JSON.stringify({ tickers: eligibleTickers }), // only high-volume names
           cache: "no-store",
           signal: ac.signal,
         });
-
         if (!r.ok) {
           const text = await r.text();
           console.error("VWAP breadth HTTP error:", r.status, text);
           return;
         }
-
         const j: VwapBreadth = await r.json();
         console.log("VWAP breadth:", j);
-        if (!stop && j?.ok) {
-          setVwapBreadth(j);
-        }
+        if (!stop && j?.ok) setVwapBreadth(j);
       } catch (e) {
         console.error("VWAP breadth fetch error:", e);
       }
@@ -160,42 +171,31 @@ export default function Navbar() {
       ac?.abort();
       clearInterval(id);
     };
-  }, [top8.join(",")]);
+  }, [eligibleTickers.join(",")]);
 
-  // VWAP breadth badge (always show something)
+  // VWAP breadth badge (always shows a pill)
   const vwapBadge = useMemo(() => {
     if (!vwapBreadth) {
       return (
-        <div
-          className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200"
-          title="Fetching VWAP breadth…"
-        >
+        <div className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200" title="Fetching VWAP breadth…">
           <span className="tracking-wide">VWAP</span>
           <span className="font-mono">…</span>
         </div>
       );
     }
-
     const { marketOpen, total, above } = vwapBreadth;
 
     if (!marketOpen) {
       return (
-        <div
-          className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200"
-          title="Market closed — VWAP breadth paused"
-        >
+        <div className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200" title="Market closed — VWAP breadth paused">
           <span className="tracking-wide">VWAP</span>
           <span className="font-mono">⏸</span>
         </div>
       );
     }
-
     if (!total) {
       return (
-        <div
-          className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200"
-          title="No VWAP data yet"
-        >
+        <div className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200" title="No VWAP data yet or all < 9M vol">
           <span className="tracking-wide">VWAP</span>
           <span className="font-mono">—</span>
         </div>
@@ -203,28 +203,12 @@ export default function Navbar() {
     }
 
     const ratio = above / total;
-    let bg = "bg-slate-50";
-    let text = "text-slate-700";
-    let ring = "ring-slate-200";
-    let arrow = "↔";
-
-    if (ratio >= 5 / 8) {
-      bg = "bg-emerald-50";
-      text = "text-emerald-700";
-      ring = "ring-emerald-200";
-      arrow = "↑";
-    } else if (ratio <= 3 / 8) {
-      bg = "bg-rose-50";
-      text = "text-rose-700";
-      ring = "ring-rose-200";
-      arrow = "↓";
-    }
+    let bg = "bg-slate-50", text = "text-slate-700", ring = "ring-slate-200", arrow = "↔";
+    if (ratio >= 5 / 8) { bg = "bg-emerald-50"; text = "text-emerald-700"; ring = "ring-emerald-200"; arrow = "↑"; }
+    else if (ratio <= 3 / 8) { bg = "bg-rose-50"; text = "text-rose-700"; ring = "ring-rose-200"; arrow = "↓"; }
 
     return (
-      <div
-        className={`ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 ${bg} ${text} ${ring}`}
-        title="VWAP breadth across top 8 (above-VWAP count)"
-      >
+      <div className={`ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 ${bg} ${text} ${ring}`} title="VWAP breadth across high-volume names">
         <span className="tracking-wide">VWAP</span>
         <span className="font-mono">{arrow} {above}/{total}</span>
       </div>
@@ -237,22 +221,10 @@ export default function Navbar() {
         <div className="mx-auto max-w-screen-2xl h-full px-4 flex items-center">
           {/* LEFT: Logo */}
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => router.push("/")}
-              className="flex items-center gap-3 hover:opacity-95"
-              aria-label="Go to Home"
-            >
-              <Image
-                src="/logo4.png"
-                alt="SmartBull Logo"
-                width={100}
-                height={100}
-                className="h-15 w-15 object-contain"
-                priority
-              />
+            <button onClick={() => router.push("/")} className="flex items-center gap-3 hover:opacity-95" aria-label="Go to Home">
+              <Image src="/logo4.png" alt="SmartBull Logo" width={100} height={100} className="h-15 w-15 object-contain" priority />
               <span className="text-white drop-shadow text-xl md:text-2xl font-extrabold tracking-tight">
-                <span className="text-white/90">Smart</span>
-                <span className="text-white">Bull.ai</span>
+                <span className="text-white/90">Smart</span><span className="text-white">Bull.ai</span>
               </span>
             </button>
           </div>
@@ -261,12 +233,7 @@ export default function Navbar() {
           <div className="flex-1 flex justify-center">
             {rows.length ? (
               <div className="flex items-center">
-                <IndustryHypeSticker
-                  rows={rows}
-                  groupBy="industry"
-                  minNames={1}
-                  overrideLabel={winnerLabel || undefined}
-                />
+                <IndustryHypeSticker rows={rows} groupBy="industry" minNames={1} overrideLabel={winnerLabel || undefined} />
                 {vwapBadge}
               </div>
             ) : (
@@ -278,13 +245,8 @@ export default function Navbar() {
 
           {/* RIGHT: Time + Sign Out */}
           <div className="flex items-center gap-4">
-            <span className="hidden sm:inline-flex items-center rounded-md px-3 py-1.5 text-sm md:text-base font-medium font-mono bg-white/25 ring-1 ring-white/35 text-white">
-              {time || "--:--:--"}
-            </span>
-            <button
-              onClick={() => signOut({ callbackUrl: "/" })}
-              className="inline-flex items-center rounded-md px-4 py-2 text-base font-semibold bg-white text-blue-700 hover:bg-gray-50 shadow-sm transition"
-            >
+            <span className="hidden sm:inline-flex items-center rounded-md px-3 py-1.5 text-sm md:text-base font-medium font-mono bg-white/25 ring-1 ring-white/35 text-white">{time || "--:--:--"}</span>
+            <button onClick={() => signOut({ callbackUrl: "/" })} className="inline-flex items-center rounded-md px-4 py-2 text-base font-semibold bg-white text-blue-700 hover:bg-gray-50 shadow-sm transition">
               Sign Out
             </button>
           </div>
