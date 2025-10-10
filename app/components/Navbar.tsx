@@ -9,9 +9,9 @@ import IndustryHypeSticker, { TickerRow as BaseTickerRow } from "./IndustryHypeS
 
 /* Extend the row locally to keep IndustryHypeSticker untouched */
 type TickerRow = BaseTickerRow & {
-  volume?: number | null;       // from SSE (may be missing)
-  price?: number | null;        // from SSE
-  volEstimate?: number | null;  // computed as dollarVolume/price when volume missing
+  volume?: number | null;       // parsed cumulative volume
+  price?: number | null;        // parsed last price
+  volEstimate?: number | null;  // computed as dollarVolume/price when needed
 };
 
 type VwapBreadth = {
@@ -25,6 +25,18 @@ type VwapBreadth = {
   tickers?: string[];
   session?: { dateET: string; startISO: string; endISO: string };
 };
+
+/** Parse numbers safely from API strings like "20,494,581", "$12.34", "803,003.5", "  123  " */
+function toNum(x: any): number | null {
+  if (x == null) return null;
+  if (typeof x === "number" && Number.isFinite(x)) return x;
+  if (typeof x === "string") {
+    const cleaned = x.replace(/[$,%\s,]/g, ""); // remove $, %, spaces, commas
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
 
 export default function Navbar() {
   const router = useRouter();
@@ -58,13 +70,14 @@ export default function Navbar() {
         const list = Array.isArray(obj?.stocks) ? obj.stocks : [];
 
         const mapped: TickerRow[] = list.map((s: any) => {
-          const price = s?.price != null ? Number(s.price) : null;
-          const volume = s?.volume != null ? Number(s.volume) : null;
+          const price = toNum(s?.price);
+          const volume = toNum(s?.volume);
 
           // Prefer provided dollarVolume; else compute from price*volume if both exist
+          const dvDirect = toNum(s?.dollarVolume);
           const dollarVolume =
-            s?.dollarVolume != null
-              ? Number(s.dollarVolume)
+            dvDirect != null
+              ? dvDirect
               : price != null && volume != null
               ? price * volume
               : null;
@@ -82,7 +95,7 @@ export default function Navbar() {
             changesPercentage:
               typeof s.changesPercentage === "number"
                 ? s.changesPercentage
-                : null,
+                : toNum(s?.changesPercentage), // handle "12.3%" strings gracefully
             dollarVolume,
             sector: s?.sector ?? null,
             industry: s?.industry ?? null,
@@ -114,7 +127,7 @@ export default function Navbar() {
     [top13]
   );
 
-  // Debug which got included/excluded
+  // Debug which got included/excluded (you can remove after verifying)
   useEffect(() => {
     if (!top13.length) return;
     try {
