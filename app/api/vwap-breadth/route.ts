@@ -24,7 +24,6 @@ function sortAndKey(tickers: string[]) {
     .sort()
     .join(",");
 }
-
 function typicalPrice(b: Bar1m) {
   return (b.h + b.l + b.c) / 3;
 }
@@ -39,6 +38,12 @@ function computeIntradayVWAP(bars: Bar1m[]) {
   }
   return vv > 0 ? pv / vv : null;
 }
+function cumulativeVolume(bars: Bar1m[]) {
+  let sum = 0;
+  for (const b of bars) sum += Number(b?.v || 0);
+  return sum;
+}
+/** Works whether `nowET` is a function or a value */
 function getNowET(): Date {
   const anyNow: any = nowET as any;
   const d = typeof anyNow === "function" ? anyNow() : anyNow;
@@ -60,35 +65,54 @@ export async function POST(req: Request) {
     if (hit && nowMs - hit.ts < TTL_MS)
       return NextResponse.json(hit.payload, { headers: { "Cache-Control": "no-store" } });
 
-    // Build session window
+    // Build session window (today 9:30 → now if open, else 16:00)
+    const open = isMarketHoursET();
     const now = getNowET();
     const start = new Date(now);
     start.setHours(9, 30, 0, 0);
+    const end = new Date(now);
+    if (!open) end.setHours(16, 0, 0, 0);
+
     const startISO = start.toISOString();
-    const endISO = now.toISOString();
-    const limit = 240;
+    const endISO = end.toISOString();
+    const limit = 420; // enough to cover a full session if your helper caps by limit
+
+    const debug: any = { dateET: yyyyMmDdET(), marketOpen: open, startISO, endISO, checks: [] };
 
     // Fetch and compute
     const results = await Promise.all(
       tickers.map(async (symbol) => {
         try {
           const bars: Bar1m[] = await getBars1m(symbol, startISO, endISO, limit);
-          if (!Array.isArray(bars) || !bars.length) return { symbol, ok: false, reason: "no-bars" };
+          const count = Array.isArray(bars) ? bars.length : 0;
+          if (!count) {
+            debug.checks.push({ symbol, reason: "no-bars" });
+            return { symbol, ok: false };
+          }
 
-          const last = bars[bars.length - 1];
-          const lastVol = last?.v ?? 0;
-          // 🚫 Filter out illiquid
-          if (lastVol < 9_000_000)
-            return { symbol, ok: false, reason: `low-vol ${lastVol}` };
+          // Filter by cumulative session volume >= 9,000,000
+          const cumVol = cumulativeVolume(bars);
+          if (cumVol < 9_000_000) {
+            debug.checks.push({ symbol, reason: "low-cum-vol", cumVol });
+            return { symbol, ok: false };
+          }
 
           const vwap = computeIntradayVWAP(bars);
-          if (!vwap || !last?.c) return { symbol, ok: false, reason: "no-vwap-or-last" };
+          const last = bars[bars.length - 1]?.c ?? null;
+          if (!vwap || !last) {
+            debug.checks.push({ symbol, reason: "no-vwap-or-last", cumVol, barCount: count });
+            return { symbol, ok: false };
+          }
 
-          const above = last.c >= vwap * 1.0001;
-          const below = last.c <= vwap * 0.9999;
-          return { symbol, ok: true, vwap, last: last.c, state: above ? "above" : below ? "below" : "flat" };
+          const above = last >= vwap * 1.0001;
+          const below = last <= vwap * 0.9999;
+          const state = above ? "above" : below ? "below" : "flat";
+          debug.checks.push({ symbol, cumVol, barCount: count, state });
+
+          return { symbol, ok: true, state };
         } catch (e: any) {
-          return { symbol, ok: false, reason: e?.message || "exception" };
+          debug.checks.push({ symbol, error: String(e?.message || e) });
+          return { symbol, ok: false };
         }
       })
     );
@@ -109,11 +133,11 @@ export async function POST(req: Request) {
       above,
       below,
       flat,
-      skipped,           // ← number of low-volume/failed symbols
+      skipped,               // low-volume or failed symbols
       ratio,
-      marketOpen: isMarketHoursET(),
+      marketOpen: open,
       tickers,
-      dateET: yyyyMmDdET(),
+      debug,                 // keep for now—super helpful to verify filtering
     };
 
     CACHE.set(key, { ts: nowMs, payload });
