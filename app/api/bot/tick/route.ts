@@ -1,11 +1,16 @@
-// app/api/bot/tick/route.ts 
+// app/api/bot/tick/route.ts  — PART 1 of 4
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { isWeekdayET, isMarketHoursET, yyyyMmDdET, nowET } from "@/lib/market";
+import {
+  isWeekdayET,
+  isMarketHoursET,
+  yyyyMmDdET,
+  nowET,
+} from "@/lib/market";
 import {
   submitBracketBuy,
   closePositionMarket,
@@ -17,7 +22,7 @@ import {
   spreadGuardOK,
   getAccount,
   sellMarket,
-  getOrder, // <-- NEW: wrapper around Alpaca GET /v2/orders/{order_id}
+  getOrder,
 } from "@/lib/alpaca";
 import { fmpQuoteCached } from "../../../../lib/fmpCached";
 
@@ -32,48 +37,37 @@ let lastTickResponse: any = null;
 let pendingTick: Promise<any> | null = null;
 const MIN_TICK_MS = 200;
 
+/* -------------------------- account -------------------------- */
 const START_CASH = 5000;
 const INVEST_BUDGET = 5000;
 
 /* -------------------------- exit / target rules -------------------------- */
-const STOP_PCT = -0.05;               // SL -5% (all trades at entry)
-const TARGET_PCT_WEAK = 0.05;         // weak setups: fixed TP +5%
-const TARGET_PCT_STRONG_DUMMY = 0.50; // strong setups: dummy high TP (+50%) then runner manages
+const STOP_PCT = -0.05;
+const TARGET_PCT_WEAK = 0.05;
+const TARGET_PCT_STRONG_DUMMY = 0.50;
 
 /* -------------------------- time-decay tuning -------------------------- */
 const DECAY_START_MIN = 0;
 const DECAY_END_MIN = 14;
-
 const VOL_MULT_START = 1.20;
 const VOL_MULT_END = 1.10;
-
 const NEAR_OR_START = 0.003;
 const NEAR_OR_END = 0.0045;
-
 const VWAP_BAND_START = 0.002;
 const VWAP_BAND_END = 0.003;
-
 const PRICE_MIN = 1;
 const PRICE_MAX = 70;
 
+/* -------------------------- liquidity -------------------------- */
 const FRESHNESS_MS = 30_000;
 const REQUIRE_AI_PICK = true;
-
-/* ====================== RELAXED LIQUIDITY: tuned for low-floats ====================== */
 const MIN_SHARES_ABS = 3_000;
 const FLOAT_MIN_PCT_PER_MIN = 0.001;
 const MIN_DOLLAR_VOL = 75_000;
-/* ===================================================================================== */
 
-/* -------------------------- Buy-the-Dip constants -------------------------- */
-const DIP_MIN_PCT = 0.07;
-const DIP_MAX_PCT = 0.20;
-const DIP_CONFIRM_EITHER = true;
-
-/* -------------------------- spread/account memo -------------------------- */
+/* -------------------------- spread/account cache -------------------------- */
 const SPREAD_TTL_MS = 1200;
 const ACCOUNT_TTL_MS = 3000;
-
 const _spreadMemo = new Map<string, { t: number; v: boolean }>();
 async function memoSpreadGuardOK(symbol: string, limitPct: number) {
   const key = `${symbol}|${limitPct.toFixed(4)}`;
@@ -84,7 +78,6 @@ async function memoSpreadGuardOK(symbol: string, limitPct: number) {
   _spreadMemo.set(key, { t: now, v });
   return v;
 }
-
 let _acctMemo: { t: number; v: any } | null = null;
 async function memoGetAccount() {
   const now = Date.now();
@@ -94,15 +87,15 @@ async function memoGetAccount() {
   return v;
 }
 
-/* -------------------------- AI fallback controls (scan only) -------------------------- */
-const AI_FALLBACK_ENABLED = true; // only during 9:30–9:44 if no AI pick
-const AI_FALLBACK_MINUTE_FROM_OPEN = 8; // 9:38 ET
+/* -------------------------- AI fallback -------------------------- */
+const AI_FALLBACK_ENABLED = true;
+const AI_FALLBACK_MINUTE_FROM_OPEN = 8;
 function allowAIFallbackNow() {
   const m = minutesSince930ET();
-  return m >= AI_FALLBACK_MINUTE_FROM_OPEN && m <= 14; // 9:38–9:44
+  return m >= AI_FALLBACK_MINUTE_FROM_OPEN && m <= 14;
 }
 
-/* -------------------------- types -------------------------- */
+/* -------------------------- misc utils -------------------------- */
 type SnapStock = {
   ticker: string;
   price?: number | null;
@@ -112,6 +105,113 @@ type SnapStock = {
   marketCap?: number | null;
   float?: number | null;
 };
+function round2(x: number) {
+  return Math.round(x * 100) / 100;
+}
+
+/* ============================================================================
+   VWAP BREADTH SENTIMENT GATE  (used by force-buy windows)
+============================================================================ */
+
+type BreadthResp = {
+  ok: boolean;
+  total: number;
+  above: number;
+  below: number;
+  flat: number;
+  ratio: number;
+  marketOpen: boolean;
+  attempted?: number;
+  failed?: string[];
+  tickers?: string[];
+  session?: { dateET: string; startISO: string; endISO: string };
+};
+type Sentiment = "green" | "neutral" | "red";
+
+const BREADTH_GREEN = 0.60;
+const BREADTH_RED = 0.45;
+const MIN_ELIGIBLE = 4;
+const TOP_N_FOR_BREADTH = 13;
+
+function classifyBreadth(above: number, denom: number): Sentiment {
+  const r = denom > 0 ? above / denom : 0;
+  if (r >= BREADTH_GREEN) return "green";
+  if (r <= BREADTH_RED) return "red";
+  return "neutral";
+}
+
+async function safePostJson(url: string, body: any, timeoutMs = 3500): Promise<any | null> {
+  const ac = new AbortController();
+  const id = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+      signal: ac.signal,
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+/**
+ * Build VWAP breadth sentiment from your live top-13 (same list your navbar uses).
+ * Only allow force buys when sentiment === "green".
+ */
+async function getVwapSentiment(baseUrl: string): Promise<{ sentiment: Sentiment; details: any }> {
+  const mSince = typeof minutesSince930ET === "function" ? minutesSince930ET() : 0;
+  if (mSince < 3) return { sentiment: "neutral", details: { reason: "first_3_minutes" } };
+
+  const snapshot = await getSnapshot(baseUrl);
+  const top = (snapshot?.stocks || []).slice(0, TOP_N_FOR_BREADTH);
+  const tickers = top.map((s) => s.ticker).filter(Boolean);
+  if (tickers.length < MIN_ELIGIBLE)
+    return { sentiment: "neutral", details: { reason: "too_few_candidates", tickers } };
+
+  const payload: BreadthResp | null = await safePostJson(
+    `${baseUrl}/api/vwap-breadth`,
+    { tickers },
+    3500
+  );
+  if (!payload?.ok)
+    return { sentiment: "neutral", details: { reason: "breadth_fetch_fail", tickers } };
+
+  const denom =
+    Number.isFinite(Number(payload.attempted)) && (payload.attempted as number) > 0
+      ? (payload.attempted as number)
+      : payload.total > 0
+      ? payload.total
+      : tickers.length;
+  if (denom < MIN_ELIGIBLE)
+    return { sentiment: "neutral", details: { reason: "too_few_attempted", payload } };
+
+  const sent = classifyBreadth(payload.above, denom);
+  return { sentiment: sent, details: payload };
+}
+// app/api/bot/tick/route.ts  — PART 2 of 4
+
+/* ===================== PART 2/4 — VWAP breadth gate helper ===================== */
+async function breadthAllowsForce(base: string, debug: any, label: string): Promise<boolean> {
+  const res = await getVwapSentiment(base);      // from Part 1
+  debug[`${label}_breadth`] = res.details || res; // keep payload for logs/inspection
+
+  if (res.sentiment === "green") return true;
+
+  // record why we skipped
+  const why =
+    res.sentiment === "red" ? "red_breadth" :
+    (res.details?.reason || "neutral_breadth");
+  (debug.reasons ||= []).push(`${label}_skipped_${why}`);
+  return false;
+}
+
+/* -------------------------- types used below -------------------------- */
 type Candle = { date: string; open: number; high: number; low: number; close: number; volume: number };
 
 /* -------------------------- small utils -------------------------- */
@@ -119,8 +219,6 @@ function priceFromFmp(q: any): number | null {
   const n = Number(q?.price ?? q?.c ?? q?.close ?? q?.previousClose);
   return Number.isFinite(n) ? n : null;
 }
-function round2(x: number) { return Math.round(x * 100) / 100; }
-
 function getBaseUrl(req: Request) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL?.trim();
   if (envBase) return envBase.replace(/\/+$/, "");
@@ -141,7 +239,6 @@ function yyyyMmDd(date: Date) {
 }
 
 /* -------------------------- wait for broker fill -------------------------- */
-// NEW: poll the order to capture the actual filled_avg_price
 async function waitForFillAvgPrice(orderId: string, timeoutMs = 20_000, pollMs = 300): Promise<{ price: number | null; filledAt?: string }> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -154,7 +251,7 @@ async function waitForFillAvgPrice(orderId: string, timeoutMs = 20_000, pollMs =
       if ((o?.status === "partially_filled" || o?.status === "done_for_day") && Number.isFinite(px) && px > 0) {
         return { price: px, filledAt: o.filled_at || o.filledAt };
       }
-    } catch { /* ignore and keep polling */ }
+    } catch { /* ignore */ }
     await new Promise(r => setTimeout(r, pollMs));
   }
   return { price: null };
@@ -222,12 +319,10 @@ async function hasAnyBuyTodayDB(): Promise<boolean> {
   });
   return !!buy;
 }
-/* day-lock helpers */
 async function hasDayLock(): Promise<boolean> {
   const s = await prisma.botState.findUnique({ where: { id: 1 }, select: { lastRunDay: true } });
   return s?.lastRunDay === yyyyMmDdET();
 }
-// NEW: atomic claim helpers
 async function acquireDayLock(today: string): Promise<boolean> {
   const res = await prisma.botState.updateMany({
     where: { id: 1, OR: [{ lastRunDay: null }, { lastRunDay: { not: today } }] },
@@ -236,9 +331,7 @@ async function acquireDayLock(today: string): Promise<boolean> {
   return res.count === 1;
 }
 async function releaseDayLock(): Promise<void> {
-  try {
-    await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } });
-  } catch { /* ignore */ }
+  try { await prisma.botState.update({ where: { id: 1 }, data: { lastRunDay: null } }); } catch {}
 }
 
 /* -------------------------- FMP candles -------------------------- */
@@ -257,12 +350,7 @@ async function fetchCandles1m(symbol: string, limit: number, baseUrl: string): P
   const j = await res.json();
   const arr = Array.isArray(j?.candles) ? j.candles : [];
   return arr.map((c: any) => ({
-    date: c.date,
-    open: Number(c.open),
-    high: Number(c.high),
-    low: Number(c.low),
-    close: Number(c.close),
-    volume: Number(c.volume),
+    date: c.date, open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close), volume: Number(c.volume),
   }));
 }
 
@@ -315,6 +403,9 @@ function dayMinLowSoFar(candles: Candle[], todayYMD: string): number | null {
   if (!day.length) return null;
   return Math.min(...day.map((c) => c.low));
 }
+const DIP_MIN_PCT = 0.07;
+const DIP_MAX_PCT = 0.20;
+const DIP_CONFIRM_EITHER = true;
 function dipArmedNow(params: { candles: Candle[]; todayYMD: string; vwap: number | null }) {
   const { candles, todayYMD, vwap } = params;
   const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
@@ -383,6 +474,7 @@ function computeHigherLowAfterOpen(candles: Candle[], todayYMD: string) {
 
   return { ok: true, firstLow, higherLow, confirmBarClose: confirmClose };
 }
+
 /* -------------------------- helpers -------------------------- */
 function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
@@ -393,48 +485,7 @@ function minutesSince930ET() {
   return Math.max(0, Math.min(DECAY_END_MIN, t));
 }
 
-/* ---------- float + liquidity ---------- */
-async function fetchFloatShares(
-  symbol: string,
-  lastPrice: number | null,
-  snapshot: { stocks: SnapStock[] } | null,
-  baseUrl: string
-): Promise<number | null> {
-  const snap = snapshot?.stocks?.find(s => s.ticker === symbol);
-  if (snap && Number.isFinite(Number(snap.float))) return Number(snap.float);
-
-  try {
-    const r = await fetch(`${baseUrl}/api/fmp/float?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
-    if (r.ok) {
-      const j = await r.json();
-      const f = Number(j?.float ?? j?.floatShares ?? j?.freeFloat);
-      if (Number.isFinite(f) && f > 0) return f;
-    }
-  } catch {}
-
-  try {
-    const r2 = await fetch(`${baseUrl}/api/fmp/profile?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
-    if (r2.ok) {
-      const j2 = await r2.json();
-      const arr = Array.isArray(j2) ? j2 : (Array.isArray(j2?.profile) ? j2.profile : []);
-      const row = arr[0] || j2 || {};
-      const f = Number(row.floatShares ?? row.sharesFloat ?? row.freeFloat);
-      if (Number.isFinite(f) && f > 0) return f;
-      const so = Number(row.sharesOutstanding ?? row.mktCapShares);
-      if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
-    }
-  } catch {}
-
-  const mcap = Number(snap?.marketCap);
-  const p = Number(lastPrice);
-  if (Number.isFinite(mcap) && Number.isFinite(p) && p > 0) {
-    const so = mcap / p;
-    if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
-  }
-  return null;
-}
-
-/* ====================== RELAXED LIQUIDITY CHECK ====================== */
+/* ---------- liquidity gates ---------- */
 function lastNBarsOfDay(candles: Candle[], todayYMD: string, n: number): Candle[] {
   const day = candles.filter((c) => isSameETDay(toET(c.date), todayYMD));
   if (!day.length) return [];
@@ -489,14 +540,8 @@ function passesRelaxedLiquidity(
 }
 
 /* ---------------- dynamic spread ---------------- */
-function dynamicSpreadLimitPct(
-  now: Date,
-  price?: number | null,
-  phase: "scan" | "force" = "scan"
-): number {
-  if (inWindow930to945ET()) {
-    return 0.013; // 1.3%
-  }
+function dynamicSpreadLimitPct(now: Date, price?: number | null, phase: "scan" | "force" = "scan"): number {
+  if (inWindow930to945ET()) return 0.013;
   const clamp = (v: number) => Math.max(0.001, Math.min(0.022, v));
   let base =
     phase === "force"
@@ -507,7 +552,6 @@ function dynamicSpreadLimitPct(
           if (mins <= 9 * 60 + 39) return 0.009;
           return 0.008;
         })();
-
   const p = Number(price);
   if (Number.isFinite(p)) {
     if (p < 2) base = Math.min(base, 0.015);
@@ -516,11 +560,48 @@ function dynamicSpreadLimitPct(
   return clamp(base);
 }
 
-/* -------------------------- premarket memo -------------------------- */
+/* ---------------- premarket memo ---------------- */
 type PreMemo = { pmHigh: number; pmLow: number; pmVol: number; fetchedAt: number };
 const scanMemo: Record<string, PreMemo> = {};
 
-/* -------------------------- evaluate entry -------------------------- */
+/* ---------------- evaluate entry ---------------- */
+async function fetchFloatShares(
+  symbol: string,
+  lastPrice: number | null,
+  snapshot: { stocks: SnapStock[] } | null,
+  baseUrl: string
+): Promise<number | null> {
+  const snap = snapshot?.stocks?.find(s => s.ticker === symbol);
+  if (snap && Number.isFinite(Number(snap.float))) return Number(snap.float);
+  try {
+    const r = await fetch(`${baseUrl}/api/fmp/float?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    if (r.ok) {
+      const j = await r.json();
+      const f = Number(j?.float ?? j?.floatShares ?? j?.freeFloat);
+      if (Number.isFinite(f) && f > 0) return f;
+    }
+  } catch {}
+  try {
+    const r2 = await fetch(`${baseUrl}/api/fmp/profile?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    if (r2.ok) {
+      const j2 = await r2.json();
+      const arr = Array.isArray(j2) ? j2 : (Array.isArray(j2?.profile) ? j2.profile : []);
+      const row = arr[0] || j2 || {};
+      const f = Number(row.floatShares ?? row.sharesFloat ?? row.freeFloat);
+      if (Number.isFinite(f) && f > 0) return f;
+      const so = Number(row.sharesOutstanding ?? row.mktCapShares);
+      if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
+    }
+  } catch {}
+  const mcap = Number(snap?.marketCap);
+  const p = Number(lastPrice);
+  if (Number.isFinite(mcap) && Number.isFinite(p) && p > 0) {
+    const so = mcap / p;
+    if (Number.isFinite(so) && so > 0) return Math.floor(so * 0.8);
+  }
+  return null;
+}
+
 async function evaluateEntrySignals(
   ticker: string,
   snapshot: { stocks: SnapStock[] } | null,
@@ -632,6 +713,7 @@ async function evaluateEntrySignals(
     debug: dbg
   };
 }
+
 /* -------------------------- setup scoring -------------------------- */
 type SetupScore = { score: number; reasons: string[] };
 function scoreSetup(e: Awaited<ReturnType<typeof evaluateEntrySignals>>): SetupScore {
@@ -760,28 +842,15 @@ async function placeEntryNow(
 
   const newTp = round2(entry * (1 + (mode === "strong" ? TARGET_PCT_STRONG_DUMMY : TARGET_PCT_WEAK)));
   const newSl = round2(entry * (1 + STOP_PCT));
-  try {
-    await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true });
-  } catch {}
+  try { await (replaceTpSlIfBetter as any)({ symbol: ticker, newTp, newSl, force: true }); } catch {}
 
   await prisma.position.create({ data: { ticker, entryPrice: entry, shares, open: true, brokerOrderId: order.id } });
   await prisma.trade.create({ data: { side: "BUY", ticker, price: entry, shares, brokerOrderId: order.id } });
 
   const newCash = Math.max(0, Number(state?.cash ?? 0) - shares * entry);
-  await prisma.botState.update({
-    where: { id: 1 },
-    data: { cash: newCash, equity: newCash + shares * entry },
-  });
+  await prisma.botState.update({ where: { id: 1 }, data: { cash: newCash, equity: newCash + shares * entry } });
 
-  ratchetState[ticker] = {
-    entry,
-    high: entry,
-    lastRung: 0,
-    lastLiftAt: 0,
-    runner: (mode === "strong"),
-    lastSL: newSl,
-    lastTP: newTp,
-  };
+  ratchetState[ticker] = { entry, high: entry, lastRung: 0, lastLiftAt: 0, runner: (mode === "strong"), lastSL: newSl, lastTP: newTp };
   lastDynSLMemo[ticker] = { day: yyyyMmDdET(), sl: newSl };
 
   return { ok: true, shares };
@@ -791,7 +860,8 @@ async function placeEntryNow(
 const lastDynSLMemo: Record<string, { day: string; sl: number }> = {};
 type RatchetState = { entry: number; high: number; lastRung: number; lastLiftAt: number; runner: boolean; lastSL: number; lastTP: number };
 const ratchetState: Record<string, RatchetState> = {};
-/* -------------------------- gentle gate for force windows -------------------------- */
+
+/* ---------------- gentle gate for force windows ---------------- */
 async function assessObviousWeakAtForce(opts: {
   symbol: string;
   today: string;
@@ -874,7 +944,7 @@ async function assessObviousWeakAtForce(opts: {
   };
 }
 
-/* -------------------------- handlers -------------------------- */
+/* -------------------------- API handlers -------------------------- */
 export async function GET(req: Request) { return handle(req); }
 export async function POST(req: Request) { return handle(req); }
 
@@ -928,7 +998,7 @@ async function handle(req: Request) {
 
       const today = yyyyMmDdET();
 
-      // Mandatory exit after 15:50 ET — record actual broker fill
+      // Mandatory exit after 15:50 ET
       if (openPos && isMandatoryExitET()) {
         const exitTicker = openPos.ticker;
         const shares = Number(openPos.shares);
@@ -1029,11 +1099,17 @@ async function handle(req: Request) {
       if (!openPos && marketOpen && inForceWindow0945() && !(await hasDayLock())) {
         const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
         if (!boughtOrLocked) {
-          await runForceWindowPrimarySecondary({
-            req, base, today, labelPrefix: "force_0945", banner: "09:45 FORCE BUY (PRIMARY→SECONDARY)",
-            stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
-            lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
-          });
+          // VWAP breadth gate — only proceed if GREEN
+          const ok = await breadthAllowsForce(base, debug, "force_0945");
+          if (!ok) {
+            debug.reasons.push("force_0945_vwap_gate_blocked");
+          } else {
+            await runForceWindowPrimarySecondary({
+              req, base, today, labelPrefix: "force_0945", banner: "09:45 FORCE BUY (PRIMARY→SECONDARY)",
+              stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
+              lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
+            });
+          }
         } else {
           debug.reasons.push("force_0945_skipped_buy_or_lock");
         }
@@ -1051,11 +1127,16 @@ async function handle(req: Request) {
       if (!openPos && marketOpen && inForceWindow1000() && !(await hasDayLock())) {
         const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
         if (!boughtOrLocked) {
-          await runForceWindowPrimarySecondary({
-            req, base, today, labelPrefix: "force_1000", banner: "10:00 SECOND FORCE BUY (PRIMARY→SECONDARY)",
-            stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
-            lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
-          });
+          const ok = await breadthAllowsForce(base, debug, "force_1000");
+          if (!ok) {
+            debug.reasons.push("force_1000_vwap_gate_blocked");
+          } else {
+            await runForceWindowPrimarySecondary({
+              req, base, today, labelPrefix: "force_1000", banner: "10:00 SECOND FORCE BUY (PRIMARY→SECONDARY)",
+              stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
+              lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
+            });
+          }
         } else {
           debug.reasons.push("force_1000_skipped_buy_or_lock");
         }
@@ -1073,11 +1154,16 @@ async function handle(req: Request) {
       if (!openPos && marketOpen && inForceWindow1015() && !(await hasDayLock())) {
         const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
         if (!boughtOrLocked) {
-          await runForceWindowPrimarySecondary({
-            req, base, today, labelPrefix: "force_1015", banner: "10:15 THIRD FORCE BUY (PRIMARY→SECONDARY)",
-            stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
-            lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
-          });
+          const ok = await breadthAllowsForce(base, debug, "force_1015");
+          if (!ok) {
+            debug.reasons.push("force_1015_vwap_gate_blocked");
+          } else {
+            await runForceWindowPrimarySecondary({
+              req, base, today, labelPrefix: "force_1015", banner: "10:15 THIRD FORCE BUY (PRIMARY→SECONDARY)",
+              stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
+              lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
+            });
+          }
         } else {
           debug.reasons.push("force_1015_skipped_buy_or_lock");
         }
@@ -1118,11 +1204,7 @@ async function handle(req: Request) {
 
           if (rungIndex > rs.lastRung && improvedBy >= 0.02 && cooldownOK) {
             try {
-              await (replaceTpSlIfBetter as any)({
-                symbol: sym,
-                newSl: targetSL,
-                force: false,
-              });
+              await (replaceTpSlIfBetter as any)({ symbol: sym, newSl: targetSL, force: false });
               lastDynSLMemo[sym] = { day: yyyyMmDdET(), sl: targetSL };
               rs.lastRung = rungIndex;
               rs.lastLiftAt = nowMs;
@@ -1175,10 +1257,7 @@ async function handle(req: Request) {
         lastRec,
         position: openPos,
         live: { ticker: openPos?.ticker ?? lastRec?.ticker ?? null, price: livePrice },
-        view: {
-          symbol: openPos?.ticker ?? lastRec?.ticker ?? null,
-          untilET: endOfDayET.toISOString(),
-        },
+        view: { symbol: openPos?.ticker ?? lastRec?.ticker ?? null, untilET: endOfDayET.toISOString() },
         serverTimeET: nowET().toISOString(),
         account: alpacaAccount,
         budget: { investPerTrade: INVEST_BUDGET },
@@ -1197,12 +1276,13 @@ async function handle(req: Request) {
   } catch (e: any) {
     const msg = e?.message || "unknown";
     const stack = typeof e?.stack === "string" ? e.stack.split("\n").slice(0, 6).join("\n") : undefined;
-    return new NextResponse(
-      JSON.stringify({ error: true, message: msg, stack }),
-      { status: 500, headers: { "content-type": "application/json" } }
-    );
+    return new NextResponse(JSON.stringify({ error: true, message: msg, stack }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
   }
 }
+// app/api/bot/tick/route.ts  — PART 3 of 4
 
 /* -------------------------- snapshot cache -------------------------- */
 let lastGoodSnapshot: { stocks: SnapStock[]; updatedAt: string } | null = null;
@@ -1308,8 +1388,8 @@ async function ensureRollingRecommendationTwo(
             let ref: number | null = Number(topStocks.find((s) => s.ticker === primary)?.price ?? NaN);
             if (!Number.isFinite(Number(ref))) {
               const q = await fmpQuoteCached(primary!);
-              const p = priceFromFmp(q);
-              if (p != null) ref = p;
+              const p = Number(q?.price ?? q?.c ?? q?.close ?? q?.previousClose);
+              if (Number.isFinite(p)) ref = p;
             }
             const priceNum = Number.isFinite(Number(ref)) ? Number(ref) : null;
             const data: any = { ticker: primary! };
@@ -1328,6 +1408,15 @@ async function ensureRollingRecommendationTwo(
   }
 
   return { primary: primary ?? null, secondary: secondary ?? null, lastRecRow: lastRec || null };
+}
+
+/* -------------------- (Optional) human-readable breadth tip for logs/UI -------------------- */
+function breadthTip(payload: any): string {
+  if (!payload) return "VWAP breadth: n/a";
+  const denom = payload.attempted ?? payload.total ?? 0;
+  const above = payload.above ?? 0;
+  const ratio = (payload.ratio ?? 0).toFixed(2);
+  return `VWAP breadth: ${above}/${denom} (ratio ${ratio})`;
 }
 
 /* ============================== scan runner ============================== */
@@ -1362,7 +1451,7 @@ async function runScanWindow(opts: {
   debug[`${windowName}_affordable_count`] = affordableTop.length;
 
   const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates);
-  if (lastRecRow?.ticker) setLastRec(lastRecRow), lastRec = lastRecRow;
+  if (lastRecRow?.ticker) setLastRec(lastRecRow);
 
   let picks: string[] = [];
   let aiMissing = !primary;
@@ -1437,15 +1526,15 @@ async function runScanWindow(opts: {
     }
     if (ref == null || !Number.isFinite(Number(ref))) {
       const q = await fmpQuoteCached(chosen);
-      const p = priceFromFmp(q);
-      if (p != null) ref = p;
+      const p = Number(q?.price ?? q?.c ?? q?.close ?? q?.previousClose);
+      if (Number.isFinite(p)) ref = p;
     }
     if (ref == null || !Number.isFinite(Number(ref))) return;
 
     const chosenEval = evals[chosen]!;
     const { score } = scoreSetup(chosenEval);
     const { sizeMult } = sizeForScoreOptionA(score, chosenEval);
-    const mode: EntryMode = score >= 2 ? "strong" : "weak";
+    const mode: "weak" | "strong" = score >= 2 ? "strong" : "weak";
 
     const placed = await placeEntryNow(chosen, Number(ref), stateRef(), sizeMult, mode);
     if (placed.ok) {
@@ -1459,7 +1548,15 @@ async function runScanWindow(opts: {
   }
 }
 
-/* -------------------- force windows (PRIMARY → SECONDARY only) -------------------- */
+/* -------------------- force windows (PRIMARY → SECONDARY only) --------------------
+   VWAP BREADTH GATE NOTE:
+   - The main handle() loop calls breadthAllowsForce(base, debug, <label>) just BEFORE
+     invoking this function for each force window (09:45, 10:00, 10:15).
+   - If VWAP breadth sentiment !== "green", the force window is SKIPPED and this
+     function is NOT executed.
+   - When this function IS called, the market regime can be assumed "GREEN / risk-on".
+   - Normal entry checks (spread, price band, evaluateEntrySignals, etc.) still apply.
+   -------------------------------------------------------------------------------*/
 async function runForceWindowPrimarySecondary(opts: {
   req: Request;
   base: string;
@@ -1492,7 +1589,7 @@ async function runForceWindowPrimarySecondary(opts: {
   debug[`${labelPrefix}_affordable_count`] = affordableTop.length;
 
   const { primary, secondary, lastRecRow } = await ensureRollingRecommendationTwo(req, candidates, 10_000);
-  if (lastRecRow?.ticker) setLastRec(lastRecRow), lastRec = lastRecRow;
+  if (lastRecRow?.ticker) setLastRec(lastRecRow);
 
   const trySymbols = [primary, secondary].filter(Boolean) as string[];
   let placedSymbol: string | null = null;
@@ -1515,8 +1612,8 @@ async function runForceWindowPrimarySecondary(opts: {
       let ref: number | null = Number(snapshot?.stocks?.find((s) => s.ticker === sym)?.price ?? NaN);
       if (!Number.isFinite(Number(ref))) {
         const q = await fmpQuoteCached(sym);
-        const p = priceFromFmp(q);
-        if (p != null) ref = p;
+        const p = Number(q?.price ?? q?.c ?? q?.close ?? q?.previousClose);
+        if (Number.isFinite(p)) ref = p;
       }
       if (ref == null || !Number.isFinite(Number(ref))) continue;
       if (ref < PRICE_MIN || ref > PRICE_MAX) continue;
@@ -1532,7 +1629,7 @@ async function runForceWindowPrimarySecondary(opts: {
         const evalRes = assess.ev ?? await evaluateEntrySignals(sym, snapshot, yyyyMmDdET(), base);
         const { score } = scoreSetup(evalRes);
         const { sizeMult } = sizeForScoreOptionA(score, evalRes);
-        const mode: EntryMode = score >= 2 ? "strong" : "weak";
+        const mode: "weak" | "strong" = score >= 2 ? "strong" : "weak";
 
         const placed = await placeEntryNow(sym, Number(ref), stateRef(), sizeMult, mode);
         if (placed.ok) {
@@ -1549,5 +1646,58 @@ async function runForceWindowPrimarySecondary(opts: {
     if (!placedSymbol) await releaseDayLock();
   }
 
-  debug[`${labelPrefix}_final`] = { placedSymbol: placedSymbol ?? null };
+  // Final debug line shows that this ran only after the VWAP breadth gate (GREEN) passed
+  debug[`${labelPrefix}_final`] = {
+    placedSymbol: placedSymbol ?? null,
+    gate: "VWAP_breadth_green"
+  };
 }
+// app/api/bot/tick/route.ts  — PART 4 of 4
+
+/* ============================= OPTIONAL EXTRAS ============================= */
+
+/** Pretty string for any logs/UI you might show on the client */
+function formatBreadthForDebug(details: any): string {
+  if (!details) return "VWAP breadth: n/a";
+  const denom = Number(details.attempted ?? details.total ?? 0);
+  const above = Number(details.above ?? 0);
+  const ratio = Number(details.ratio ?? 0);
+  return `VWAP breadth ${above}/${denom} (${(ratio * 100).toFixed(0)}%)`;
+}
+
+/* ---------- STRICT OPTION: require GREEN for 2 consecutive minutes ---------- */
+/*  To enable: 
+    1) Uncomment the block below,
+    2) Replace calls to `breadthAllowsForce(...)` in Part 2 with `breadthAllowsForceStrict(...)`.
+*/
+// let _lastGreenMinuteKey: number | null = null;
+// function _etMinuteKey(): number {
+//   const d = nowET();
+//   return d.getHours() * 60 + d.getMinutes();
+// }
+// async function breadthAllowsForceStrict(base: string, debug: any, label: string): Promise<boolean> {
+//   const res = await getVwapSentiment(base);
+//   debug[`${label}_breadth`] = res.details || res;
+
+//   const minuteKey = _etMinuteKey();
+
+//   if (res.sentiment === "green") {
+//     if (_lastGreenMinuteKey === minuteKey - 1) {
+//       // GREEN two minutes in a row → allow
+//       _lastGreenMinuteKey = minuteKey;
+//       return true;
+//     }
+//     // first green minute → remember, but block this minute (conservative)
+//     _lastGreenMinuteKey = minuteKey;
+//     (debug.reasons ||= []).push(`${label}_first_green_minute_wait`);
+//     return false;
+//   }
+
+//   // any non-green breaks the chain
+//   _lastGreenMinuteKey = null;
+//   const why = res.sentiment === "red" ? "red_breadth" : (res.details?.reason || "neutral_breadth");
+//   (debug.reasons ||= []).push(`${label}_skipped_${why}`);
+//   return false;
+// }
+
+/* ============================= END OF FILE ============================= */
