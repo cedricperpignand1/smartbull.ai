@@ -13,8 +13,10 @@ type VwapBreadth = {
   above: number;
   below: number;
   flat: number;
-  ratio: number; // above / total
+  ratio: number;
   marketOpen: boolean;
+  tickers?: string[];
+  session?: { dateET: string; startISO: string; endISO: string };
 };
 
 export default function Navbar() {
@@ -23,8 +25,6 @@ export default function Navbar() {
   const [time, setTime] = useState<string>("");
   const [rows, setRows] = useState<TickerRow[]>([]);
   const [winnerLabel, setWinnerLabel] = useState<string | null>(null);
-
-  // NEW: VWAP breadth state
   const [vwapBreadth, setVwapBreadth] = useState<VwapBreadth | null>(null);
 
   /* Clock */
@@ -61,25 +61,25 @@ export default function Navbar() {
           industry: s?.industry ?? null,
         }));
         setRows(mapped);
-      } catch {}
+      } catch (e) {
+        console.error("SSE parse error:", e);
+      }
     };
     es.onerror = () => {};
     return () => es.close();
   }, []);
 
-  // Pick top 13 tickers (by current ordering from your stream)
+  // Top sets from your stream
   const top13 = useMemo(
     () => rows.slice(0, 13).map((r) => r.ticker).filter(Boolean),
     [rows]
   );
-
-  // NEW: Select top 8 for VWAP breadth
   const top8 = useMemo(
     () => top13.slice(0, 8).map((t) => t.toUpperCase()),
     [top13]
   );
 
-  /* Poll winner industry every 10 minutes (and once immediately when we have data) */
+  /* Winner industry every 10 minutes (and once immediately) */
   useEffect(() => {
     if (!top13.length) return;
 
@@ -96,24 +96,30 @@ export default function Navbar() {
           cache: "no-store",
           signal: ac.signal,
         });
+        if (!r.ok) {
+          const text = await r.text();
+          console.error("industry-winner HTTP error:", r.status, text);
+          return;
+        }
         const j = await r.json();
         if (!stop && j?.ok && j?.winner?.label) {
           setWinnerLabel(String(j.winner.label));
         }
-      } catch {}
+      } catch (e) {
+        console.error("industry-winner fetch error:", e);
+      }
     };
 
     fetchWinner();
-    const id = setInterval(fetchWinner, 10 * 60 * 1000); // 10 minutes
-
+    const id = setInterval(fetchWinner, 10 * 60 * 1000);
     return () => {
       stop = true;
       ac?.abort();
       clearInterval(id);
     };
-  }, [top13.join(",")]); // re-run if the top-13 set changes
+  }, [top13.join(",")]);
 
-  /* NEW: Poll VWAP breadth every 60s (and on top8 change) */
+  /* VWAP breadth every 60s (and once immediately) */
   useEffect(() => {
     if (!top8.length) return;
 
@@ -130,16 +136,25 @@ export default function Navbar() {
           cache: "no-store",
           signal: ac.signal,
         });
+
+        if (!r.ok) {
+          const text = await r.text();
+          console.error("VWAP breadth HTTP error:", r.status, text);
+          return;
+        }
+
         const j: VwapBreadth = await r.json();
+        console.log("VWAP breadth:", j);
         if (!stop && j?.ok) {
           setVwapBreadth(j);
         }
-      } catch {}
+      } catch (e) {
+        console.error("VWAP breadth fetch error:", e);
+      }
     };
 
     fetchBreadth();
-    const id = setInterval(fetchBreadth, 60 * 1000); // 60 seconds
-
+    const id = setInterval(fetchBreadth, 60 * 1000);
     return () => {
       stop = true;
       ac?.abort();
@@ -147,24 +162,58 @@ export default function Navbar() {
     };
   }, [top8.join(",")]);
 
-  // NEW: badge style based on ratio
+  // VWAP breadth badge (always show something)
   const vwapBadge = useMemo(() => {
-    if (!vwapBreadth || !vwapBreadth.total) return null;
-    const { above, total, ratio } = vwapBreadth;
+    if (!vwapBreadth) {
+      return (
+        <div
+          className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200"
+          title="Fetching VWAP breadth…"
+        >
+          <span className="tracking-wide">VWAP</span>
+          <span className="font-mono">…</span>
+        </div>
+      );
+    }
 
+    const { marketOpen, total, above } = vwapBreadth;
+
+    if (!marketOpen) {
+      return (
+        <div
+          className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200"
+          title="Market closed — VWAP breadth paused"
+        >
+          <span className="tracking-wide">VWAP</span>
+          <span className="font-mono">⏸</span>
+        </div>
+      );
+    }
+
+    if (!total) {
+      return (
+        <div
+          className="ml-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold shadow-sm ring-1 bg-slate-50 text-slate-700 ring-slate-200"
+          title="No VWAP data yet"
+        >
+          <span className="tracking-wide">VWAP</span>
+          <span className="font-mono">—</span>
+        </div>
+      );
+    }
+
+    const ratio = above / total;
     let bg = "bg-slate-50";
     let text = "text-slate-700";
     let ring = "ring-slate-200";
     let arrow = "↔";
 
     if (ratio >= 5 / 8) {
-      // risk-on
       bg = "bg-emerald-50";
       text = "text-emerald-700";
       ring = "ring-emerald-200";
       arrow = "↑";
     } else if (ratio <= 3 / 8) {
-      // risk-off
       bg = "bg-rose-50";
       text = "text-rose-700";
       ring = "ring-rose-200";
@@ -208,7 +257,7 @@ export default function Navbar() {
             </button>
           </div>
 
-          {/* CENTER: Sticker — color by SPY tone, text by winner industry + VWAP breadth */}
+          {/* CENTER: Industry sticker + VWAP breadth */}
           <div className="flex-1 flex justify-center">
             {rows.length ? (
               <div className="flex items-center">
