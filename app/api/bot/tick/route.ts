@@ -110,7 +110,8 @@ function round2(x: number) {
 }
 
 /* ============================================================================
-   VWAP BREADTH SENTIMENT GATE  (used by force-buy windows)
+   VWAP BREADTH SENTIMENT GATE (used by force-buy windows)
+   - Enhanced WHY/WHY-NOT logging with explicit, human-readable explanations.
 ============================================================================ */
 
 type BreadthResp = {
@@ -163,6 +164,7 @@ async function safePostJson(url: string, body: any, timeoutMs = 3500): Promise<a
 /**
  * Build VWAP breadth sentiment from your live top-13 (same list your navbar uses).
  * Only allow force buys when sentiment === "green".
+ * Adds details.explain so debug shows a clear reason to proceed/skip.
  */
 async function getVwapSentiment(baseUrl: string): Promise<{ sentiment: Sentiment; details: any }> {
   const mSince = typeof minutesSince930ET === "function" ? minutesSince930ET() : 0;
@@ -192,22 +194,35 @@ async function getVwapSentiment(baseUrl: string): Promise<{ sentiment: Sentiment
     return { sentiment: "neutral", details: { reason: "too_few_attempted", payload } };
 
   const sent = classifyBreadth(payload.above, denom);
-  return { sentiment: sent, details: payload };
+  const ratio = Number.isFinite(Number(payload.ratio)) ? payload.ratio : (denom ? payload.above / denom : 0);
+  const explain =
+    sent === "green"
+      ? `VWAP breadth GREEN: ${payload.above}/${denom} above VWAP (ratio ${ratio.toFixed(2)}).`
+      : sent === "red"
+      ? `VWAP breadth RED: only ${payload.above}/${denom} above VWAP (ratio ${ratio.toFixed(2)}).`
+      : `VWAP breadth NEUTRAL: ${payload.above}/${denom} above VWAP (ratio ${ratio.toFixed(2)}).`;
+
+  return { sentiment: sent, details: { ...payload, denom, explain } };
 }
 // app/api/bot/tick/route.ts  — PART 2 of 4
 
 /* ===================== PART 2/4 — VWAP breadth gate helper ===================== */
 async function breadthAllowsForce(base: string, debug: any, label: string): Promise<boolean> {
-  const res = await getVwapSentiment(base);      // from Part 1
+  const res = await getVwapSentiment(base);       // from Part 1
   debug[`${label}_breadth`] = res.details || res; // keep payload for logs/inspection
 
-  if (res.sentiment === "green") return true;
+  if (res.sentiment === "green") {
+    // Positive, add explicit why
+    (debug.reasons ||= []).push(`${label}_proceed_green:${res?.details?.explain ?? "VWAP breadth GREEN"}`);
+    return true;
+  }
 
-  // record why we skipped
+  // record why we skipped with explicit explanation
   const why =
     res.sentiment === "red" ? "red_breadth" :
     (res.details?.reason || "neutral_breadth");
-  (debug.reasons ||= []).push(`${label}_skipped_${why}`);
+  const explain = res?.details?.explain || breadthTip(res?.details);
+  (debug.reasons ||= []).push(`${label}_skipped_${why}:${explain}`);
   return false;
 }
 
@@ -287,6 +302,17 @@ function inForceWindow1015() {
   const d = nowET();
   return d.getHours() === 10 && (d.getMinutes() === 15 || d.getMinutes() === 16);
 }
+/* >>> NEW: 10:15–10:29 scan & 10:30 force <<< */
+function inScanWindow1015to1029() {
+  const d = nowET(); const s = d.getSeconds();
+  const m = d.getHours() * 60 + d.getMinutes();
+  return d.getHours() === 10 && m >= 10 * 60 + 15 && m <= 10 * 60 + 29 && s <= 59;
+}
+function inForceWindow1030() {
+  const d = nowET();
+  return d.getHours() === 10 && (d.getMinutes() === 30 || d.getMinutes() === 31);
+}
+
 function isMandatoryExitET() {
   const d = nowET();
   const mins = d.getHours() * 60 + d.getMinutes();
@@ -1051,6 +1077,9 @@ async function handle(req: Request) {
             force_1000: inForceWindow1000(),
             scan_1001_1014: inScanWindowLate(),
             force_1015: inForceWindow1015(),
+            /* NEW status flags */
+            scan_1015_1029: inScanWindow1015to1029(),
+            force_1030: inForceWindow1030(),
             requireAiPick: REQUIRE_AI_PICK,
           },
           debug,
@@ -1099,7 +1128,6 @@ async function handle(req: Request) {
       if (!openPos && marketOpen && inForceWindow0945() && !(await hasDayLock())) {
         const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
         if (!boughtOrLocked) {
-          // VWAP breadth gate — only proceed if GREEN
           const ok = await breadthAllowsForce(base, debug, "force_0945");
           if (!ok) {
             debug.reasons.push("force_0945_vwap_gate_blocked");
@@ -1166,6 +1194,33 @@ async function handle(req: Request) {
           }
         } else {
           debug.reasons.push("force_1015_skipped_buy_or_lock");
+        }
+      }
+
+      /* ============================== NEW SCAN 10:15–10:29 ============================== */
+      if (!openPos && marketOpen && inScanWindow1015to1029() && !(await hasDayLock()) && !(await hasAnyBuyTodayDB())) {
+        await runScanWindow({
+          req, base, today, stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
+          lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug, windowName: "scan_1015_1029"
+        });
+      }
+
+      /* ============================== NEW FORCE 10:30 (PRIMARY→SECONDARY) ============================== */
+      if (!openPos && marketOpen && inForceWindow1030() && !(await hasDayLock())) {
+        const boughtOrLocked = (await hasAnyBuyTodayDB().catch(() => false)) || (await hasDayLock());
+        if (!boughtOrLocked) {
+          const ok = await breadthAllowsForce(base, debug, "force_1030");
+          if (!ok) {
+            debug.reasons.push("force_1030_vwap_gate_blocked");
+          } else {
+            await runForceWindowPrimarySecondary({
+              req, base, today, labelPrefix: "force_1030", banner: "10:30 FOURTH FORCE BUY (PRIMARY→SECONDARY)",
+              stateRef: () => state!, openPosRef: () => openPos, setOpenPos: (p) => openPos = p,
+              lastRecRef: () => lastRec, setLastRec: (r) => lastRec = r, debug
+            });
+          }
+        } else {
+          debug.reasons.push("force_1030_skipped_buy_or_lock");
         }
       }
 
@@ -1550,13 +1605,9 @@ async function runScanWindow(opts: {
 
 /* -------------------- force windows (PRIMARY → SECONDARY only) --------------------
    VWAP BREADTH GATE NOTE:
-   - The main handle() loop calls breadthAllowsForce(base, debug, <label>) just BEFORE
-     invoking this function for each force window (09:45, 10:00, 10:15).
-   - If VWAP breadth sentiment !== "green", the force window is SKIPPED and this
-     function is NOT executed.
-   - When this function IS called, the market regime can be assumed "GREEN / risk-on".
-   - Normal entry checks (spread, price band, evaluateEntrySignals, etc.) still apply.
-   -------------------------------------------------------------------------------*/
+   - Callers (handle() in Part 2) must pass breadthAllowsForce(base, debug, <label>) first.
+   - When this runs, breadth has already been GREEN; still do normal safety checks.
+-------------------------------------------------------------------------------*/
 async function runForceWindowPrimarySecondary(opts: {
   req: Request;
   base: string;
@@ -1646,7 +1697,7 @@ async function runForceWindowPrimarySecondary(opts: {
     if (!placedSymbol) await releaseDayLock();
   }
 
-  // Final debug line shows that this ran only after the VWAP breadth gate (GREEN) passed
+  // Final debug line shows that this ran only after the VWAP breadth gate (GREEN) passed earlier
   debug[`${labelPrefix}_final`] = {
     placedSymbol: placedSymbol ?? null,
     gate: "VWAP_breadth_green"
@@ -1659,16 +1710,20 @@ async function runForceWindowPrimarySecondary(opts: {
 /** Pretty string for any logs/UI you might show on the client */
 function formatBreadthForDebug(details: any): string {
   if (!details) return "VWAP breadth: n/a";
-  const denom = Number(details.attempted ?? details.total ?? 0);
-  const above = Number(details.above ?? 0);
-  const ratio = Number(details.ratio ?? 0);
+  const denomRaw = details.attempted ?? details.total ?? details.denom ?? 0;
+  const denom = Number.isFinite(Number(denomRaw)) ? Number(denomRaw) : 0;
+  const above = Number.isFinite(Number(details.above)) ? Number(details.above) : 0;
+  const ratio =
+    Number.isFinite(Number(details.ratio))
+      ? Number(details.ratio)
+      : (denom > 0 ? above / denom : 0);
   return `VWAP breadth ${above}/${denom} (${(ratio * 100).toFixed(0)}%)`;
 }
 
 /* ---------- STRICT OPTION: require GREEN for 2 consecutive minutes ---------- */
-/*  To enable: 
+/*  To enable:
     1) Uncomment the block below,
-    2) Replace calls to `breadthAllowsForce(...)` in Part 2 with `breadthAllowsForceStrict(...)`.
+    2) Replace calls to `breadthAllowsForce(...)` with `breadthAllowsForceStrict(...)` in Part 2.
 */
 // let _lastGreenMinuteKey: number | null = null;
 // function _etMinuteKey(): number {
@@ -1677,26 +1732,28 @@ function formatBreadthForDebug(details: any): string {
 // }
 // async function breadthAllowsForceStrict(base: string, debug: any, label: string): Promise<boolean> {
 //   const res = await getVwapSentiment(base);
-//   debug[`${label}_breadth`] = res.details || res;
-
+//   debug[`${label}_breadth`] = res.details || res; // keep payload for logs/UI
+//
 //   const minuteKey = _etMinuteKey();
-
+//   const explain = res?.details?.explain || breadthTip(res?.details);
+//
 //   if (res.sentiment === "green") {
 //     if (_lastGreenMinuteKey === minuteKey - 1) {
 //       // GREEN two minutes in a row → allow
+//       (debug.reasons ||= []).push(`${label}_proceed_green_2min:${explain}`);
 //       _lastGreenMinuteKey = minuteKey;
 //       return true;
 //     }
 //     // first green minute → remember, but block this minute (conservative)
-//     _lastGreenMinuteKey = minuteKey;
-//     (debug.reasons ||= []).push(`${label}_first_green_minute_wait`);
+//    _lastGreenMinuteKey = minuteKey;
+//     (debug.reasons ||= []).push(`${label}_first_green_minute_wait:${explain}`);
 //     return false;
 //   }
-
+//
 //   // any non-green breaks the chain
 //   _lastGreenMinuteKey = null;
 //   const why = res.sentiment === "red" ? "red_breadth" : (res.details?.reason || "neutral_breadth");
-//   (debug.reasons ||= []).push(`${label}_skipped_${why}`);
+//   (debug.reasons ||= []).push(`${label}_skipped_${why}:${explain}`);
 //   return false;
 // }
 
